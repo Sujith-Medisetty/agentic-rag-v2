@@ -1,0 +1,27 @@
+# LangChain / LangGraph core
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-anthropic>=0.3.0
+langchain-community>=0.3.0
+
+# MCP integration
+langchain-mcp-adapters>=0.1.0
+mcp>=1.0.0
+
+# LangGraph persistence (cross-run checkpointing)
+langgraph-checkpoint-sqlite>=1.0.0
+
+# Observability
+langsmith>=0.1.0
+
+# Existing deps
+requests>=2.31.0
+
+# Utilities
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# RAG service (rag/ — semantic search ported from claw-rag-service)
+blake3>=0.4.0          # content hashing (matches Rust blake3); falls back to blake2b if absent
+# qdrant-client>=1.7.0  # optional: Qdrant vector backend (set CLAW_RAG_QDRANT_URL)
