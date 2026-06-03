@@ -13,11 +13,13 @@
 #   npm     (ships with node)
 #   ANTHROPIC_API_KEY (the agent needs it)
 #
-# First-run side effects:
+# First-run side effects (all self-healing — re-running is safe):
 #   - Creates a venv at ./.venv if absent and installs requirements.txt
 #   - Runs `npm install` in web/ if node_modules is absent
-#   - Generates PWA icons via scripts/generate-pwa-icons.py if they're missing
-#     and Pillow + cairosvg are installable (skipped silently otherwise)
+#   - Generates PWA icons via scripts/generate-pwa-icons.py if they're missing.
+#     Auto-installs Pillow + cairosvg (pip) AND the native libcairo library
+#     (brew on macOS; clear apt-get/dnf hint on Linux). If libcairo can't be
+#     installed automatically, the PWA still works with SVG icons only.
 
 set -euo pipefail
 
@@ -79,13 +81,54 @@ if [[ ! -d web/node_modules ]]; then
 fi
 
 # ---- PWA icons (optional) -------------------------------------------------
+#
+# cairosvg is a thin Python wrapper around the native libcairo C library.
+# pip can install the wrapper, but libcairo itself needs an OS package
+# manager (brew on macOS, apt/dnf on Linux). We try to bootstrap both.
+
+ensure_icon_deps() {
+  pip install --quiet pillow cairosvg 2>/dev/null || return 1
+
+  # cairosvg's import triggers libcairo dlopen — this is the real check.
+  if python3 -c 'import cairosvg' 2>/dev/null; then
+    return 0
+  fi
+
+  # Native libcairo is missing — try to install it for the user.
+  case "$(uname -s)" in
+    Darwin)
+      if command -v brew >/dev/null; then
+        log "installing libcairo via Homebrew (one-time, ~20s)"
+        if brew install cairo >/dev/null 2>&1; then
+          ok "libcairo installed"
+          python3 -c 'import cairosvg' 2>/dev/null && return 0
+        fi
+        warn "brew install cairo failed"
+      else
+        warn "Homebrew not found. Install from https://brew.sh, then re-run."
+      fi
+      ;;
+    Linux)
+      if command -v apt-get >/dev/null; then
+        warn "libcairo missing. Run:  sudo apt-get install -y libcairo2"
+      elif command -v dnf >/dev/null; then
+        warn "libcairo missing. Run:  sudo dnf install -y cairo"
+      elif command -v pacman >/dev/null; then
+        warn "libcairo missing. Run:  sudo pacman -S --noconfirm cairo"
+      else
+        warn "libcairo missing — install your distro's cairo package and re-run."
+      fi
+      ;;
+  esac
+  return 1
+}
 
 if [[ ! -f web/public/icons/icon-512.png ]]; then
   log "generating PWA icons (one-time)"
-  if pip install --quiet pillow cairosvg 2>/dev/null; then
+  if ensure_icon_deps; then
     python3 scripts/generate-pwa-icons.py || warn "icon generation failed — using SVG only"
   else
-    warn "Pillow/cairosvg not installable on this system — PWA will use SVG icons only"
+    warn "skipping PNG icons — PWA will use SVG icons only"
   fi
 fi
 

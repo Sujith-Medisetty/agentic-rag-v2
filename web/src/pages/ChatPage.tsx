@@ -345,14 +345,15 @@ export default function ChatPage() {
 
   // ============================================================================
   return (
-    <div className="flex h-screen flex-col bg-bg">
+    <div className="flex h-screen flex-col">
       {/* Header — sticky, has back link + git + push + totals + connection */}
-      <header className="flex items-center justify-between gap-3 border-b border-border bg-surface px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-3">
+      <header className="chrome-bar flex items-center justify-between gap-3 px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-3">
         <Link
           to={`/p/${projectId}`}
-          className="shrink-0 text-sm text-muted hover:text-accent"
+          className="group flex shrink-0 items-center gap-1.5 text-sm text-muted transition-colors hover:text-accent"
         >
-          ← back
+          <span className="transition-transform group-hover:-translate-x-0.5">←</span>
+          <span>back</span>
         </Link>
         <div className="flex min-w-0 items-center gap-2">
           <BranchBadge git={git} />
@@ -398,14 +399,14 @@ export default function ChatPage() {
       {/* Input — pinned bottom, safe-area aware */}
       <form
         onSubmit={send}
-        className="border-t border-border bg-surface px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+        className="chrome-bar-bottom px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
       >
         <div className="mx-auto flex max-w-4xl gap-2">
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="Type a message…"
-            className="min-h-touch flex-1 rounded-lg border border-border bg-elevated px-3 py-2 text-base text-text placeholder:text-subtle focus:border-accent focus:outline-none md:text-sm"
+            className="field min-h-touch flex-1 text-base md:text-sm"
             autoCapitalize="sentences"
             autoCorrect="on"
             enterKeyHint="send"
@@ -414,7 +415,7 @@ export default function ChatPage() {
           <button
             type="submit"
             disabled={sending || !input.trim()}
-            className="min-h-touch min-w-touch rounded-lg bg-accent px-4 py-2 text-sm font-medium text-bg transition-opacity hover:opacity-90 disabled:opacity-40"
+            className="btn-primary min-h-touch min-w-touch"
           >
             {sending ? "…" : "Send"}
           </button>
@@ -604,9 +605,17 @@ function BranchBadge({ git }: { git: GitInfo | null }) {
 
 function EmptyState() {
   return (
-    <div className="mt-12 flex flex-col items-center gap-2 text-center text-muted">
-      <div className="text-lg text-text">Start a conversation</div>
-      <div className="max-w-sm text-sm">
+    <div className="mt-16 flex flex-col items-center gap-4 text-center">
+      <div
+        aria-hidden
+        className="relative flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-gradient shadow-glow-accent"
+      >
+        <span className="text-bg text-2xl font-bold">⌘</span>
+      </div>
+      <div className="text-xl font-semibold tracking-tight text-text">
+        Start a conversation
+      </div>
+      <div className="max-w-md text-sm text-muted">
         Type a request below. Each prompt opens a turn that shows the agent's
         reply, every tool it calls, files it changes, and the tokens it used.
       </div>

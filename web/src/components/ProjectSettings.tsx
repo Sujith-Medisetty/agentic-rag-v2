@@ -32,8 +32,10 @@ export default function ProjectSettings({
   };
 
   return (
-    <div className="space-y-4 rounded-lg border border-border bg-surface p-4">
-      <div className="text-sm font-medium">Settings</div>
+    <div className="glass-card-soft space-y-4 p-5">
+      <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted">
+        Settings
+      </div>
 
       <Toggle
         label="Auto-commit on each turn"
@@ -109,7 +111,7 @@ function Select({
         value={value}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
-        className="min-h-touch w-full rounded border border-border bg-elevated px-3 py-2 text-sm outline-none focus:border-accent"
+        className="field min-h-touch text-sm"
       >
         {options.map((o) => (
           <option key={o.value} value={o.value}>{o.label}</option>

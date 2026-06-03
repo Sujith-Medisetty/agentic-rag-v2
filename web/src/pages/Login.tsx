@@ -36,29 +36,46 @@ export default function Login({ onDone }: { onDone: () => void }) {
     <div className="flex h-screen items-center justify-center px-4">
       <form
         onSubmit={submit}
-        className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-surface p-6"
+        className="glass-card w-full max-w-sm space-y-5 p-7"
       >
-        <h1 className="text-xl font-semibold">Sign in</h1>
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <span
+              aria-hidden
+              className="inline-block h-2.5 w-2.5 rounded-full bg-accent-gradient shadow-glow-accent"
+            />
+            <span className="brand-mark text-sm font-semibold tracking-tight">
+              agentic&#8209;rag
+            </span>
+          </div>
+          <h1 className="text-xl font-semibold tracking-tight">Welcome back</h1>
+          <p className="text-xs text-muted">Enter your passcode to continue.</p>
+        </div>
+
         <input
           type="password"
           autoFocus
           value={pass}
           onChange={(e) => setPass(e.target.value)}
           placeholder="Passcode"
-          className="w-full rounded border border-border bg-elevated px-3 py-2 outline-none focus:border-accent"
+          className="field"
         />
         <input
           type="text"
           value={label}
           onChange={(e) => setLabel(e.target.value)}
           placeholder="Device name (optional)"
-          className="w-full rounded border border-border bg-elevated px-3 py-2 outline-none focus:border-accent"
+          className="field"
         />
-        {err && <div className="text-sm text-danger">{err}</div>}
+        {err && (
+          <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+            {err}
+          </div>
+        )}
         <button
           type="submit"
           disabled={busy}
-          className="min-h-touch w-full rounded bg-accent px-3 py-2 font-medium text-bg disabled:opacity-50"
+          className="btn-primary min-h-touch w-full"
         >
           {busy ? "Signing in…" : "Sign in"}
         </button>

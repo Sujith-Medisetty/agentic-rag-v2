@@ -29,33 +29,49 @@ export default function Setup({ onDone }: { onDone: () => void }) {
     <div className="flex h-screen items-center justify-center px-4">
       <form
         onSubmit={submit}
-        className="w-full max-w-sm space-y-4 rounded-lg border border-border bg-surface p-6"
+        className="glass-card w-full max-w-sm space-y-5 p-7"
       >
-        <h1 className="text-xl font-semibold">Set your passcode</h1>
-        <p className="text-sm text-muted">
-          You'll use this to sign in from any device. Pick something you'll remember
-          — there's no recovery (this is your local backend).
-        </p>
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <span
+              aria-hidden
+              className="inline-block h-2.5 w-2.5 rounded-full bg-accent-gradient shadow-glow-accent"
+            />
+            <span className="brand-mark text-sm font-semibold tracking-tight">
+              agentic&#8209;rag
+            </span>
+          </div>
+          <h1 className="text-xl font-semibold tracking-tight">Set your passcode</h1>
+          <p className="text-xs text-muted">
+            You'll use this to sign in from any device. Pick something you'll
+            remember — there's no recovery (this is your local backend).
+          </p>
+        </div>
+
         <input
           type="password"
           autoFocus
           value={pass}
           onChange={(e) => setPass(e.target.value)}
           placeholder="New passcode"
-          className="w-full rounded border border-border bg-elevated px-3 py-2 outline-none focus:border-accent"
+          className="field"
         />
         <input
           type="password"
           value={confirm}
           onChange={(e) => setConfirm(e.target.value)}
           placeholder="Confirm passcode"
-          className="w-full rounded border border-border bg-elevated px-3 py-2 outline-none focus:border-accent"
+          className="field"
         />
-        {err && <div className="text-sm text-danger">{err}</div>}
+        {err && (
+          <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+            {err}
+          </div>
+        )}
         <button
           type="submit"
           disabled={busy}
-          className="min-h-touch w-full rounded bg-accent px-3 py-2 font-medium text-bg disabled:opacity-50"
+          className="btn-primary min-h-touch w-full"
         >
           {busy ? "Setting up…" : "Continue"}
         </button>

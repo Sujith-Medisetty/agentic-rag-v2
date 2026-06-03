@@ -8,9 +8,17 @@
   }
   body {
     margin: 0;
+    background-color: #07080a;
+    color: #ecedf0;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     font-feature-settings: "ss01", "cv11";
+    /* Subtle ambient backdrop: two soft radial glows on near-black. */
+    background-image:
+      radial-gradient(900px 600px at 12% -10%, rgba(94, 234, 212, 0.07), transparent 60%),
+      radial-gradient(800px 500px at 100% 110%, rgba(167, 139, 250, 0.06), transparent 60%),
+      linear-gradient(180deg, #07080a 0%, #0a0b10 100%);
+    background-attachment: fixed;
   }
 
   /* Selection: subtle accent tint, not harsh blue. */
@@ -24,44 +32,127 @@
     *::-webkit-scrollbar       { width: 8px; height: 8px; }
     *::-webkit-scrollbar-track { background: transparent; }
     *::-webkit-scrollbar-thumb {
-      background-color: #23262d; border-radius: 4px;
+      background-color: #262a33; border-radius: 4px;
     }
-    *::-webkit-scrollbar-thumb:hover { background-color: #2c3038; }
+    *::-webkit-scrollbar-thumb:hover { background-color: #323743; }
+  }
+
+  /* Native form controls — give them the dark theme too. */
+  select option {
+    background-color: #171a20;
+    color: #ecedf0;
   }
 }
 
 @layer components {
-  /* Transcript — terminal-dense reading. Used on the chat scroll region so
-     everything inside (turns, tools, diffs, footers) inherits mono + size. */
+  /* ----- Transcript surface ------------------------------------------- */
+  /* Terminal-dense reading. Used on the chat scroll region so everything
+     inside (turns, tools, diffs, footers) inherits mono + size. */
   .transcript {
     @apply font-mono text-tx leading-snug text-text;
-    font-variant-ligatures: none;     /* terminals don't ligate; we shouldn't either */
+    font-variant-ligatures: none;
   }
 
-  /* Tree line — generic indented row with a leading connector char (⏺ or ⎿).
-     Pairs with .tree-rail to draw a thin vertical guide under nested groups. */
+  /* ----- Tree connectors ---------------------------------------------- */
   .tree-line {
     @apply flex items-baseline gap-1.5 whitespace-pre;
   }
-  /* Vertical guide rail to the LEFT of a nested tree section. Color is intentionally
-     near-invisible so it whispers rather than shouts. */
   .tree-rail {
     @apply border-l border-border/40 pl-3;
   }
 
-  /* Pill — small inline badge for branch / status / model. Sans (it's chrome). */
+  /* ----- Pills / badges ----------------------------------------------- */
   .pill {
     @apply inline-flex items-center gap-1.5 rounded-md border border-border
-           bg-elevated px-2 py-0.5 font-sans text-tx-xs text-muted;
+           bg-elevated/70 px-2 py-0.5 font-sans text-tx-xs text-muted
+           backdrop-blur-sm;
   }
   .pill-accent  { @apply text-accent  border-accent/30  bg-accent/5; }
   .pill-success { @apply text-success border-success/30 bg-success/5; }
   .pill-warn    { @apply text-warn    border-warn/30    bg-warn/5; }
   .pill-danger  { @apply text-danger  border-danger/30  bg-danger/5; }
 
-  /* Streaming dot — soft pulse while assistant text is arriving. */
+  /* ----- Streaming dot ------------------------------------------------ */
   .stream-dot {
     @apply inline-block h-1.5 w-1.5 animate-pulse-soft rounded-full bg-accent
            align-middle;
+    box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.18);
   }
+
+  /* ----- Brand wordmark ----------------------------------------------- */
+  /* Used for "agentic-rag" header logo and large headings on auth screens. */
+  .brand-mark {
+    @apply bg-clip-text text-transparent;
+    background-image: linear-gradient(135deg, #5eead4 0%, #67e8f9 45%, #a78bfa 100%);
+  }
+
+  /* ----- Glass card --------------------------------------------------- */
+  /* Semi-transparent panel with backdrop blur + soft elevation. Use for
+     auth cards, modals, and the chat input bar. */
+  .glass-card {
+    @apply rounded-2xl border border-border/80 bg-surface/70 backdrop-blur-xl
+           shadow-lift;
+    background-image: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0) 60%);
+  }
+  /* Variant: a lighter inner card for nested content. */
+  .glass-card-soft {
+    @apply rounded-xl border border-border/60 bg-elevated/60 backdrop-blur-md;
+  }
+
+  /* ----- Sticky chrome ------------------------------------------------- */
+  /* Top header, plan panel, input bar — translucent with blur so the ambient
+     background bleeds through. */
+  .chrome-bar {
+    @apply border-b border-border/70 bg-surface/70 backdrop-blur-xl;
+  }
+  .chrome-bar-bottom {
+    @apply border-t border-border/70 bg-surface/70 backdrop-blur-xl;
+  }
+
+  /* ----- Buttons ------------------------------------------------------ */
+  /* Primary — gradient accent with a soft glow. Use sparingly. */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg
+           bg-accent-gradient px-4 py-2 text-sm font-semibold text-bg
+           shadow-soft transition-all duration-200
+           hover:shadow-glow-accent hover:brightness-105
+           active:translate-y-px
+           disabled:opacity-50 disabled:hover:shadow-soft disabled:hover:brightness-100;
+  }
+  /* Secondary — outlined / ghost. */
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg
+           border border-border bg-elevated/60 px-3 py-1.5 text-sm text-text
+           transition-colors hover:border-accent/50 hover:bg-elevated
+           disabled:opacity-50;
+  }
+
+  /* ----- Inputs ------------------------------------------------------- */
+  .field {
+    @apply w-full rounded-lg border border-border bg-elevated/60 px-3 py-2
+           text-text placeholder:text-subtle outline-none transition-colors
+           focus:border-accent/70 focus:bg-elevated
+           focus:shadow-[0_0_0_3px_rgba(94,234,212,0.12)];
+  }
+
+  /* ----- List card (project / session list rows) ---------------------- */
+  /* Subtle gradient surface with a hover-lift + glow on the border. */
+  .list-card {
+    @apply relative block overflow-hidden rounded-xl border border-border
+           bg-surface px-4 py-3.5 shadow-soft transition-all duration-200
+           hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-lift;
+    background-image:
+      linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0) 60%);
+  }
+  /* Decorative thin gradient bar that appears on the left edge on hover. */
+  .list-card::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 2px;
+    background: linear-gradient(180deg, #5eead4, #a78bfa);
+    opacity: 0;
+    transition: opacity 200ms ease;
+  }
+  .list-card:hover::before { opacity: 1; }
 }

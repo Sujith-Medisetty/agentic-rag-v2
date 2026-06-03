@@ -53,8 +53,22 @@ def main() -> int:
         from PIL import Image
     except ImportError as e:
         print(
-            f"error: missing dependency ({e.name}). "
+            f"error: missing Python dependency ({e.name}). "
             "Install with:  pip install pillow cairosvg",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as e:
+        # cairosvg imports cleanly but libcairo (the native C library) is
+        # missing. Common on a fresh macOS — cairosvg is just a wrapper.
+        print(
+            "error: cairosvg loaded but the native libcairo library is missing.\n"
+            "\n"
+            "  macOS:   brew install cairo\n"
+            "  Ubuntu:  sudo apt-get install libcairo2\n"
+            "  Windows: pip install cairocffi   (bundles a Windows build)\n"
+            "\n"
+            f"  Original error: {e}",
             file=sys.stderr,
         )
         return 1

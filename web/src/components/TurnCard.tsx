@@ -72,9 +72,9 @@ export default function TurnCard({ turn, index }: { turn: Turn; index: number })
       }
     >
       {/* User-prompt header — ">" prefix, prompt text, right-aligned meta */}
-      <header className="mb-3 flex items-baseline gap-2">
-        <span className="text-subtle">&gt;</span>
-        <span className="flex-1 whitespace-pre-wrap text-text">{turn.userPrompt}</span>
+      <header className="mb-3 flex items-baseline gap-2 border-l-2 border-accent/50 pl-2.5">
+        <span className="text-accent/80">&gt;</span>
+        <span className="flex-1 whitespace-pre-wrap font-medium text-text">{turn.userPrompt}</span>
         <span className="shrink-0 font-sans text-tx-xs text-subtle">
           #{index + 1} · {new Date(turn.startedAt).toLocaleTimeString()}
         </span>

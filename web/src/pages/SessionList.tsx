@@ -56,25 +56,28 @@ export default function SessionList() {
   };
 
   return (
-    <div className="mx-auto max-w-3xl space-y-6 p-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <Link to="/" className="text-sm text-muted hover:text-accent">
+    <div className="mx-auto max-w-3xl space-y-6 p-6 pt-8">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <Link
+            to="/"
+            className="text-xs text-muted transition-colors hover:text-accent"
+          >
             ← all projects
           </Link>
-          <h1 className="mt-1 text-2xl font-semibold">
+          <h1 className="mt-2 truncate text-3xl font-semibold tracking-tight">
             {project?.name ?? "Loading…"}
           </h1>
           {project && (
-            <div className="font-mono text-xs text-muted">
+            <div className="mt-1 truncate font-mono text-xs text-muted">
               {project.workspace_path}
             </div>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           <button
             onClick={() => setShowSettings((v) => !v)}
-            className="min-h-touch rounded border border-border px-3 py-1.5 text-sm hover:border-accent"
+            className="btn-ghost min-h-touch"
             aria-label="Project settings"
           >
             ⚙ Settings
@@ -82,7 +85,7 @@ export default function SessionList() {
           <button
             onClick={startNew}
             disabled={creating || !projectId}
-            className="min-h-touch rounded bg-accent px-3 py-1.5 text-sm font-medium text-bg disabled:opacity-50"
+            className="btn-primary min-h-touch"
           >
             {creating ? "Creating…" : "+ New session"}
           </button>
@@ -97,24 +100,36 @@ export default function SessionList() {
       )}
 
       {loading && <div className="text-muted">Loading…</div>}
-      {err && <div className="text-danger">{err}</div>}
-
-      {!loading && !err && sessions.length === 0 && (
-        <div className="rounded border border-dashed border-border p-8 text-center text-muted">
-          No sessions yet. Start a new one to begin chatting.
+      {err && (
+        <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+          {err}
         </div>
       )}
 
-      <div className="grid gap-2">
+      {!loading && !err && sessions.length === 0 && (
+        <div className="glass-card-soft p-10 text-center">
+          <div className="text-base text-text">No sessions yet</div>
+          <div className="mt-1 text-sm text-muted">
+            Start a new one to begin chatting.
+          </div>
+        </div>
+      )}
+
+      <div className="grid gap-2.5">
         {sessions.map((s) => (
           <Link
             key={s.id}
             to={`/p/${projectId}/s/${s.id}`}
-            className="block rounded border border-border bg-surface p-4 transition hover:border-accent"
+            className="list-card"
           >
-            <div className="font-medium">{s.name}</div>
-            <div className="text-xs text-muted">
-              Last active {new Date(s.last_active_at * 1000).toLocaleString()}
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="truncate font-medium text-text">{s.name}</div>
+                <div className="mt-0.5 text-xs text-muted">
+                  Last active {new Date(s.last_active_at * 1000).toLocaleString()}
+                </div>
+              </div>
+              <span className="text-subtle">→</span>
             </div>
           </Link>
         ))}
