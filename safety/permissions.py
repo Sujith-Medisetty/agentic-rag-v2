@@ -1,9 +1,10 @@
 """
 Permission system — 4 modes + per-tool authorization.
-Ported from Rust: runtime/src/permissions.rs
 
 Controls what tools Claude can run and when it needs to ask the user.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
@@ -11,15 +12,14 @@ from typing import Callable
 
 from safety.bash_validator import PermissionMode
 
-
 # ---------------------------------------------------------------------------
-# Outcome types (ported from Rust)
+# Outcome types
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PermissionOutcome:
     allowed: bool
-    reason:  str = ""
+    reason: str = ""
 
     @classmethod
     def allow(cls) -> "PermissionOutcome":
@@ -29,96 +29,88 @@ class PermissionOutcome:
     def deny(cls, reason: str) -> "PermissionOutcome":
         return cls(allowed=False, reason=reason)
 
-
 # ---------------------------------------------------------------------------
 # Per-tool permission requirements
-# Ported from Rust: tools/src/lib.rs required_permission field
 # ---------------------------------------------------------------------------
 
 TOOL_REQUIRED_MODES: dict[str, PermissionMode] = {
     # read-only tools
-    "read_file":      PermissionMode.READ_ONLY,
-    "grep_search":    PermissionMode.READ_ONLY,
-    "glob_search":    PermissionMode.READ_ONLY,
-    "WebFetch":       PermissionMode.READ_ONLY,
-    "WebSearch":      PermissionMode.READ_ONLY,
-    "Sleep":          PermissionMode.READ_ONLY,
+    "read_file": PermissionMode.READ_ONLY,
+    "grep_search": PermissionMode.READ_ONLY,
+    "glob_search": PermissionMode.READ_ONLY,
+    "WebFetch": PermissionMode.READ_ONLY,
+    "WebSearch": PermissionMode.READ_ONLY,
+    "Sleep": PermissionMode.READ_ONLY,
     "AskUserQuestion":PermissionMode.READ_ONLY,
     "SendUserMessage":PermissionMode.READ_ONLY,
-    "ToolSearch":     PermissionMode.READ_ONLY,
-    # read-only git tools (Rust exposes these discretely; all ReadOnly)
-    "GitStatus":      PermissionMode.READ_ONLY,
-    "GitDiff":        PermissionMode.READ_ONLY,
-    "GitLog":         PermissionMode.READ_ONLY,
-    "GitShow":        PermissionMode.READ_ONLY,
-    "GitBlame":       PermissionMode.READ_ONLY,
-    "git_read":       PermissionMode.READ_ONLY,
+    "ToolSearch": PermissionMode.READ_ONLY,
+    # read-only git tools
+    "GitStatus": PermissionMode.READ_ONLY,
+    "GitDiff": PermissionMode.READ_ONLY,
+    "GitLog": PermissionMode.READ_ONLY,
+    "GitShow": PermissionMode.READ_ONLY,
+    "GitBlame": PermissionMode.READ_ONLY,
+    "git_read": PermissionMode.READ_ONLY,
 
     # workspace write tools
-    "TodoWrite":      PermissionMode.WORKSPACE_WRITE,  # Rust: WorkspaceWrite
-    "write_file":     PermissionMode.WORKSPACE_WRITE,
-    "edit_file":      PermissionMode.WORKSPACE_WRITE,
+    "TodoWrite": PermissionMode.WORKSPACE_WRITE, # Rust: WorkspaceWrite
+    "write_file": PermissionMode.WORKSPACE_WRITE,
+    "edit_file": PermissionMode.WORKSPACE_WRITE,
 
     # full access tools
-    "bash":           PermissionMode.FULL_ACCESS,
+    "bash": PermissionMode.FULL_ACCESS,
 
-    # multi-agent tools (mirror Rust required_permission)
-    "Agent":              PermissionMode.FULL_ACCESS,
-    "AgentStatus":        PermissionMode.READ_ONLY,
-    "WorkerCreate":       PermissionMode.FULL_ACCESS,
+    # multi-agent tools
+    "Agent": PermissionMode.FULL_ACCESS,
+    "AgentStatus": PermissionMode.READ_ONLY,
+    "WorkerCreate": PermissionMode.FULL_ACCESS,
     "WorkerResolveTrust": PermissionMode.FULL_ACCESS,
-    "WorkerSendPrompt":   PermissionMode.FULL_ACCESS,
-    "WorkerRestart":      PermissionMode.FULL_ACCESS,
-    "WorkerTerminate":    PermissionMode.FULL_ACCESS,
+    "WorkerSendPrompt": PermissionMode.FULL_ACCESS,
+    "WorkerRestart": PermissionMode.FULL_ACCESS,
+    "WorkerTerminate": PermissionMode.FULL_ACCESS,
     "WorkerObserveCompletion": PermissionMode.FULL_ACCESS,
-    "WorkerGet":          PermissionMode.READ_ONLY,
-    "WorkerObserve":      PermissionMode.READ_ONLY,
-    "WorkerAwaitReady":   PermissionMode.READ_ONLY,
+    "WorkerGet": PermissionMode.READ_ONLY,
+    "WorkerObserve": PermissionMode.READ_ONLY,
+    "WorkerAwaitReady": PermissionMode.READ_ONLY,
 }
 
 MODE_RANK: dict[PermissionMode, int] = {
-    # Mirrors Rust PermissionMode declaration order (derived Ord).
-    PermissionMode.READ_ONLY:       0,
+    PermissionMode.READ_ONLY: 0,
     PermissionMode.WORKSPACE_WRITE: 1,
-    PermissionMode.FULL_ACCESS:     2,
-    PermissionMode.PROMPT:          3,
-    PermissionMode.ALLOW:           4,
+    PermissionMode.FULL_ACCESS: 2,
+    PermissionMode.PROMPT: 3,
+    PermissionMode.ALLOW: 4,
 }
 
-
 # ---------------------------------------------------------------------------
-# Permission rules + hook overrides (ported from Rust permissions.rs)
+# Permission rules + hook overrides
 # ---------------------------------------------------------------------------
 
 class PermissionOverride(Enum):
     """Hook-provided override applied before standard permission evaluation."""
     ALLOW = "allow"
-    DENY  = "deny"
-    ASK   = "ask"
-
+    DENY = "deny"
+    ASK = "ask"
 
 @dataclass
 class PermissionContext:
-    """Extra context supplied by hooks/orchestration (Rust PermissionContext)."""
+    """Extra context supplied by hooks/orchestration."""
     override_decision: PermissionOverride | None = None
-    override_reason:   str | None = None
-
+    override_reason: str | None = None
 
 @dataclass
 class PermissionRequest:
-    """Authorization request presented to a prompter (Rust PermissionRequest)."""
-    tool_name:     str
-    input:         str
-    current_mode:  PermissionMode
+    """Authorization request presented to a prompter."""
+    tool_name: str
+    input: str
+    current_mode: PermissionMode
     required_mode: PermissionMode
-    reason:        str | None = None
-
+    reason: str | None = None
 
 _SUBJECT_KEYS = (
     "command", "path", "file_path", "filePath", "notebook_path",
     "notebookPath", "url", "pattern", "code", "message",
 )
-
 
 def _find_first_unescaped(value: str, needle: str) -> int | None:
     escaped = False
@@ -130,7 +122,6 @@ def _find_first_unescaped(value: str, needle: str) -> int | None:
             return idx
         escaped = False
     return None
-
 
 def _find_last_unescaped(value: str, needle: str) -> int | None:
     for pos in range(len(value) - 1, -1, -1):
@@ -145,10 +136,8 @@ def _find_last_unescaped(value: str, needle: str) -> int | None:
             return pos
     return None
 
-
 def _unescape_rule_content(content: str) -> str:
     return content.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
-
 
 def _extract_permission_subject(input_str: str) -> str | None:
     import json
@@ -163,18 +152,17 @@ def _extract_permission_subject(input_str: str) -> str | None:
                 return v
     return input_str if input_str.strip() else None
 
-
 @dataclass
 class PermissionRule:
-    raw:       str
+    raw: str
     tool_name: str
-    kind:      str = "any"   # "any" | "exact" | "prefix"
-    value:     str = ""
+    kind: str = "any" # "any" | "exact" | "prefix"
+    value: str = ""
 
     @classmethod
     def parse(cls, raw: str) -> "PermissionRule":
         trimmed = raw.strip()
-        open_i  = _find_first_unescaped(trimmed, "(")
+        open_i = _find_first_unescaped(trimmed, "(")
         close_i = _find_last_unescaped(trimmed, ")")
         if (
             open_i is not None and close_i is not None
@@ -205,7 +193,6 @@ class PermissionRule:
             return subject.startswith(self.value)
         return False
 
-
 def _find_matching_rule(
     rules: list[PermissionRule], tool_name: str, input_str: str
 ) -> PermissionRule | None:
@@ -214,14 +201,11 @@ def _find_matching_rule(
             return rule
     return None
 
-
 def _rank(mode: PermissionMode) -> int:
     return MODE_RANK.get(mode, 0)
 
-
 # ---------------------------------------------------------------------------
 # Permission policy
-# Ported from Rust: runtime/src/permissions.rs PermissionPolicy
 # ---------------------------------------------------------------------------
 
 class PermissionPolicy:
@@ -229,7 +213,6 @@ class PermissionPolicy:
     Evaluates whether a tool call is allowed under the current permission mode,
     plus allow/deny/ask rules, denied_tools, and hook overrides.
 
-    Faithful port of Rust PermissionPolicy::authorize_with_context.
     """
 
     def __init__(
@@ -237,23 +220,23 @@ class PermissionPolicy:
         mode: PermissionMode = PermissionMode.FULL_ACCESS,
         prompter: Callable[[str, str, str], bool] | None = None,
         allow_rules: list[str] | None = None,
-        deny_rules:  list[str] | None = None,
-        ask_rules:   list[str] | None = None,
+        deny_rules: list[str] | None = None,
+        ask_rules: list[str] | None = None,
         denied_tools: list[str] | None = None,
     ):
-        self.mode     = mode
-        self.prompter = prompter   # fn(tool_name, input_preview, reason) -> bool
+        self.mode = mode
+        self.prompter = prompter # fn(tool_name, input_preview, reason) -> bool
 
-        self.allow_rules  = [PermissionRule.parse(r) for r in (allow_rules or [])]
-        self.deny_rules   = [PermissionRule.parse(r) for r in (deny_rules or [])]
-        self.ask_rules    = [PermissionRule.parse(r) for r in (ask_rules or [])]
+        self.allow_rules = [PermissionRule.parse(r) for r in (allow_rules or [])]
+        self.deny_rules = [PermissionRule.parse(r) for r in (deny_rules or [])]
+        self.ask_rules = [PermissionRule.parse(r) for r in (ask_rules or [])]
         self.denied_tools = list(denied_tools or [])
 
         # session-level approvals: tool_name → always allow
         self._always_allow: set[str] = set()
 
     def required_mode_for(self, tool_name: str) -> PermissionMode:
-        """Required mode for a tool; defaults to full-access (Rust DangerFullAccess)."""
+        """Required mode for a tool; defaults to full-access."""
         return TOOL_REQUIRED_MODES.get(tool_name, PermissionMode.FULL_ACCESS)
 
     def authorize(
@@ -265,7 +248,6 @@ class PermissionPolicy:
         """
         Check if this tool call is allowed.
 
-        Faithful port of Rust PermissionPolicy::authorize_with_context — evaluation
         order: denied_tools → deny_rules → hook override → ask_rules → allow grant
         (allow_rule / Allow mode / rank ≥ required) → escalation prompt → deny.
         """
@@ -287,9 +269,9 @@ class PermissionPolicy:
                 f"Permission to use {tool_name} has been denied by rule '{deny_rule.raw}'"
             )
 
-        current  = self.mode
+        current = self.mode
         required = self.required_mode_for(tool_name)
-        ask_rule   = _find_matching_rule(self.ask_rules,   tool_name, input_str)
+        ask_rule = _find_matching_rule(self.ask_rules, tool_name, input_str)
         allow_rule = _find_matching_rule(self.allow_rules, tool_name, input_str)
 
         def _granted() -> bool:
@@ -348,7 +330,7 @@ class PermissionPolicy:
         required: PermissionMode,
         reason: str | None,
     ) -> PermissionOutcome:
-        """Prompt the user if a prompter is wired; otherwise deny (Rust prompt_or_deny)."""
+        """Prompt the user if a prompter is wired; otherwise deny."""
         if self.prompter:
             allowed = self.prompter(tool_name, input_str[:200], reason or "")
             return PermissionOutcome.allow() if allowed else PermissionOutcome.deny("User denied")
@@ -360,36 +342,7 @@ class PermissionPolicy:
         """Mark a tool as always allowed for this session (user chose 'always allow')."""
         self._always_allow.add(tool_name)
 
-
-# ---------------------------------------------------------------------------
-# Default interactive prompter for terminal use
-# ---------------------------------------------------------------------------
-
-def terminal_prompter(tool_name: str, input_preview: str, reason: str) -> bool:
-    """
-    Ask the user in the terminal whether to allow a tool call.
-    Returns True = allow, False = deny.
-    """
-    print(f"\n\033[33m⚠️  Permission required\033[0m")
-    print(f"   Tool:   {tool_name}")
-    print(f"   Reason: {reason}")
-    if input_preview:
-        print(f"   Input:  {input_preview}")
-    print()
-    print("   [a] Allow once  [A] Always allow  [d] Deny")
-
-    while True:
-        try:
-            choice = input("   Choice: ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            return False
-
-        if choice == "a":
-            return True
-        elif choice == "A":
-            # caller can check and call always_allow_tool
-            return True
-        elif choice == "d":
-            return False
-        else:
-            print("   Please enter a, A, or d")
+# Note: the old terminal_prompter() helper was removed when the CLI was
+# retired. Web-mode permission prompts will route through a UI modal in a
+# later phase; today, configure PermissionPolicy without a prompter and
+# either run in FULL_ACCESS or rely on the bash validator + sandbox.

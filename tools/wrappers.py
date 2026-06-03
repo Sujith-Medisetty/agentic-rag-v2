@@ -1,201 +1,117 @@
 """
-Tool wrappers — wraps all custom tools in LangChain StructuredTool.
-
-Safety is injected INSIDE each wrapper so LangGraph's ToolNode
-automatically enforces all safety checks on every tool call.
-
-Display features:
-  _show_diffs=True  → colored diff printed after every edit/write (CLI mode)
-  progress reporter → tool_start/tool_done events for live progress feed
+Tool registry — one decorated function per tool.
+Each tool lives in a SINGLE block:
+ schema (Pydantic, declared at module top so it's reusable)
+ + @tool decorator (binds name + schema, makes the symbol a BaseTool)
+ + @_safe_tool decorator (permissions + hooks + try/except)
+ + docstring (the LLM-visible description with usage rules)
+ + body (calls the production implementation in tools/*.py)
+Registration is just `[bash, edit_file,...]` — no StructuredTool.from_function
+ceremony, no _DESC_* constants, no separate underscore-prefixed function block.
+Public API:
+ configure_safety(...) — wire permission policy / hooks / sandbox / workspace
+ get_read_tools() — plan/explore subset (read-only)
+ get_all_tools(extra=) — full toolset (read + write + utility + multi-agent)
+ READ_TOOLS, WRITE_TOOLS, ALL_TOOLS, MULTI_AGENT_TOOLS, UTILITY_TOOLS
+Diffs and live activity stream through agents.reporter.get_reporter() events —
+WebReporter publishes them to the per-session WebSocket bus.
 """
-
+from __future__ import annotations
 import difflib
+import functools
+import inspect
 import json
-import os
-from typing import Optional
-
-from langchain_core.tools import StructuredTool, tool
+import re
+from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-
-# ── your production implementations (untouched) ──────────────────────────────
+# Production implementations (untouched). Imports aliased where the public tool
+# name collides with the underlying helper name (e.g. `read_file`).
 from tools.file_ops import (
-    read_file, write_file, edit_file,
-    grep_search, glob_search, GrepSearchInput,
+    read_file as _read_file_impl,
+    write_file as _write_file_impl,
+    edit_file as _edit_file_impl,
+    grep_search as _grep_search_impl,
+    glob_search as _glob_search_impl,
+    GrepSearchInput,
 )
 from tools.bash import execute_bash, BashInput
 from tools.git import (
     git_status, git_diff, git_log, git_show, git_blame,
     git_create_branch, git_checkout, git_add, git_commit,
-    git_push, git_pull, git_stash, git_stash_pop, git_reset,
-    git_current_branch,
+    git_push, git_pull, git_stash, git_current_branch,
 )
 from tools.web import web_fetch, web_search
-from tools.tasks import TaskManager
-from tools.github import create_pr, list_prs, get_issue
-
-# ── safety layer (untouched) ─────────────────────────────────────────────────
-from safety.bash_validator import validate_command, PermissionMode, ValidationStatus
-from safety.sandbox import SandboxStatus, execute_sandboxed, SandboxResult
-from safety.permissions import PermissionPolicy, TOOL_REQUIRED_MODES
+from tools.utils import todo_write, sleep_tool, brief
+# Safety layer (untouched).
+from safety.bash_validator import validate_command, PermissionMode
+from safety.sandbox import SandboxStatus, execute_sandboxed
+from safety.permissions import PermissionPolicy
 from safety.hooks import HookRunner
-
-
-# ---------------------------------------------------------------------------
-# Global safety context — set once at startup by main.py
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Global runtime config — wired by server.app at startup
+# ============================================================================
 _permission_policy: PermissionPolicy = PermissionPolicy()
 _hook_runner: HookRunner = HookRunner()
-_sandbox: Optional[SandboxStatus] = None
+_sandbox: SandboxStatus | None = None
 _workspace: str = "."
 _permission_mode: PermissionMode = PermissionMode.FULL_ACCESS
-
-# ---------------------------------------------------------------------------
-# Display config — set at startup by main.py
-# ---------------------------------------------------------------------------
-
-_show_diffs: bool = False   # True in CLI mode: show colored diff after every edit
-
-
-def configure_display(show_diffs: bool) -> None:
-    """Called at startup. CLI mode → show_diffs=True. Auto → False."""
-    global _show_diffs
-    _show_diffs = show_diffs
-
-
-# ---------------------------------------------------------------------------
-# Diff display helpers
-# ---------------------------------------------------------------------------
-
-_C_GREEN  = "\033[32m"
-_C_RED    = "\033[31m"
-_C_CYAN   = "\033[36m"
-_C_YELLOW = "\033[33m"
-_C_DIM    = "\033[2m"
-_C_BOLD   = "\033[1m"
-_C_RESET  = "\033[0m"
-
-
-def _print_diff(path: str, original: str, updated: str) -> None:
-    """Print unified diff with ANSI colors — only in CLI mode."""
-    if not _show_diffs:
-        return
-
-    orig_lines    = (original or "").splitlines(keepends=True)
-    updated_lines = (updated  or "").splitlines(keepends=True)
-
-    diff = list(difflib.unified_diff(
-        orig_lines, updated_lines,
-        fromfile=f"a/{path}",
-        tofile=f"b/{path}",
-        n=3,
-    ))
-
-    if not diff:
-        return
-
-    print()
-    for line in diff:
-        if line.startswith("+++ ") or line.startswith("--- "):
-            print(f"{_C_BOLD}{line}{_C_RESET}", end="")
-        elif line.startswith("@@"):
-            print(f"{_C_CYAN}{line}{_C_RESET}", end="")
-        elif line.startswith("+"):
-            print(f"{_C_GREEN}{line}{_C_RESET}", end="")
-        elif line.startswith("-"):
-            print(f"{_C_RED}{line}{_C_RESET}", end="")
-        else:
-            print(f"{_C_DIM}{line}{_C_RESET}", end="")
-    print()
-
-
-def _print_new_file(path: str, content: str) -> None:
-    """Print new file content in green — only in CLI mode."""
-    if not _show_diffs:
-        return
-
-    lines = (content or "").splitlines()
-    print(f"\n{_C_BOLD}{_C_GREEN}+++ {path} [NEW FILE]{_C_RESET}")
-    for line in lines[:60]:
-        print(f"{_C_GREEN}+{line}{_C_RESET}")
-    if len(lines) > 60:
-        print(f"{_C_DIM}... {len(lines) - 60} more lines{_C_RESET}")
-    print()
-
-
+_plan_mode_active: bool = False
+_task_manager = None # lazily created via _get_task_manager()
 def configure_safety(
     permission_policy: PermissionPolicy,
     hook_runner: HookRunner,
-    sandbox: Optional[SandboxStatus],
+    sandbox: SandboxStatus | None,
     workspace: str,
     permission_mode: PermissionMode,
 ) -> None:
-    """Called once at startup to wire safety into all tool wrappers."""
+    """Wire safety into all tool wrappers. Called once at startup."""
     global _permission_policy, _hook_runner, _sandbox, _workspace, _permission_mode
     _permission_policy = permission_policy
-    _hook_runner       = hook_runner
-    _sandbox           = sandbox
-    _workspace         = workspace
-    _permission_mode   = permission_mode
-
-
-def _check_permission(tool_name: str, input_dict: dict) -> Optional[str]:
-    """Returns error string if denied, None if allowed."""
+    _hook_runner = hook_runner
+    _sandbox = sandbox
+    _workspace = workspace
+    _permission_mode = permission_mode
+def _get_task_manager():
+    global _task_manager
+    if _task_manager is None:
+        from tools.tasks import TaskManager
+        _task_manager = TaskManager()
+    return _task_manager
+# ============================================================================
+# Safety decorator — stacks INSIDE @tool. @tool gives us the BaseTool object;
+# @_safe_tool runs the permission/hook gauntlet on every invocation.
+# ============================================================================
+def _check_permission(tool_name: str, input_dict: dict) -> str | None:
+    """Returns an error string if denied, None if allowed."""
     input_str = json.dumps(input_dict)
-
-    # pre-hook
     hook = _hook_runner.pre_tool_use(tool_name, input_str)
     if hook.denied or hook.failed:
         return "; ".join(hook.messages) or f"Hook denied '{tool_name}'"
-
-    # permission policy
     perm = _permission_policy.authorize(tool_name, input_str)
     if not perm.allowed:
         return perm.reason
-
     return None
-
-import functools
-
-# ---------------------------------------------------------------------------
-# Safety decorator — permission check + pre-hook + try/except + post-hook
-# Apply to tools that don't need special diff display or sandbox logic
-# ---------------------------------------------------------------------------
-
 def _safe_tool(tool_name: str):
-    """
-    Wraps a tool function with:
-      1. Permission check (returns BLOCKED if denied)
-      2. Pre-hook (user-configured shell script)
-      3. try/except (returns Error: message on exception)
-      4. Post-hook on success or failure
-
-    Use for tools that have no special display logic (no diff, no sandbox).
-    _write_file, _edit_file, _bash keep their explicit bodies for diff/sandbox.
-    """
+    """Wrap a tool function with permission check + pre/post hooks + try/except.
+    Apply to tools that have no custom display logic (no diff, no sandbox).
+    Tools that need bespoke bodies (write_file/edit_file/bash) inline the same
+    checks instead of stacking this decorator."""
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             inp_dict = kwargs or {}
             if args:
-                import inspect
-                sig    = inspect.signature(fn)
+                sig = inspect.signature(fn)
                 params = list(sig.parameters.keys())
                 inp_dict = {**{params[i]: a for i, a in enumerate(args)}, **kwargs}
-
             inp_str = json.dumps({k: v for k, v in inp_dict.items()
-                                  if isinstance(v, (str, int, bool, type(None)))})
-
-            # pre-hook
+                if isinstance(v, (str, int, bool, type(None)))})
             hook = _hook_runner.pre_tool_use(tool_name, inp_str)
             if hook.denied or hook.failed:
                 return "; ".join(hook.messages) or f"Hook denied '{tool_name}'"
-
-            # permission check
             perm = _permission_policy.authorize(tool_name, inp_str)
             if not perm.allowed:
                 return f"BLOCKED: {perm.reason}"
-
             try:
                 result = fn(*args, **kwargs)
                 _hook_runner.post_tool_use(tool_name, inp_str, str(result)[:200])
@@ -205,140 +121,229 @@ def _safe_tool(tool_name: str):
                 return f"Error: {e}"
         return wrapper
     return decorator
-
-
-
-# ---------------------------------------------------------------------------
-# Pydantic schemas for each tool
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# Diff + reporter helpers used by file/agent tools
+# ============================================================================
+def _build_unified_diff(path: str, before: str, after: str) -> str:
+    """Plain unified-diff string published to the UI via the file_changed event."""
+    return "".join(difflib.unified_diff(
+        (before or "").splitlines(keepends=True),
+        (after or "").splitlines(keepends=True),
+        fromfile=f"a/{path}", tofile=f"b/{path}", n=3,
+    ))
+def _safe_report(fn):
+    """Call a reporter method, swallowing any error so a busted reporter
+    never breaks a tool call. Used at every reporter call-site."""
+    try:
+        fn()
+    except Exception:
+        pass
+# ============================================================================
+# Pydantic input schemas — declared up here so @tool(args_schema=...) can bind
+# them, and so the LLM sees rich Field(description=...) hints per argument.
+# ============================================================================
 class ReadFileInput(BaseModel):
-    path:   str            = Field(description="Absolute or relative path to the file")
-    offset: Optional[int]  = Field(None, description="Line number to start reading from")
-    limit:  Optional[int]  = Field(None, description="Maximum number of lines to read")
-
+    path: str = Field(description="Absolute or relative path to the file")
+    offset: int | None = Field(None, description="1-indexed line number to start reading from")
+    limit: int | None = Field(None, description="Maximum number of lines to read")
 class WriteFileInput(BaseModel):
-    path:    str = Field(description="Path to write to (creates parent dirs)")
+    path: str = Field(description="Path to write to (creates parent dirs)")
     content: str = Field(description="Full file content to write")
-
 class EditFileInput(BaseModel):
-    path:        str  = Field(description="Path of the file to edit")
-    old_string:  str  = Field(description="Exact text to find and replace")
-    new_string:  str  = Field(description="Replacement text")
-    replace_all: bool = Field(False, description="Replace all occurrences (default: first only)")
-
+    path: str = Field(description="Path of the file to edit")
+    old_string: str = Field(description="Exact text to find and replace (whitespace-sensitive, must be unique unless replace_all)")
+    new_string: str = Field(description="Replacement text (must differ from old_string)")
+    replace_all: bool = Field(False, description="Replace every occurrence (default: just the first)")
 class GrepInput(BaseModel):
-    pattern:          str            = Field(description="Regex pattern to search for")
-    path:             Optional[str]  = Field(None, description="Directory to search in")
-    glob:             Optional[str]  = Field(None, description="File glob filter e.g. *.py")
-    output_mode:      Optional[str]  = Field(None, description="files_with_matches | content | count")
-    before:           Optional[int]  = Field(None, description="Lines of context before match")
-    after:            Optional[int]  = Field(None, description="Lines of context after match")
-    case_insensitive: Optional[bool] = Field(None, description="Case-insensitive search")
-    file_type:        Optional[str]  = Field(None, description="Filter by extension e.g. py")
-    head_limit:       Optional[int]  = Field(None, description="Max results to return")
-    multiline:        Optional[bool] = Field(None, description="Enable dot to match newlines")
-    line_numbers:     Optional[bool] = Field(None, description="Show line numbers (default True)")
-
+    pattern: str = Field(description="Regex pattern to search for")
+    path: str | None = Field(None, description="Directory to search in")
+    glob: str | None = Field(None, description="File glob filter e.g. *.py")
+    output_mode: str | None = Field(None, description="files_with_matches | content | count")
+    before: int | None = Field(None, description="Lines of context before each match")
+    after: int | None = Field(None, description="Lines of context after each match")
+    case_insensitive: bool | None = Field(None, description="Case-insensitive search")
+    file_type: str | None = Field(None, description="Filter by extension e.g. py")
+    head_limit: int | None = Field(None, description="Cap total results")
+    multiline: bool | None = Field(None, description="Let `.` match newlines and `^`/`$` match line boundaries")
+    line_numbers: bool | None = Field(None, description="Show line numbers (default True)")
 class GlobInput(BaseModel):
-    pattern: str           = Field(description="Glob pattern e.g. **/*.py")
-    path:    Optional[str] = Field(None, description="Base directory (default: cwd)")
-
+    pattern: str = Field(description="Glob pattern e.g. **/*.py")
+    path: str | None = Field(None, description="Base directory (default: cwd)")
 class BashInputSchema(BaseModel):
-    command:           str           = Field(description="Shell command to execute")
-    timeout:           Optional[int] = Field(None, description="Timeout in milliseconds")
-    run_in_background: bool          = Field(False, description="Run without waiting for output")
-
+    command: str = Field(description="Shell command to execute")
+    timeout: int | None = Field(None, description="Timeout in MILLISECONDS (max 600000, default 120000)")
+    run_in_background: bool = Field(False, description="Run without waiting; the call returns immediately")
 class GitInput(BaseModel):
-    action: str            = Field(description="status|diff|log|show|blame|branch|commit|push|pull|stash")
-    path:   Optional[str]  = Field(None)
-    commit: Optional[str]  = Field(None)
-    staged: Optional[bool] = Field(None)
-    count:  Optional[int]  = Field(None)
-    message: Optional[str] = Field(None)
-    branch:  Optional[str] = Field(None)
-
+    action: str = Field(description="status|diff|log|show|blame|branch|checkout|add|commit|push|pull|stash")
+    path: str | None = Field(None)
+    commit: str | None = Field(None)
+    staged: bool | None = Field(None)
+    count: int | None = Field(None)
+    message: str | None = Field(None)
+    branch: str | None = Field(None)
 class WebFetchInput(BaseModel):
-    url:     str           = Field(description="URL to fetch")
-    timeout: Optional[int] = Field(None, description="Timeout in seconds")
-
+    url: str = Field(description="URL to fetch")
+    timeout: int | None = Field(None, description="Timeout in seconds (default 20)")
 class WebSearchInput(BaseModel):
-    query:           str             = Field(description="Search query")
-    allowed_domains: Optional[list]  = Field(None)
-    blocked_domains: Optional[list]  = Field(None)
-
-
-# ---------------------------------------------------------------------------
-# Tool wrapper functions — safety injected here
-# ---------------------------------------------------------------------------
-
+    query: str = Field(description="Search query")
+    allowed_domains: list | None = Field(None, description="Only return results from these domains")
+    blocked_domains: list | None = Field(None, description="Exclude these domains")
+class GitHubInput(BaseModel):
+    action: str = Field(description="get_issue | list_issues | comment_issue | create_pr | get_pr | list_prs | get_repo_info | get_file")
+    repo: str = Field(description="owner/repo e.g. anthropics/claude")
+    issue_number: int | None = Field(None)
+    pr_number: int | None = Field(None)
+    title: str | None = Field(None, description="PR title (keep under 70 chars)")
+    body: str | None = Field(None, description="PR body (use ## Summary + ## Test plan format)")
+    branch: str | None = Field(None, description="Head branch for PR creation")
+    base_branch: str | None = Field(None, description="Base branch (default: main)")
+    path: str | None = Field(None)
+    state: str | None = Field(None, description="open | closed | all")
+    comment: str | None = Field(None)
+class TodoItem(BaseModel):
+    content: str = Field(description="Task description (imperative form)")
+    status: str = Field(description="pending | in_progress | completed")
+    activeForm: str = Field(description="Present-continuous label shown in progress UI")
+class TodoWriteInput(BaseModel):
+    todos: list[TodoItem] = Field(description="The FULL todo list (writes are total, not incremental)")
+class SleepInput(BaseModel):
+    duration_ms: int = Field(description="Milliseconds to wait (max 300000)")
+class AskUserInput(BaseModel):
+    question: str = Field(description="The single, grounded question to ask")
+    options: list | None = Field(None, description="Optional list of choices for a closed question")
+class SendMessageInput(BaseModel):
+    message: str = Field(description="Progress update or interim finding to send to the user")
+class ToolSearchInput(BaseModel):
+    query: str = Field(description="Free-text query, or 'select:Tool1,Tool2' for exact lookup")
+class PlanModeInput(BaseModel):
+    pass # no parameters
+class TaskCreateInput(BaseModel):
+    prompt: str = Field(description="What to track")
+    description: str | None = Field(None, description="Optional longer description")
+class TaskIdInput(BaseModel):
+    task_id: str = Field(description="Task ID returned by TaskCreate")
+class TaskUpdateInput(BaseModel):
+    task_id: str = Field(description="Task ID")
+    message: str = Field(description="Progress message to append to the task's log")
+class TaskListInput(BaseModel):
+    status: str | None = Field(None, description="Filter by status (e.g. running, completed)")
+class AgentToolInput(BaseModel):
+    description: str = Field(description="Short description of the delegated task")
+    prompt: str = Field(description="Self-contained task prompt — sub-agents have no memory of this conversation")
+    subagent_type: str | None = Field(None, description="general-purpose | Explore | Plan | Verification | claw-guide | statusline-setup")
+    name: str | None = Field(None, description="Optional name for the sub-agent")
+    model: str | None = Field(None, description="Optional model override")
+class AgentStatusInput(BaseModel):
+    agent_id: str = Field(description="The agent_id returned by a prior Agent spawn")
+# ============================================================================
+# FILE TOOLS
+# ============================================================================
+@tool("read_file", args_schema=ReadFileInput)
 @_safe_tool("read_file")
-def _read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = None) -> str:
-    result = read_file(path, offset, limit)
+def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
+    """Read a text file from disk. Use this (NOT `bash` with cat/head/tail) for any file you need to inspect.
+    Usage:
+    - `path` may be absolute or relative to the workspace.
+    - For large files, pass `offset` (1-indexed start line) and `limit` (max lines) to window the read.
+    - Line numbers are returned in the output — use them when referencing code back to the user as `path:line`.
+    - You MUST have read a file at least once this conversation before calling `edit_file` on it. Reading is also the safest way to confirm an edit landed correctly.
+    """
+    result = _read_file_impl(path, offset, limit)
     f = result.file
-    header = f"File: {f.filePath} (lines {f.startLine}-{f.startLine + f.numLines - 1} of {f.totalLines})\n{'-'*40}\n"
+    header = (
+        f"File: {f.filePath} "
+        f"(lines {f.startLine}-{f.startLine + f.numLines - 1} of {f.totalLines})\n"
+        f"{'-' * 40}\n"
+    )
     return header + f.content
-
-
-def _write_file(path: str, content: str) -> str:
+@tool("write_file", args_schema=WriteFileInput)
+def write_file(path: str, content: str) -> str:
+    """Create a new file, or overwrite an existing one with brand-new content. Parent directories are created automatically.
+    Usage:
+    - Prefer `edit_file` for modifying existing files — it only changes the targeted region and is much safer.
+    - Only use `write_file` for genuinely new files, or when the entire file is being replaced.
+    - If overwriting an existing file, read it first so you don't drop content you didn't mean to.
+    - Do NOT create README, docs, or planning files unless the user explicitly asks for them.
+    - Do not use emojis in file content unless requested.
+    """
     err = _check_permission("write_file", {"path": path})
     if err:
         return f"BLOCKED: {err}"
     try:
-        result = write_file(path, content)
-        verb   = "Created" if result.type == "create" else "Updated"
-
-        # show diff / new file content in CLI mode
-        if result.type == "create":
-            _print_new_file(result.filePath, result.content)
-        else:
-            _print_diff(result.filePath, result.originalFile or "", result.content)
-
-        _hook_runner.post_tool_use("write_file", json.dumps({"path": path}),
-                                   f"{verb}: {result.filePath}")
-
+        result = _write_file_impl(path, content)
+        verb = "Created" if result.type == "create" else "Updated"
+        # Notify the UI — diff for overwrites, full content for creates.
+        from agents.reporter import get_reporter
+        kind = "create" if result.type == "create" else "edit"
+        diff_text = (result.content if result.type == "create"
+            else _build_unified_diff(result.filePath, result.originalFile or "", result.content))
+        _safe_report(lambda: get_reporter().file_changed(
+            path=result.filePath, kind=kind,
+            diff=diff_text, bytes_count=len(result.content),
+        ))
+        _hook_runner.post_tool_use(
+            "write_file", json.dumps({"path": path}), f"{verb}: {result.filePath}"
+        )
         return f"{verb}: {result.filePath} ({len(result.content)} bytes)"
     except Exception as e:
         _hook_runner.post_tool_failure("write_file", json.dumps({"path": path}), str(e))
         return f"Error: {e}"
-
-
-def _edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+@tool("edit_file", args_schema=EditFileInput)
+def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Make a precise text replacement in an existing file. Strongly preferred over `write_file` for any change to an existing file.
+    Usage:
+    - You MUST have read the file at least once this conversation before calling `edit_file` on it.
+    - `old_string` must match the file EXACTLY, including all whitespace, indentation (tabs vs spaces), and line endings. Copy directly from `read_file` output (excluding the line-number prefix).
+    - `old_string` must be unique in the file. If it isn't, add more surrounding context to make it unique, or set `replace_all=true` to replace every occurrence (useful for variable/identifier renames).
+    - `new_string` must differ from `old_string`, and the result should remain syntactically valid.
+    - For multiple edits to the same file, prefer several focused `edit_file` calls over one large rewrite — easier to review and to rollback if one fails.
+    """
     inp = {"path": path, "old_string": old_string, "new_string": new_string}
     err = _check_permission("edit_file", inp)
     if err:
         return f"BLOCKED: {err}"
     try:
-        result = edit_file(path, old_string, new_string, replace_all)
-        reps   = result.originalFile.count(old_string) if replace_all else 1
-
-        # show colored diff in CLI mode — computed from original vs updated content
-        updated = result.originalFile.replace(old_string, new_string,
-                                               0 if replace_all else 1)
-        _print_diff(result.filePath, result.originalFile, updated)
-
+        result = _edit_file_impl(path, old_string, new_string, replace_all)
+        reps = result.originalFile.count(old_string) if replace_all else 1
+        updated = result.originalFile.replace(
+            old_string, new_string, 0 if replace_all else 1
+        )
+        # Notify the UI — always a unified diff for edits.
+        from agents.reporter import get_reporter
+        diff_text = _build_unified_diff(result.filePath, result.originalFile, updated)
+        _safe_report(lambda: get_reporter().file_changed(
+            path=result.filePath, kind="edit",
+            diff=diff_text, bytes_count=len(updated),
+        ))
         out = f"Edited: {result.filePath}\nReplacements: {reps}"
         _hook_runner.post_tool_use("edit_file", json.dumps(inp), out)
-
         return out
     except Exception as e:
         _hook_runner.post_tool_failure("edit_file", json.dumps(inp), str(e))
         return f"Error: {e}"
-
-
-def _grep_search(
+@tool("grep_search", args_schema=GrepInput)
+def grep_search(
     pattern: str,
-    path: Optional[str] = None,
-    glob: Optional[str] = None,
-    output_mode: Optional[str] = None,
-    before: Optional[int] = None,
-    after: Optional[int] = None,
-    case_insensitive: Optional[bool] = None,
-    file_type: Optional[str] = None,
-    head_limit: Optional[int] = None,
-    multiline: Optional[bool] = None,
-    line_numbers: Optional[bool] = None,
+    path: str | None = None,
+    glob: str | None = None,
+    output_mode: str | None = None,
+    before: int | None = None,
+    after: int | None = None,
+    case_insensitive: bool | None = None,
+    file_type: str | None = None,
+    head_limit: int | None = None,
+    multiline: bool | None = None,
+    line_numbers: bool | None = None,
 ) -> str:
+    """Regex search across files in the workspace. Use this (NOT `bash` with grep) for code search — it returns structured results with line numbers and respects `.gitignore`.
+    Usage:
+    - `pattern` is a regex; quote special characters.
+    - Scope the search with `path` (directory), `glob` (e.g. `**/*.py`), or `file_type` (extension, e.g. `py`).
+    - `output_mode`: `files_with_matches` (default) lists matching files; `content` returns matched lines; `count` returns per-file match counts.
+    - `before` / `after` add context lines around each match (useful with `output_mode=content`).
+    - `head_limit` caps total results; use it on broad searches.
+    - `multiline=true` lets `.` match newlines and `^`/`$` match line boundaries for cross-line patterns.
+    """
     try:
         inp = GrepSearchInput(
             pattern=pattern, path=path, glob=glob,
@@ -346,45 +351,74 @@ def _grep_search(
             case_insensitive=case_insensitive, file_type=file_type,
             head_limit=head_limit, multiline=multiline, line_numbers=line_numbers,
         )
-        result = grep_search(inp)
+        result = _grep_search_impl(inp)
         if result.content:
             return result.content
         return f"Found in {result.numFiles} files: {', '.join(result.filenames[:10])}"
     except Exception as e:
         return f"Error: {e}"
-
-
+@tool("glob_search", args_schema=GlobInput)
 @_safe_tool("glob_search")
-def _glob_search(pattern: str, path: Optional[str] = None) -> str:
-    result = glob_search(pattern, path)
+def glob_search(pattern: str, path: str | None = None) -> str:
+    """Find files by glob pattern, sorted by modification time (newest first). Use this (NOT `bash` with find) when you need files matching a name or path pattern.
+    Examples: `**/*.py`, `src/**/test_*.ts`, `config/*.{yaml,yml}`.
+    """
+    result = _glob_search_impl(pattern, path)
     if not result.filenames:
         return "No files found."
     lines = [f"Found {result.numFiles} files ({result.durationMs}ms):"] + result.filenames[:50]
     if result.truncated:
         lines.append("... (truncated to 100 results)")
     return "\n".join(lines)
-
-
-def _bash(command: str, timeout: Optional[int] = None, run_in_background: bool = False) -> str:
+# ============================================================================
+# BASH
+# ============================================================================
+@tool("bash", args_schema=BashInputSchema)
+def bash(command: str, timeout: int | None = None, run_in_background: bool = False) -> str:
+    """Execute a shell command in the workspace. Use ONLY for operations a dedicated tool doesn't cover (build, test, install, run, package managers, git operations beyond the `git` tool's actions).
+    DO NOT use bash for:
+    - Reading files → use `read_file`.
+    - Editing files → use `edit_file` / `write_file`.
+    - Searching code → use `grep_search` / `glob_search`.
+    - `cat`, `head`, `tail`, `sed`, `awk`, `echo >file`, `find` for code lookup — all have better dedicated tools above.
+    Usage:
+    - `timeout` is in MILLISECONDS (default 120000, max 600000).
+    - Set `run_in_background=true` for long-running processes (dev servers, watchers); the call returns immediately.
+    - Quote paths containing spaces with double quotes.
+    - Run independent commands as PARALLEL tool calls in the same message, not chained sequentially. Use `&&` only when a later command truly depends on an earlier one succeeding; use `;` only when you don't care about earlier failures. Avoid splitting commands with newlines.
+    - When running `find`, search from `.` or a specific path — never from `/`.
+    - Avoid leading `sleep` loops; the harness enforces caps. Prefer `run_in_background=true` and poll the result.
+    Git commits (use ONLY when the user explicitly asks for a commit):
+    - Always create NEW commits — never `--amend` unless the user asks.
+    - Never `--no-verify`, never skip hooks or signing, never force-push to `main` / `master`.
+    - Stage specific files by name. Avoid `git add -A` / `git add.` — they can sweep in secrets or large binaries.
+    - Pass commit messages via a HEREDOC for clean formatting:
+    git commit -m "$(cat <<'EOF'
+    Short imperative subject line.
+    Optional body explaining WHY.
+    EOF
+    )"
+    - Before destructive operations (`reset --hard`, `push --force`, `checkout --`, `branch -D`, `clean -f`), prefer a safer alternative and confirm with the user first.
+    """
     inp = {"command": command}
     err = _check_permission("bash", inp)
     if err:
         return f"BLOCKED: {err}"
-
     # bash-specific validator
     val = validate_command(command, _permission_mode, _workspace)
     if val.is_blocked:
         return f"BLOCKED: {val.message}"
     if val.is_warning:
-        print(f"\033[33m⚠️  {val.message}\033[0m")
-
+        # Warnings surface to the UI via tool_done's preview; nothing to print.
+        from agents.reporter import get_reporter
+        _safe_report(lambda: get_reporter().message(f"bash warning: {val.message}"))
     try:
         if _sandbox and _sandbox.active:
             timeout_sec = timeout / 1000.0 if timeout else None
             result = execute_sandboxed(command, _sandbox, timeout_sec)
             parts = []
-            if result.stdout:  parts.append(result.stdout)
-            if result.stderr:  parts.append(f"[stderr]\n{result.stderr}")
+            if result.stdout: parts.append(result.stdout)
+            if result.stderr: parts.append(f"[stderr]\n{result.stderr}")
             if result.exit_code != 0:
                 parts.append(f"[exit code: {result.exit_code}]")
             out = "\n".join(parts) or "(no output)"
@@ -399,23 +433,26 @@ def _bash(command: str, timeout: Optional[int] = None, run_in_background: bool =
             if raw.return_code_interpretation:
                 parts.append(f"[{raw.return_code_interpretation}]")
             out = "\n".join(parts) or "(no output)"
-
         _hook_runner.post_tool_use("bash", json.dumps(inp), out[:500])
         return out
     except Exception as e:
         _hook_runner.post_tool_failure("bash", json.dumps(inp), str(e))
         return f"Error: {e}"
-
-
-def _git(
+# ============================================================================
+# GIT (write-mode full; git_read is the plan-mode subset)
+# ============================================================================
+def _git_dispatch(
     action: str,
-    path: Optional[str] = None,
-    commit: Optional[str] = None,
-    staged: Optional[bool] = None,
-    count: Optional[int] = None,
-    message: Optional[str] = None,
-    branch: Optional[str] = None,
+    path: str | None = None,
+    commit: str | None = None,
+    staged: bool | None = None,
+    count: int | None = None,
+    message: str | None = None,
+    branch: str | None = None,
 ) -> str:
+    """Shared implementation behind both `git` and `git_read`. Routes the action
+    to the matching tools.git helper and enforces permission checks on the
+    write-side actions (add / commit / push)."""
     cwd = path or _workspace
     try:
         if action == "status":
@@ -452,58 +489,49 @@ def _git(
             return f"Unknown git action: {action}"
     except Exception as e:
         return f"Error: {e}"
-
-
-class GitHubInput(BaseModel):
-    action:       str            = Field(description="get_issue | list_issues | comment_issue | create_pr | get_pr | list_prs | get_repo_info | get_file")
-    repo:         str            = Field(description="owner/repo e.g. anthropics/claude")
-    issue_number: Optional[int]  = Field(None)
-    pr_number:    Optional[int]  = Field(None)
-    title:        Optional[str]  = Field(None)
-    body:         Optional[str]  = Field(None)
-    branch:       Optional[str]  = Field(None)
-    base_branch:  Optional[str]  = Field(None)
-    path:         Optional[str]  = Field(None)
-    state:        Optional[str]  = Field(None)
-    comment:      Optional[str]  = Field(None)
-
-
-def _github(action: str, repo: str, **kwargs) -> str:
-    err = _check_permission("github", {"action": action, "repo": repo})
-    if err:
-        return f"BLOCKED: {err}"
-    try:
-        from tools.github import get_issue, list_prs, create_pr
-        if action == "get_issue":
-            result = get_issue(repo=repo, issue_number=kwargs.get("issue_number", 1))
-            return str(result)
-        elif action in ("list_prs", "get_pr"):
-            result = list_prs(repo=repo, state=kwargs.get("state", "open"))
-            return str(result)
-        elif action == "create_pr":
-            result = create_pr(
-                repo        = repo,
-                title       = kwargs.get("title", ""),
-                body        = kwargs.get("body", ""),
-                head_branch = kwargs.get("branch", ""),
-                base_branch = kwargs.get("base_branch", "main"),
-            )
-            return f"PR created: {result.url}"
-        else:
-            return f"Unknown github action: {action}"
-    except Exception as e:
-        return f"Error: {e}"
-
-@_safe_tool("WebFetch")
-def _web_fetch(url: str, timeout: Optional[int] = None) -> str:
-    return web_fetch(url, timeout=timeout or 20).result[:8000]
-
-
-def _web_search(
-    query: str,
-    allowed_domains: Optional[list] = None,
-    blocked_domains: Optional[list] = None,
+@tool("git", args_schema=GitInput)
+def git(
+    action: str,
+    path: str | None = None,
+    commit: str | None = None,
+    staged: bool | None = None,
+    count: int | None = None,
+    message: str | None = None,
+    branch: str | None = None,
 ) -> str:
+    """Git write operations: `status`, `diff`, `log`, `show`, `blame`, `branch`, `checkout`, `add`, `commit`, `push`, `pull`, `stash`. Use this in preference to `bash git...` for the actions it covers.
+    For anything outside this set (rebase, cherry-pick, complex log queries, or HEREDOC-formatted commit messages), fall back to `bash` and follow the git-commit protocol documented in the `bash` tool description.
+    """
+    return _git_dispatch(action, path, commit, staged, count, message, branch)
+@tool("git_read", args_schema=GitInput)
+def git_read(
+    action: str = "status",
+    path: str | None = None,
+    commit: str | None = None,
+    staged: bool | None = None,
+    count: int | None = None,
+    message: str | None = None,
+    branch: str | None = None,
+) -> str:
+    """Git read-only operations: `status`, `diff`, `log`, `show`, `blame`. Use this in plan/explore mode instead of `bash`.
+    For commit / push / branch-creating operations, use the full `git` tool (write mode only).
+    """
+    return _git_dispatch(action, path, commit, staged, count, message, branch)
+# ============================================================================
+# WEB
+# ============================================================================
+@tool("WebFetch", args_schema=WebFetchInput)
+@_safe_tool("WebFetch")
+def WebFetch(url: str, timeout: int | None = None) -> str:
+    """Fetch a URL and return its content as clean, readable text (HTML stripped). Use for documentation pages, RFCs, or any URL the user supplies. Output is truncated to ~8000 characters."""
+    return web_fetch(url, timeout=timeout or 20).result[:8000]
+@tool("WebSearch", args_schema=WebSearchInput)
+def WebSearch(
+    query: str,
+    allowed_domains: list | None = None,
+    blocked_domains: list | None = None,
+) -> str:
+    """Search the web (DuckDuckGo). Returns a ranked list of title + URL results. Pair with `WebFetch` to read the most relevant hit. Use `allowed_domains` / `blocked_domains` to scope results."""
     try:
         result = web_search(query, allowed_domains, blocked_domains)
         if not result.results:
@@ -514,61 +542,54 @@ def _web_search(
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Utility tools — TodoWrite, Sleep, AskUserQuestion, SendUserMessage,
-#                 ToolSearch, EnterPlanMode, ExitPlanMode,
-#                 TaskCreate/Update/Get/List/Stop/Output
-# ---------------------------------------------------------------------------
-
-from tools.utils import todo_write, sleep_tool, ask_user_question, brief
-
-
-# ── Pydantic schemas ──────────────────────────────────────────────────────────
-
-class TodoItem(BaseModel):
-    content:    str = Field(description="Task description")
-    status:     str = Field(description="pending | in_progress | completed")
-    activeForm: str = Field(description="Identifier for the task form")
-
-class TodoWriteInput(BaseModel):
-    todos: list[TodoItem] = Field(description="Full todo list to write")
-
-class SleepInput(BaseModel):
-    duration_ms: int = Field(description="Milliseconds to wait (max 300000)")
-
-class AskUserInput(BaseModel):
-    question: str             = Field(description="Question to ask the user")
-    options:  Optional[list]  = Field(None, description="Optional list of choices")
-
-class SendMessageInput(BaseModel):
-    message: str = Field(description="Message or status update to send to the user")
-
-class ToolSearchInput(BaseModel):
-    query: str = Field(description="Search query e.g. 'file edit', 'select:bash,git'")
-
-class PlanModeInput(BaseModel):
-    pass   # no parameters
-
-class TaskCreateInput(BaseModel):
-    prompt:      str           = Field(description="Task description / what to track")
-    description: Optional[str] = Field(None, description="Longer description")
-
-class TaskIdInput(BaseModel):
-    task_id: str = Field(description="Task ID returned by TaskCreate")
-
-class TaskUpdateInput(BaseModel):
-    task_id: str = Field(description="Task ID")
-    message: str = Field(description="Progress message to append")
-
-class TaskListInput(BaseModel):
-    status: Optional[str] = Field(None, description="Filter by status e.g. running")
-
-
-# ── Tool functions ────────────────────────────────────────────────────────────
-
-def _todo_write(todos: list) -> str:
+# ============================================================================
+# GITHUB
+# ============================================================================
+@tool("github", args_schema=GitHubInput)
+def github(action: str, repo: str, **kwargs) -> str:
+    """GitHub API (via `gh` CLI). Actions: `get_issue`, `list_issues`, `comment_issue`, `create_pr`, `get_pr`, `list_prs`, `get_repo_info`, `get_file`.
+    PR creation:
+    - Keep titles under 70 characters; use the body for detail.
+    - Body format: `## Summary` with 1–3 bullets, then `## Test plan` with a markdown checklist of how to verify.
+    - When constructing the body in `bash`, use a HEREDOC (`gh pr create --body "$(cat <<'EOF'... EOF)"`) to preserve formatting.
+    - Only create a PR when the user explicitly asks for one.
+    """
+    err = _check_permission("github", {"action": action, "repo": repo})
+    if err:
+        return f"BLOCKED: {err}"
+    try:
+        from tools.github import get_issue, list_prs, create_pr
+        if action == "get_issue":
+            return str(get_issue(repo=repo, issue_number=kwargs.get("issue_number", 1)))
+        elif action in ("list_prs", "get_pr"):
+            return str(list_prs(repo=repo, state=kwargs.get("state", "open")))
+        elif action == "create_pr":
+            result = create_pr(
+                repo = repo,
+                title = kwargs.get("title", ""),
+                body = kwargs.get("body", ""),
+                head_branch = kwargs.get("branch", ""),
+                base_branch = kwargs.get("base_branch", "main"),
+            )
+            return f"PR created: {result.url}"
+        else:
+            return f"Unknown github action: {action}"
+    except Exception as e:
+        return f"Error: {e}"
+# ============================================================================
+# UTILITY — TodoWrite / Sleep / AskUserQuestion / SendUserMessage / ToolSearch
+# / EnterPlanMode / ExitPlanMode / Task*
+# ============================================================================
+@tool("TodoWrite", args_schema=TodoWriteInput)
+def TodoWrite(todos: list) -> str:
+    """Create or update your todo list for this conversation. Use this at the start of any multi-step task (3+ distinct steps) to plan the work, and update it as you progress.
+    Usage:
+    - Pass the FULL todo list every call (writes are total, not incremental). Add new items, change statuses, or drop completed ones.
+    - Each item: `content` (imperative, e.g. "Add tone/style section"), `status` (`pending` | `in_progress` | `completed`), `activeForm` (present-continuous shown in progress UI, e.g. "Adding tone/style section").
+    - Exactly ONE item should be `in_progress` at a time. Set it BEFORE starting that step.
+    - Mark each item `completed` the MOMENT it finishes — never batch completions at the end of the task.
+    - Skip TodoWrite entirely for trivial single-step requests.
+    """
     try:
         items = [
             {"content": t["content"], "status": t["status"], "activeForm": t["activeForm"]}
@@ -577,135 +598,156 @@ def _todo_write(todos: list) -> str:
             for t in todos
         ]
         result = todo_write(items)
-        icons  = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
-        lines  = ["Updated todo list:"]
+        # Notify the UI — full current list so reload / late-joining clients
+        # see the same state without replaying every prior TodoWrite call.
+        from agents.reporter import get_reporter
+        _safe_report(lambda: get_reporter().todo_update(list(result.new_todos)))
+        icons = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+        lines = ["Updated todo list:"]
         for t in result.new_todos:
-            lines.append(f"  {icons.get(t['status'], '[ ]')} {t['content']}")
+            lines.append(f" {icons.get(t['status'], '[ ]')} {t['content']}")
         if result.verification_nudge_needed:
             lines.append("(consider adding a verification step)")
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
-
-
+@tool("Sleep", args_schema=SleepInput)
 @_safe_tool("Sleep")
-def _sleep(duration_ms: int) -> str:
+def Sleep(duration_ms: int) -> str:
+    """Pause for `duration_ms` milliseconds (max 300000). Use sparingly — only when you need to wait for a backgrounded process to make progress (e.g. dev server boot).
+    Prefer polling the actual state (read a file, check a port) over a fixed sleep when possible.
+    """
     return f"Slept for {sleep_tool(duration_ms)['slept_ms']}ms."
-
-
-def _ask_user_question(question: str, options: Optional[list] = None) -> str:
+@tool("AskUserQuestion", args_schema=AskUserInput)
+def AskUserQuestion(question: str, options: list | None = None) -> str:
+    """Ask the user a single clarifying question and wait for their answer. Asking has a cost — it interrupts the user and is often answerable by looking at the codebase yourself.
+    Before asking:
+    - Spend up to ~1 minute on read-only investigation (grep, read config, check docs) so your question is specific and grounded.
+    - Prefer "I found A and B in `config.yaml` — which do you want?" over "what config?"
+    Usage:
+    - One question at a time, phrased so it's answerable in a short reply.
+    - Optionally pass `options` (list of choices) for a closed question.
     """
-    In LangGraph: uses interrupt() to pause the graph and wait for user input.
-    Falls back to terminal input if not inside a graph execution.
-    """
+    # LangGraph's `interrupt()` pauses the graph and surfaces the question
+    # to the runner. The web backend will route this to a UI modal in a
+    # later phase; for now, if no UI is listening (or the call fails)
+    # we return a clear marker so the model can adapt rather than blocking
+    # on terminal input that no longer exists.
     try:
         from langgraph.types import interrupt
-        answer = interrupt({"type": "question", "question": question, "options": options or []})
+        answer = interrupt(
+            {"type": "question", "question": question, "options": options or []}
+        )
         return str(answer) if answer else ""
     except Exception:
-        return ask_user_question(question, options)
-
-
-def _send_user_message(message: str) -> str:
+        return (
+            "(no interactive user available — please proceed with your best "
+            "guess, then explain the assumption in your reply)"
+        )
+@tool("SendUserMessage", args_schema=SendMessageInput)
+def SendUserMessage(message: str) -> str:
+    """Send a progress update or interim finding to the user during a long task. Use sparingly — only for milestones the user actually wants to see (e.g. "finished exploration, starting implementation").
+    Do not use as a substitute for the end-of-turn summary.
+    """
     try:
-        from ui.progress import get_reporter
+        from agents.reporter import get_reporter
         get_reporter().message(message)
         result = brief(message)
         return f"Message sent: {result.message}"
     except Exception as e:
         return f"Error: {e}"
-
-
-def _tool_search(query: str) -> str:
-    """Search all registered tools by name or description."""
-    import re
+@tool("ToolSearch", args_schema=ToolSearchInput)
+def ToolSearch(query: str) -> str:
+    """Search available tools by name or keyword. Use to discover tools whose schemas aren't loaded yet, or to find the right tool for a task.
+    Usage:
+    - `select:Tool1,Tool2,...` — load these exact tool schemas (use when you already know the names).
+    - Free-text query — ranked keyword search across tool names and descriptions; top 5 returned.
+    """
     query_lower = query.strip().lower()
-
     if query_lower.startswith("select:"):
-        names   = [n.strip() for n in query_lower[7:].split(",") if n.strip()]
+        names = [n.strip() for n in query_lower[7:].split(",") if n.strip()]
         matches = [t for t in ALL_TOOLS if t.name.lower() in names]
     else:
-        tokens  = re.split(r"\s+", query_lower)
-        matches = []
+        tokens = re.split(r"\s+", query_lower)
+        scored: list = []
         for t in ALL_TOOLS:
             haystack = f"{t.name.lower()} {(t.description or '').lower()}"
-            score    = sum(2 if tok in t.name.lower() else 1
-                          for tok in tokens if tok in haystack)
+            score = sum(
+                2 if tok in t.name.lower() else 1
+                for tok in tokens if tok in haystack
+            )
             if score > 0:
-                matches.append((score, t))
-        matches = [t for _, t in sorted(matches, key=lambda x: -x[0])][:5]
-
+                scored.append((score, t))
+        matches = [t for _, t in sorted(scored, key=lambda x: -x[0])][:5]
     if not matches:
         return f"No tools found matching '{query}'"
     lines = [f"Tools matching '{query}':"]
     for t in matches:
-        lines.append(f"  {t.name}: {(t.description or '')[:100]}")
+        lines.append(f" {t.name}: {(t.description or '')[:100]}")
     return "\n".join(lines)
-
-
-# Plan mode — in LangGraph, Phases 1+2 are read-only by design.
-# These tools signal Claude's intent and update a session-level flag.
-_plan_mode_active: bool = False
-
+@tool("EnterPlanMode", args_schema=PlanModeInput)
 @_safe_tool("EnterPlanMode")
-def _enter_plan_mode() -> str:
+def EnterPlanMode() -> str:
+    """Switch to plan-only mode. Read, search, and explore freely; all write, edit, bash, and execute tools are BLOCKED until `ExitPlanMode`.
+    Use when the user asks for a plan, design, or analysis before any changes are made.
+    """
     global _plan_mode_active
     _plan_mode_active = True
     return "Plan mode ON. Explore and search freely. Do NOT write/edit/bash. Call ExitPlanMode when ready."
-
+@tool("ExitPlanMode", args_schema=PlanModeInput)
 @_safe_tool("ExitPlanMode")
-def _exit_plan_mode() -> str:
+def ExitPlanMode() -> str:
+    """Leave plan mode and re-enable write / edit / bash tools. Call ONLY after presenting your plan to the user AND receiving explicit approval to proceed.
+    Do not call it implicitly to bypass plan mode.
+    """
     global _plan_mode_active
     _plan_mode_active = False
     return "Plan mode OFF. Write and execute tools available."
-
-
-# Task tools — backed by tools/tasks.py TaskManager
-_task_manager = None
-
-def _get_task_manager():
-    global _task_manager
-    if _task_manager is None:
-        from tools.tasks import TaskManager
-        _task_manager = TaskManager()
-    return _task_manager
-
+@tool("TaskCreate", args_schema=TaskCreateInput)
 @_safe_tool("TaskCreate")
-def _task_create(prompt: str, description: Optional[str] = None) -> str:
+def TaskCreate(prompt: str, description: str | None = None) -> str:
+    """Create a long-lived task record (persisted under `.clawd-tasks/`). Distinct from `TodoWrite` — use Tasks for work that spans many turns or sessions, or for tracking outputs from sub-agents.
+    Returns a `task_id`. Status flow: created → running → completed | failed | stopped.
+    """
     task = _get_task_manager().create(prompt=prompt, description=description or "")
     return f"Task created: {task.task_id} | {task.status.value}"
-
+@tool("TaskUpdate", args_schema=TaskUpdateInput)
 @_safe_tool("TaskUpdate")
-def _task_update(task_id: str, message: str) -> str:
+def TaskUpdate(task_id: str, message: str) -> str:
+    """Append a progress message to a task's persistent log. Use to leave breadcrumbs (findings, decisions, blockers) on a long-running task."""
     _get_task_manager().append_output(task_id, message)
     return f"Task {task_id} updated."
-
+@tool("TaskGet", args_schema=TaskIdInput)
 @_safe_tool("TaskGet")
-def _task_get(task_id: str) -> str:
+def TaskGet(task_id: str) -> str:
+    """Get full details (status, prompt, history) for a task by `task_id`."""
     t = _get_task_manager().get(task_id)
     return f"Task {t.task_id}: {t.status.value}\n{t.prompt}"
-
-def _task_list(status: Optional[str] = None) -> str:
+@tool("TaskList", args_schema=TaskListInput)
+def TaskList(status: str | None = None) -> str:
+    """List tasks, optionally filtered by `status` (e.g. `running`, `completed`)."""
     try:
-        mgr   = _get_task_manager()
+        mgr = _get_task_manager()
         tasks = mgr.list_all(status_filter=status)
         if not tasks:
             return "No tasks."
         lines = [f"Tasks ({len(tasks)}):"]
         for t in tasks:
-            lines.append(f"  [{t.status.value}] {t.task_id}: {t.prompt[:60]}")
+            lines.append(f" [{t.status.value}] {t.task_id}: {t.prompt[:60]}")
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
-
+@tool("TaskStop", args_schema=TaskIdInput)
 @_safe_tool("TaskStop")
-def _task_stop(task_id: str) -> str:
+def TaskStop(task_id: str) -> str:
+    """Stop a running task. Use when the task is no longer needed or has stalled."""
     _get_task_manager().stop(task_id)
     return f"Task {task_id} stopped."
-
-def _task_output(task_id: str) -> str:
+@tool("TaskOutput", args_schema=TaskIdInput)
+def TaskOutput(task_id: str) -> str:
+    """Get the accumulated output and messages produced by a task."""
     try:
-        mgr  = _get_task_manager()
+        mgr = _get_task_manager()
         task = mgr.get(task_id)
         msgs = getattr(task, "messages", []) or getattr(task, "output", []) or []
         if not msgs:
@@ -713,232 +755,102 @@ def _task_output(task_id: str) -> str:
         lines = [f"Task {task_id} output:"]
         for m in msgs:
             if isinstance(m, str):
-                lines.append(f"  {m}")
+                lines.append(f" {m}")
             elif hasattr(m, "content"):
-                lines.append(f"  {m.content}")
+                lines.append(f" {m.content}")
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
-
-
-# ── Tool definitions ──────────────────────────────────────────────────────────
-
 UTILITY_TOOLS = [
-    StructuredTool.from_function(func=_todo_write, name="TodoWrite",
-        args_schema=TodoWriteInput,
-        description="Create or update your todo list. Use at the start of complex tasks. Status: pending | in_progress | completed."),
-    StructuredTool.from_function(func=_sleep, name="Sleep",
-        args_schema=SleepInput,
-        description="Wait for duration_ms milliseconds (max 300000). Use to wait for background processes or servers to start."),
-    StructuredTool.from_function(func=_ask_user_question, name="AskUserQuestion",
-        args_schema=AskUserInput,
-        description="Ask the user a clarifying question and wait for their answer. Ask one specific question at a time."),
-    StructuredTool.from_function(func=_send_user_message, name="SendUserMessage",
-        args_schema=SendMessageInput,
-        description="Send a progress update or result to the user. Use for long tasks to report findings."),
-    StructuredTool.from_function(func=_tool_search, name="ToolSearch",
-        args_schema=ToolSearchInput,
-        description="Search available tools by name or keyword. Use 'select:Tool1,Tool2' for exact lookup."),
-    StructuredTool.from_function(func=_enter_plan_mode, name="EnterPlanMode",
-        args_schema=PlanModeInput,
-        description="Switch to plan-only mode. Explore and read freely. All write/execute tools are blocked until ExitPlanMode."),
-    StructuredTool.from_function(func=_exit_plan_mode, name="ExitPlanMode",
-        args_schema=PlanModeInput,
-        description="Exit plan mode. Call after presenting your plan and receiving approval. Write tools become available again."),
-    StructuredTool.from_function(func=_task_create, name="TaskCreate",
-        args_schema=TaskCreateInput,
-        description="Create a task to track work. Returns a task_id. Status: created → running → completed/failed/stopped."),
-    StructuredTool.from_function(func=_task_update, name="TaskUpdate",
-        args_schema=TaskUpdateInput,
-        description="Append a progress message to a task's log."),
-    StructuredTool.from_function(func=_task_get, name="TaskGet",
-        args_schema=TaskIdInput,
-        description="Get details of a specific task by ID."),
-    StructuredTool.from_function(func=_task_list, name="TaskList",
-        args_schema=TaskListInput,
-        description="List all tasks, optionally filtered by status."),
-    StructuredTool.from_function(func=_task_stop, name="TaskStop",
-        args_schema=TaskIdInput,
-        description="Stop a running task."),
-    StructuredTool.from_function(func=_task_output, name="TaskOutput",
-        args_schema=TaskIdInput,
-        description="Get accumulated output and messages for a task."),
+    TodoWrite, Sleep, AskUserQuestion, SendUserMessage, ToolSearch,
+    EnterPlanMode, ExitPlanMode,
+    TaskCreate, TaskUpdate, TaskGet, TaskList, TaskStop, TaskOutput,
 ]
-
-# ---------------------------------------------------------------------------
-# Build StructuredTool list
-# ---------------------------------------------------------------------------
-
-
+# ============================================================================
+# READ / WRITE TOOL LISTS
+# ============================================================================
 READ_TOOLS = [
-    StructuredTool.from_function(func=_read_file,    name="read_file",   args_schema=ReadFileInput,
-        description="Read a text file, optionally windowed by offset/limit lines"),
-    StructuredTool.from_function(func=_grep_search,  name="grep_search", args_schema=GrepInput,
-        description="Regex search across files with context lines, file type filtering"),
-    StructuredTool.from_function(func=_glob_search,  name="glob_search", args_schema=GlobInput,
-        description="Find files by glob pattern (e.g. **/*.py), sorted by modified time"),
-    StructuredTool.from_function(func=_web_fetch,    name="WebFetch",    args_schema=WebFetchInput,
-        description="Fetch a URL and return clean readable text"),
-    StructuredTool.from_function(func=_web_search,   name="WebSearch",   args_schema=WebSearchInput,
-        description="Search the web with DuckDuckGo, optional domain filtering"),
-    StructuredTool.from_function(func=lambda action="status", **kw: _git(action, **kw),
-        name="git_read",
-        description="Git read operations: status, diff, log, show, blame"),
-] + UTILITY_TOOLS   # utility tools available in read/plan mode too
-
+    read_file, grep_search, glob_search, WebFetch, WebSearch, git_read,
+] + UTILITY_TOOLS # utility tools are available in read/plan mode too
 WRITE_TOOLS = [
-    StructuredTool.from_function(func=_write_file,  name="write_file",  args_schema=WriteFileInput,
-        description="Create or overwrite a file. Creates parent directories automatically"),
-    StructuredTool.from_function(func=_edit_file,   name="edit_file",   args_schema=EditFileInput,
-        description="Precise text replacement in a file. Preferred over write_file for edits"),
-    StructuredTool.from_function(func=_bash,        name="bash",        args_schema=BashInputSchema,
-        description="Execute shell commands with 6-layer safety validation"),
-    StructuredTool.from_function(func=_git,         name="git",         args_schema=GitInput,
-        description="Git operations: status, diff, log, commit, push, pull, branch, stash"),
-    StructuredTool.from_function(func=_web_fetch,   name="WebFetch",    args_schema=WebFetchInput,
-        description="Fetch a URL and return clean readable text"),
-    StructuredTool.from_function(func=_web_search,  name="WebSearch",   args_schema=WebSearchInput,
-        description="Search the web with DuckDuckGo, optional domain filtering"),
-    StructuredTool.from_function(func=_github,      name="github",      args_schema=GitHubInput,
-        description="GitHub API: get_issue, list_issues, create_pr, get_pr, list_prs, get_repo_info"),
+    write_file, edit_file, bash, git, WebFetch, WebSearch, github,
 ] + UTILITY_TOOLS
-
-ALL_TOOLS = WRITE_TOOLS   # superset of read + write + utility
-
-
-# ---------------------------------------------------------------------------
-# Multi-agent tools — port of Rust Agent / Worker suite (+ AgentStatus polling).
-# (see tools/multi_agent.py). Permission modes mirror lib.rs required_permission.
-# ---------------------------------------------------------------------------
-
-class AgentToolInput(BaseModel):
-    description:   str           = Field(description="Short description of the delegated task")
-    prompt:        str           = Field(description="The full task prompt for the sub-agent")
-    subagent_type: Optional[str] = Field(None, description="general-purpose | Explore | Plan | Verification | claw-guide | statusline-setup")
-    name:          Optional[str] = Field(None, description="Optional name for the sub-agent")
-    model:         Optional[str] = Field(None, description="Optional model override")
-
-class AgentStatusInput(BaseModel):
-    agent_id: str = Field(description="The agent_id returned by a prior Agent spawn")
-
-class WorkerCreateInput(BaseModel):
-    cwd:           str       = Field(description="Working directory for the worker")
-    trusted_roots: list[str] = Field(default_factory=list, description="Directories that auto-clear the trust gate")
-    auto_recover_prompt_misdelivery: bool = Field(True, description="Auto-arm a replay if a prompt is misdelivered")
-
-class WorkerIdInput(BaseModel):
-    worker_id: str = Field(description="Worker ID")
-
-class WorkerObserveInput(BaseModel):
-    worker_id:   str = Field(description="Worker ID")
-    screen_text: str = Field(description="Latest terminal snapshot to feed the boot detector")
-
-class WorkerSendPromptInput(BaseModel):
-    worker_id:    str            = Field(description="Worker ID (must be ready_for_prompt)")
-    prompt:       Optional[str]  = Field(None, description="Prompt to send; omit to replay a recovered prompt")
-    task_receipt: Optional[dict] = Field(None, description="Optional task receipt {repo, task_kind, source_surface, objective_preview, expected_artifacts}")
-
-class WorkerObserveCompletionInput(BaseModel):
-    worker_id:     str = Field(description="Worker ID")
-    finish_reason: str = Field(description="Session finish reason")
-    tokens_output: int = Field(description="Tokens the session produced")
-
-
+# ============================================================================
+# MULTI-AGENT — Agent + AgentStatus + Worker* lifecycle
+#
+# ============================================================================
+@tool("Agent", args_schema=AgentToolInput)
 @_safe_tool("Agent")
-def _agent_tool(description: str, prompt: str, subagent_type: Optional[str] = None,
-                name: Optional[str] = None, model: Optional[str] = None) -> str:
+def Agent(
+    description: str,
+    prompt: str,
+    subagent_type: str | None = None,
+    name: str | None = None,
+    model: str | None = None,
+) -> str:
+    """Launch a BACKGROUND sub-agent in a fresh conversation. Returns immediately with `{agentId, status: "running", outputFile,...}` — you must poll completion with `AgentStatus`.
+    When to use:
+    - Large, separable work that would bloat your own context (broad codebase exploration, multi-file research, running long verification suites).
+    - Truly INDEPENDENT parallel work — spawn multiple agents in the same message and they run concurrently.
+    - When the orchestration playbook in the system prompt applies.
+    When NOT to use:
+    - Small or tightly-coupled work — do it yourself. The sub-agent's fresh context costs more than the savings.
+    - Sub-agents CANNOT spawn further sub-agents. You are the sole orchestrator.
+    subagent_type (defaults to `general-purpose`):
+    - `Explore` — read-only research (read_file, grep, glob, web). Use for "where is X defined / what references Y".
+    - `Plan` — read-only + TodoWrite. Use to produce a roadmap or implementation plan before any writes.
+    - `Verification` — read + bash. Use to run tests, type-check, build, or otherwise verify a deterministic check.
+    - `general-purpose` — full write/execute toolset. Use for self-contained build tasks.
+    - `claw-guide` — guidance/Q&A about the agent harness itself.
+    - `statusline-setup` — narrow tool set for configuring status line.
+    Briefing the sub-agent (critical):
+    - The sub-agent sees ONLY your `prompt` + what it reads from disk — it has no memory of this conversation. Brief it like a smart colleague who just walked in: goal, what you've already ruled out, the exact files/lines to look at, and the form the answer should take.
+    - Terse command-style prompts produce shallow work. Specific, context-rich prompts produce good work.
+    - Never delegate UNDERSTANDING — don't write "based on what you find, decide what to do." Decide yourself, then delegate the execution.
+    """
     from tools.multi_agent import run_agent
-    return json.dumps(run_agent(description, prompt, subagent_type, name, model))
-
+    manifest = run_agent(description, prompt, subagent_type, name, model)
+    # Notify the UI — populates the sub-agent tree the moment the spawn lands.
+    from agents.reporter import get_reporter
+    _safe_report(lambda: get_reporter().agent_spawn(
+        agent_id = str(manifest.get("agentId", "")),
+        description = description,
+        subagent_type = str(manifest.get("subagentType", subagent_type or "general-purpose")),
+        name = str(manifest.get("name", name or "")),
+        model = str(manifest.get("model", model or "")),
+    ))
+    return json.dumps(manifest)
+@tool("AgentStatus", args_schema=AgentStatusInput)
 @_safe_tool("AgentStatus")
-def _agent_status(agent_id: str) -> str:
+def AgentStatus(agent_id: str) -> str:
+    """Poll a spawned sub-agent's manifest by `agent_id`. Returns `{status: running | completed | failed, outputFile, error?,...}`.
+    Usage:
+    - Poll until `status` becomes `completed` or `failed`. The harness's stall detector treats `AgentStatus` as a poll-style call, so it won't false-trip when you wait.
+    - On `completed`: read the `outputFile` with `read_file` to get the actual result. Do not assume — the agent may have done something different from what you asked.
+    - On `failed`: read the `error`, then adapt (fix input, retry with a narrower scope, or spawn a debugger sub-agent). Never silently proceed past a failure.
+    - A dependent stage starts only after `completed` AND a deterministic check has passed (tests / type-check / compile).
+    """
     from tools.multi_agent import get_agent_status
-    return json.dumps(get_agent_status(agent_id))
-
-@_safe_tool("WorkerCreate")
-def _worker_create(cwd: str, trusted_roots: Optional[list] = None,
-                   auto_recover_prompt_misdelivery: bool = True) -> str:
-    from tools.multi_agent import worker_create
-    return json.dumps(worker_create(cwd, trusted_roots, auto_recover_prompt_misdelivery))
-
-@_safe_tool("WorkerGet")
-def _worker_get(worker_id: str) -> str:
-    from tools.multi_agent import worker_get
-    return json.dumps(worker_get(worker_id))
-
-@_safe_tool("WorkerObserve")
-def _worker_observe(worker_id: str, screen_text: str) -> str:
-    from tools.multi_agent import worker_observe
-    return json.dumps(worker_observe(worker_id, screen_text))
-
-@_safe_tool("WorkerResolveTrust")
-def _worker_resolve_trust(worker_id: str) -> str:
-    from tools.multi_agent import worker_resolve_trust
-    return json.dumps(worker_resolve_trust(worker_id))
-
-@_safe_tool("WorkerAwaitReady")
-def _worker_await_ready(worker_id: str) -> str:
-    from tools.multi_agent import worker_await_ready
-    return json.dumps(worker_await_ready(worker_id))
-
-@_safe_tool("WorkerSendPrompt")
-def _worker_send_prompt(worker_id: str, prompt: Optional[str] = None,
-                        task_receipt: Optional[dict] = None) -> str:
-    from tools.multi_agent import worker_send_prompt
-    return json.dumps(worker_send_prompt(worker_id, prompt, task_receipt))
-
-@_safe_tool("WorkerRestart")
-def _worker_restart(worker_id: str) -> str:
-    from tools.multi_agent import worker_restart
-    return json.dumps(worker_restart(worker_id))
-
-@_safe_tool("WorkerTerminate")
-def _worker_terminate(worker_id: str) -> str:
-    from tools.multi_agent import worker_terminate
-    return json.dumps(worker_terminate(worker_id))
-
-@_safe_tool("WorkerObserveCompletion")
-def _worker_observe_completion(worker_id: str, finish_reason: str, tokens_output: int) -> str:
-    from tools.multi_agent import worker_observe_completion
-    return json.dumps(worker_observe_completion(worker_id, finish_reason, tokens_output))
-
-
-MULTI_AGENT_TOOLS = [
-    StructuredTool.from_function(func=_agent_tool, name="Agent", args_schema=AgentToolInput,
-        description="Launch a background sub-agent (subagent_type sets its restricted tools + prompt). Returns immediately with status 'running' and an agent_id; call multiple times for parallel independent tasks. Poll completion with AgentStatus."),
-    StructuredTool.from_function(func=_agent_status, name="AgentStatus", args_schema=AgentStatusInput,
-        description="Poll a spawned sub-agent by agent_id. Returns its manifest (status running|completed|failed, plus output_file). Read the output_file with read_file once status is completed."),
-    StructuredTool.from_function(func=_worker_create, name="WorkerCreate", args_schema=WorkerCreateInput,
-        description="Create a coding worker boot session with trust-gate and prompt-delivery guards."),
-    StructuredTool.from_function(func=_worker_get, name="WorkerGet", args_schema=WorkerIdInput,
-        description="Fetch the current worker boot state, last error, and event history."),
-    StructuredTool.from_function(func=_worker_observe, name="WorkerObserve", args_schema=WorkerObserveInput,
-        description="Feed a terminal snapshot into worker boot detection (trust gate, ready handshake, misdelivery)."),
-    StructuredTool.from_function(func=_worker_resolve_trust, name="WorkerResolveTrust", args_schema=WorkerIdInput,
-        description="Resolve a detected trust prompt so worker boot can continue."),
-    StructuredTool.from_function(func=_worker_await_ready, name="WorkerAwaitReady", args_schema=WorkerIdInput,
-        description="Return the current ready-handshake verdict for a coding worker."),
-    StructuredTool.from_function(func=_worker_send_prompt, name="WorkerSendPrompt", args_schema=WorkerSendPromptInput,
-        description="Send a task prompt once the worker is ready_for_prompt; can replay a recovered prompt."),
-    StructuredTool.from_function(func=_worker_restart, name="WorkerRestart", args_schema=WorkerIdInput,
-        description="Restart worker boot state after a failed or stale startup."),
-    StructuredTool.from_function(func=_worker_terminate, name="WorkerTerminate", args_schema=WorkerIdInput,
-        description="Terminate a worker and mark the lane finished from the control plane."),
-    StructuredTool.from_function(func=_worker_observe_completion, name="WorkerObserveCompletion",
-        args_schema=WorkerObserveCompletionInput,
-        description="Report session completion, classifying finish_reason into Finished or Failed."),
-]
-
-ALL_TOOLS = WRITE_TOOLS + MULTI_AGENT_TOOLS   # write + utility + multi-agent
-
-
+    manifest = get_agent_status(agent_id)
+    # Notify the UI — keeps the sub-agent tree's status badge in sync.
+    from agents.reporter import get_reporter
+    _safe_report(lambda: get_reporter().agent_status_update(
+        agent_id = str(manifest.get("agentId", agent_id)),
+        status = str(manifest.get("status", "")),
+        output_file = str(manifest.get("outputFile", "")),
+        error = str(manifest.get("error") or ""),
+    ))
+    return json.dumps(manifest)
+MULTI_AGENT_TOOLS = [Agent, AgentStatus]
+# ============================================================================
+# ALL_TOOLS + public API
+# ============================================================================
+ALL_TOOLS = WRITE_TOOLS + MULTI_AGENT_TOOLS # write + utility + multi-agent
 def get_read_tools() -> list:
     """Tools for plan/explore mode — no writes, no bash."""
-    return READ_TOOLS
-
-
+    return list(READ_TOOLS)
 def get_all_tools(extra_tools: list | None = None) -> list:
-    """All tools including write + bash + multi-agent. Optionally append MCP tools."""
+    """All tools (read + write + utility + multi-agent). Optionally append MCP tools."""
     tools = list(ALL_TOOLS)
     if extra_tools:
         tools.extend(extra_tools)

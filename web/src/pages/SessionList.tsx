@@ -1,0 +1,124 @@
+import { useEffect, useState } from "react";
+import { Link, useParams, useNavigate } from "react-router-dom";
+import { projectsApi, sessionsApi } from "@/lib/api";
+import type { Project, Session } from "@/lib/types";
+import ProjectSettings from "@/components/ProjectSettings";
+
+export default function SessionList() {
+  const { projectId } = useParams<{ projectId: string }>();
+  const navigate = useNavigate();
+  const [project, setProject] = useState<Project | null>(null);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setErr(null);
+      try {
+        const [p, ss] = await Promise.all([
+          projectsApi.get(projectId),
+          sessionsApi.list(projectId),
+        ]);
+        if (cancelled) return;
+        setProject(p);
+        setSessions(ss);
+      } catch (e: any) {
+        if (!cancelled) setErr(e?.message ?? "failed to load");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  const startNew = async () => {
+    if (!projectId) return;
+    setCreating(true);
+    try {
+      const s = await sessionsApi.create(
+        projectId,
+        `Session ${new Date().toLocaleString()}`,
+      );
+      navigate(`/p/${projectId}/s/${s.id}`);
+    } catch (e: any) {
+      setErr(e?.message ?? "failed to create session");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-6 p-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <Link to="/" className="text-sm text-muted hover:text-accent">
+            ← all projects
+          </Link>
+          <h1 className="mt-1 text-2xl font-semibold">
+            {project?.name ?? "Loading…"}
+          </h1>
+          {project && (
+            <div className="font-mono text-xs text-muted">
+              {project.workspace_path}
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowSettings((v) => !v)}
+            className="min-h-touch rounded border border-border px-3 py-1.5 text-sm hover:border-accent"
+            aria-label="Project settings"
+          >
+            ⚙ Settings
+          </button>
+          <button
+            onClick={startNew}
+            disabled={creating || !projectId}
+            className="min-h-touch rounded bg-accent px-3 py-1.5 text-sm font-medium text-bg disabled:opacity-50"
+          >
+            {creating ? "Creating…" : "+ New session"}
+          </button>
+        </div>
+      </div>
+
+      {showSettings && project && (
+        <ProjectSettings
+          project={project}
+          onChange={(updated) => setProject(updated)}
+        />
+      )}
+
+      {loading && <div className="text-muted">Loading…</div>}
+      {err && <div className="text-danger">{err}</div>}
+
+      {!loading && !err && sessions.length === 0 && (
+        <div className="rounded border border-dashed border-border p-8 text-center text-muted">
+          No sessions yet. Start a new one to begin chatting.
+        </div>
+      )}
+
+      <div className="grid gap-2">
+        {sessions.map((s) => (
+          <Link
+            key={s.id}
+            to={`/p/${projectId}/s/${s.id}`}
+            className="block rounded border border-border bg-surface p-4 transition hover:border-accent"
+          >
+            <div className="font-medium">{s.name}</div>
+            <div className="text-xs text-muted">
+              Last active {new Date(s.last_active_at * 1000).toLocaleString()}
+            </div>
+          </Link>
+        ))}
+      </div>
+    </div>
+  );
+}

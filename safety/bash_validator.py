@@ -1,20 +1,20 @@
 """
 Bash command validator — full safety pipeline.
-Ported from Rust: runtime/src/bash_validation.rs
 
 Six validation submodules run in sequence before any bash command executes:
-  1. read_only_validation    — block writes in read-only mode
-  2. mode_validation         — enforce workspace boundary
-  3. sed_validation          — block sed -i in read-only
-  4. destructive_check       — block rm -rf /, fork bombs, disk writes
-  5. path_validation         — warn on traversal / home dir references
-  6. classify_command        — classify intent for logging
+ 1. read_only_validation — block writes in read-only mode
+ 2. mode_validation — enforce workspace boundary
+ 3. sed_validation — block sed -i in read-only
+ 4. destructive_check — block rm -rf /, fork bombs, disk writes
+ 5. path_validation — warn on traversal / home dir references
+ 6. classify_command — classify intent for logging
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Result types
@@ -23,12 +23,11 @@ from pathlib import Path
 class ValidationStatus(Enum):
     ALLOW = "allow"
     BLOCK = "block"
-    WARN  = "warn"
-
+    WARN = "warn"
 
 @dataclass
 class ValidationResult:
-    status:  ValidationStatus
+    status: ValidationStatus
     message: str = ""
 
     @classmethod
@@ -55,20 +54,18 @@ class ValidationResult:
     def is_warning(self) -> bool:
         return self.status == ValidationStatus.WARN
 
-
 class CommandIntent(Enum):
-    READ_ONLY          = "read_only"
-    WRITE              = "write"
-    DESTRUCTIVE        = "destructive"
-    NETWORK            = "network"
+    READ_ONLY = "read_only"
+    WRITE = "write"
+    DESTRUCTIVE = "destructive"
+    NETWORK = "network"
     PROCESS_MANAGEMENT = "process_management"
     PACKAGE_MANAGEMENT = "package_management"
-    SYSTEM_ADMIN       = "system_admin"
-    UNKNOWN            = "unknown"
-
+    SYSTEM_ADMIN = "system_admin"
+    UNKNOWN = "unknown"
 
 # ---------------------------------------------------------------------------
-# Command lists (exact port from Rust bash_validation.rs)
+# Command lists
 # ---------------------------------------------------------------------------
 
 WRITE_COMMANDS = {
@@ -137,17 +134,17 @@ SYSTEM_ADMIN_COMMANDS = {
     "groupadd", "groupdel", "passwd", "visudo",
 }
 
-# Destructive patterns — exact port from Rust
+# Destructive patterns —
 DESTRUCTIVE_PATTERNS = [
-    ("rm -rf /",      "Recursive forced deletion at root — this will destroy the system"),
-    ("rm -rf ~",      "Recursive forced deletion of home directory"),
-    ("rm -rf *",      "Recursive forced deletion of all files in current directory"),
-    ("rm -rf .",      "Recursive forced deletion of current directory"),
-    ("mkfs",          "Filesystem creation will destroy existing data on the device"),
-    ("dd if=",        "Direct disk write — can overwrite partitions or devices"),
-    ("> /dev/sd",     "Writing to raw disk device"),
-    ("chmod -R 777",  "Recursively setting world-writable permissions"),
-    ("chmod -R 000",  "Recursively removing all permissions"),
+    ("rm -rf /", "Recursive forced deletion at root — this will destroy the system"),
+    ("rm -rf ~", "Recursive forced deletion of home directory"),
+    ("rm -rf *", "Recursive forced deletion of all files in current directory"),
+    ("rm -rf.", "Recursive forced deletion of current directory"),
+    ("mkfs", "Filesystem creation will destroy existing data on the device"),
+    ("dd if=", "Direct disk write — can overwrite partitions or devices"),
+    ("> /dev/sd", "Writing to raw disk device"),
+    ("chmod -R 777", "Recursively setting world-writable permissions"),
+    ("chmod -R 000", "Recursively removing all permissions"),
     (":(){ :|:& };:", "Fork bomb — will crash the system"),
 ]
 
@@ -158,22 +155,19 @@ SYSTEM_PATHS = {
     "/sys/", "/proc/", "/dev/", "/sbin/", "/lib/", "/opt/",
 }
 
-
 # ---------------------------------------------------------------------------
-# Permission modes (mirrors Rust PermissionMode)
+# Permission modes
 # ---------------------------------------------------------------------------
 
 class PermissionMode(Enum):
-    READ_ONLY       = "read-only"
+    READ_ONLY = "read-only"
     WORKSPACE_WRITE = "workspace-write"
-    FULL_ACCESS     = "danger-full-access"
-    PROMPT          = "prompt"
-    ALLOW           = "allow"
-
+    FULL_ACCESS = "danger-full-access"
+    PROMPT = "prompt"
+    ALLOW = "allow"
 
 # ---------------------------------------------------------------------------
 # 1. Read-only validation
-# Ported from Rust: validate_read_only()
 # ---------------------------------------------------------------------------
 
 def validate_read_only(command: str, mode: PermissionMode) -> ValidationResult:
@@ -208,7 +202,6 @@ def validate_read_only(command: str, mode: PermissionMode) -> ValidationResult:
 
     return ValidationResult.allow()
 
-
 def _validate_git_read_only(command: str) -> ValidationResult:
     parts = command.split()
     subcommand = next((p for p in parts[1:] if not p.startswith("-")), None)
@@ -220,10 +213,8 @@ def _validate_git_read_only(command: str) -> ValidationResult:
         f"Git subcommand '{subcommand}' modifies repository state and is not allowed in read-only mode"
     )
 
-
 # ---------------------------------------------------------------------------
 # 2. Mode validation
-# Ported from Rust: validate_mode()
 # ---------------------------------------------------------------------------
 
 def validate_mode(command: str, mode: PermissionMode) -> ValidationResult:
@@ -238,7 +229,6 @@ def validate_mode(command: str, mode: PermissionMode) -> ValidationResult:
 
     return ValidationResult.allow()
 
-
 def _command_targets_outside_workspace(command: str) -> bool:
     first = _extract_first_command(command)
     is_write = first in WRITE_COMMANDS or first in STATE_MODIFYING_COMMANDS
@@ -246,10 +236,8 @@ def _command_targets_outside_workspace(command: str) -> bool:
         return False
     return any(sys_path in command for sys_path in SYSTEM_PATHS)
 
-
 # ---------------------------------------------------------------------------
 # 3. Sed validation
-# Ported from Rust: validate_sed()
 # ---------------------------------------------------------------------------
 
 def validate_sed(command: str, mode: PermissionMode) -> ValidationResult:
@@ -265,10 +253,8 @@ def validate_sed(command: str, mode: PermissionMode) -> ValidationResult:
 
     return ValidationResult.allow()
 
-
 # ---------------------------------------------------------------------------
 # 4. Destructive check
-# Ported from Rust: check_destructive()
 # ---------------------------------------------------------------------------
 
 def check_destructive(command: str) -> ValidationResult:
@@ -289,10 +275,8 @@ def check_destructive(command: str) -> ValidationResult:
 
     return ValidationResult.allow()
 
-
 # ---------------------------------------------------------------------------
 # 5. Path validation
-# Ported from Rust: validate_paths()
 # ---------------------------------------------------------------------------
 
 def validate_paths(command: str, workspace: str) -> ValidationResult:
@@ -315,10 +299,8 @@ def validate_paths(command: str, workspace: str) -> ValidationResult:
 
     return ValidationResult.allow()
 
-
 # ---------------------------------------------------------------------------
 # 6. Command classification
-# Ported from Rust: classify_command()
 # ---------------------------------------------------------------------------
 
 def classify_command(command: str) -> CommandIntent:
@@ -356,10 +338,8 @@ def classify_command(command: str) -> CommandIntent:
 
     return CommandIntent.UNKNOWN
 
-
 # ---------------------------------------------------------------------------
 # Full pipeline — run all validations in order
-# Ported from Rust: validate_command()
 # ---------------------------------------------------------------------------
 
 def validate_command(
@@ -371,11 +351,11 @@ def validate_command(
     Run the full validation pipeline on a bash command.
     Returns the first non-Allow result, or Allow if all pass.
 
-    Order matches Rust:
-      1. mode validation (includes read-only check)
-      2. sed validation
-      3. destructive check
-      4. path validation
+    Order
+    1. mode validation (includes read-only check)
+    2. sed validation
+    3. destructive check
+    4. path validation
     """
     for check in [
         lambda: validate_mode(command, mode),
@@ -389,7 +369,6 @@ def validate_command(
 
     return ValidationResult.allow()
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -397,7 +376,6 @@ def validate_command(
 def _extract_first_command(command: str) -> str:
     """
     Extract the first bare command, skipping env var assignments.
-    Ported from Rust: extract_first_command()
     """
     remaining = command.strip()
 
@@ -418,7 +396,6 @@ def _extract_first_command(command: str) -> str:
     parts = remaining.split()
     return parts[0] if parts else ""
 
-
 def _extract_sudo_inner(command: str) -> str:
     """Extract the command after sudo, skipping sudo flags."""
     parts = command.split()
@@ -431,7 +408,6 @@ def _extract_sudo_inner(command: str) -> str:
         else:
             return " ".join(parts[i:])
     return ""
-
 
 def _find_end_of_value(s: str) -> int | None:
     """Find end of a shell variable value (handles quotes)."""

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Background tile — matches the app's bg #0b0d10 -->
+  <rect width="512" height="512" rx="96" fill="#0b0d10"/>
+  <!-- Subtle inner border ring -->
+  <rect x="32" y="32" width="448" height="448" rx="80" fill="none"
+        stroke="#262b35" stroke-width="2"/>
+  <!-- Glyph: stylized chat arrow built from accent (#5eead4) shapes.
+       Geometry chosen to keep meaning at 16x16 favicon scale + render
+       cleanly inside the Android maskable safe-zone (centre 410x410). -->
+  <g fill="#5eead4">
+    <!-- Speech bubble silhouette -->
+    <path d="M128 144
+             h256
+             a40 40 0 0 1 40 40
+             v144
+             a40 40 0 0 1 -40 40
+             h-128
+             l-72 64
+             v-64
+             h-56
+             a40 40 0 0 1 -40 -40
+             v-144
+             a40 40 0 0 1 40 -40 z"/>
+  </g>
+  <!-- Three dots inside the bubble: signals 'agent thinking'. -->
+  <g fill="#0b0d10">
+    <circle cx="200" cy="256" r="20"/>
+    <circle cx="272" cy="256" r="20"/>
+    <circle cx="344" cy="256" r="20"/>
+  </g>
+</svg>

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Vite
+node_modules/
+web/dist/
+.vite/
+
+# Local state — never commit these
+.agent/                  # LangGraph SqliteSaver checkpoints (~/.agent shouldn't be here either)
+.agentic-rag/            # web backend state
+.clawd-agents/           # spawned sub-agent manifests
+.clawd-todos.json        # per-workspace todo list
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

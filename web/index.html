@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover lets the app extend under the iOS notch +
+         home-indicator area so we can paint our own background there. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no"
+    />
+    <meta
+      name="description"
+      content="Local agentic coding assistant — chat with your repo from any device."
+    />
+
+    <!-- Browser chrome colour (Android address bar, desktop window). -->
+    <meta name="theme-color" content="#0b0d10" />
+
+    <!-- iOS install metadata. iOS doesn't read manifest.json for these,
+         so we set them explicitly here. apple-touch-icon controls the
+         home-screen icon; the status-bar style draws the iOS clock /
+         signal in white on top of our dark background. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="agentic-rag" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+    <!-- Favicon + PWA manifest. vite-plugin-pwa generates manifest.webmanifest
+         at build time; the icon.svg link gives older browsers a sharp tab icon. -->
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" sizes="any" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+
+    <title>agentic-rag</title>
+  </head>
+  <body class="bg-bg text-text">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

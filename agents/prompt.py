@@ -1,14 +1,13 @@
 """
 System prompt builder.
-Faithful port of Rust: runtime/src/prompt.rs
 
 Assembles ONE system prompt as an ordered list of sections:
-    static scaffolding (intro / system / doing-tasks / actions)
-    + __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__
-    + dynamic sections (environment / project context / instruction files / config)
+ static scaffolding (intro / system / doing-tasks / actions)
+ + __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__
+ + dynamic sections (environment / project context / instruction files / config)
 
 This replaces the previous per-phase system prompts. render() joins sections
-with "\n\n", matching Rust SystemPromptBuilder::render.
+with "\n\n", matching
 """
 
 from __future__ import annotations
@@ -17,15 +16,17 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
-# Marker separating static prompt scaffolding from dynamic runtime context.
+# Marker separating static prompt scaffolding (cacheable across runs) from
+# dynamic runtime context (cwd / git state / instruction files / config).
+# Emitted verbatim in the rendered prompt so downstream cache-split or
+# truncation logic can pivot on it. Currently unread inside this repo — the
+# constant is kept for and as a forward-compatible anchor.
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 FRONTIER_MODEL_NAME = "Claude Opus 4.6"
 
 MAX_INSTRUCTION_FILE_CHARS = 4_000
 MAX_TOTAL_INSTRUCTION_CHARS = 12_000
 MAX_GIT_DIFF_CHARS = 50_000
-
 
 # ---------------------------------------------------------------------------
 # Static sections (verbatim from prompt.rs)
@@ -34,7 +35,6 @@ MAX_GIT_DIFF_CHARS = 50_000
 def prepend_bullets(items: list[str]) -> list[str]:
     """Format each item as an indented bullet ` - {item}`."""
     return [f" - {item}" for item in items]
-
 
 def get_simple_intro_section(has_output_style: bool) -> str:
     tail = (
@@ -51,7 +51,6 @@ def get_simple_intro_section(has_output_style: bool) -> str:
         "You may use URLs provided by the user in their messages or local files."
     )
 
-
 def get_simple_system_section() -> str:
     items = prepend_bullets([
         "All text you output outside of tool use is displayed to the user.",
@@ -66,7 +65,6 @@ def get_simple_system_section() -> str:
         "The system may automatically compress prior messages as context grows.",
     ])
     return "\n".join(["# System", *items])
-
 
 def get_simple_doing_tasks_section() -> str:
     items = prepend_bullets([
@@ -83,7 +81,6 @@ def get_simple_doing_tasks_section() -> str:
     ])
     return "\n".join(["# Doing tasks", *items])
 
-
 def get_actions_section() -> str:
     return "\n".join([
         "# Executing actions with care",
@@ -94,6 +91,86 @@ def get_actions_section() -> str:
         "workspace instructions.",
     ])
 
+def get_tone_style_section() -> str:
+    """How the model talks to the user. Disciplines verbosity in both directions:
+    not silent, not chatty. The model often forgets that tool calls themselves
+    are invisible to the user — these rules close that gap."""
+    return "\n".join([
+        "# Tone and style",
+        "",
+        "Assume users see ONLY your text output — tool calls, tool results, and "
+        "internal reasoning are invisible. Before your first tool call, state in "
+        "one sentence what you're about to do. While working, give short updates "
+        "at key moments: when you find something, change direction, or hit a "
+        "blocker. Brief is good; silent is not.",
+        "",
+        "End each turn with a 1–2 sentence summary: what changed and what's next. "
+        "Nothing more.",
+        "",
+        "Match response shape to the task. A simple question gets a direct "
+        "answer in plain prose — not headers, not bullet lists, not sections. "
+        "Reserve structure for genuinely structured output.",
+        "",
+        "Never narrate internal deliberation (\"Let me think about…\", \"I'll "
+        "now consider…\"). State results and decisions directly.",
+        "",
+        "Reference code as `path:line` (e.g. `agents/nodes.py:204`) so the user "
+        "can jump straight to it.",
+        "",
+        "Do not use emojis unless the user explicitly asks for them.",
+        "",
+        "In code: default to no comments. Only add a comment when the WHY is "
+        "non-obvious (hidden constraint, subtle invariant, workaround for a "
+        "specific bug). Never explain WHAT well-named code already says. Never "
+        "reference the current task or PR in code comments — that belongs in "
+        "the commit message.",
+    ])
+
+def get_using_tools_section() -> str:
+    """How to choose between tools and how to call them. Calls out the two
+    behaviors that most often go wrong without explicit guidance: defaulting
+    to bash for things a dedicated tool handles better, and serial tool calls
+    when parallel would be safe and faster."""
+    return "\n".join([
+        "# Using your tools",
+        "",
+        " - Prefer dedicated tools over `bash` when one fits: `read_file` for "
+        "reading files, `edit_file` / `write_file` for changing them, "
+        "`grep_search` / `glob_search` for searching. Reserve `bash` for "
+        "operations that genuinely require a shell (build, test, install, git "
+        "actions not covered by the `git` tool).",
+        " - Inside `bash`, avoid `cat`, `head`, `tail`, `sed`, `awk`, `echo` "
+        "for file I/O — use `read_file`, `edit_file`, `write_file` instead. "
+        "Use `ls`, `rg`, and find-style commands freely.",
+        " - Make independent tool calls in the SAME message (parallel). If "
+        "you need to run `git status` and `git diff`, send them as two tool "
+        "calls in one assistant turn — do NOT serialize them across turns. "
+        "Only sequence calls when a later call genuinely depends on an "
+        "earlier result.",
+        " - Use `TodoWrite` to plan multi-step work (3+ distinct steps) and "
+        "update it as you go. Mark each item `completed` the moment it's "
+        "done — do not batch completions at the end. Skip TodoWrite for "
+        "trivial single-step requests.",
+        " - Read before you edit. `edit_file` requires the file to have been "
+        "read this conversation, and your `old_string` must match the file "
+        "exactly (whitespace included). When in doubt, read the surrounding "
+        "lines first.",
+        " - Use `ToolSearch` when you need a tool whose schema isn't loaded "
+        "yet (e.g. `select:TaskCreate,TaskUpdate`).",
+        " - Use `AskUserQuestion` sparingly. Before asking, spend up to a "
+        "minute on read-only investigation (grep, read config, check docs) so "
+        "your question is specific. A grounded question (\"I see configs for "
+        "X and Y — which do you want?\") beats a vague one (\"what config?\").",
+        " - For tasks that span 3+ files or require open-ended exploration, "
+        "consider delegating to a sub-agent via `Agent` (e.g. `subagent_type` = "
+        "`Explore` for read-only research, `Plan` for roadmap + TodoWrite, "
+        "`Verification` for running tests). Poll with `AgentStatus` until "
+        "`completed`, then `read_file` the `outputFile`. See the orchestration "
+        "section below for the full playbook.",
+        " - `EnterPlanMode` switches to read-only exploration; all "
+        "write/execute tools are blocked until `ExitPlanMode`. Use it when the "
+        "user asks for a plan before acting.",
+    ])
 
 def get_orchestration_section() -> str:
     """Orchestration playbook — only injected for the top-level orchestrator (via
@@ -254,7 +331,6 @@ def get_orchestration_section() -> str:
     ]
     return "\n".join(lines)
 
-
 # ---------------------------------------------------------------------------
 # Project context discovery
 # ---------------------------------------------------------------------------
@@ -264,15 +340,13 @@ class ContextFile:
     path: Path
     content: str
 
-
-# Candidate instruction files per directory (ancestor chain), in Rust order.
+# Candidate instruction files per directory (ancestor chain), order.
 _INSTRUCTION_CANDIDATES = (
     ("CLAUDE.md",),
     ("CLAUDE.local.md",),
     (".claw", "CLAUDE.md"),
     (".claw", "instructions.md"),
 )
-
 
 def _collapse_blank_lines(content: str) -> str:
     result = []
@@ -285,10 +359,8 @@ def _collapse_blank_lines(content: str) -> str:
         previous_blank = is_blank
     return "\n".join(result) + ("\n" if result else "")
 
-
 def _normalize_instruction_content(content: str) -> str:
     return _collapse_blank_lines(content).strip()
-
 
 def discover_instruction_files(cwd: Path) -> list[ContextFile]:
     """Walk the ancestor chain (root → cwd) collecting instruction files.
@@ -326,7 +398,6 @@ def discover_instruction_files(cwd: Path) -> list[ContextFile]:
         deduped.append(f)
     return deduped
 
-
 def _read_git_output(cwd: Path, args: list[str]) -> str | None:
     try:
         proc = subprocess.run(
@@ -341,7 +412,6 @@ def _read_git_output(cwd: Path, args: list[str]) -> str | None:
         return None
     return proc.stdout
 
-
 def read_git_status(cwd: Path) -> str | None:
     out = _read_git_output(cwd, ["--no-optional-locks", "status", "--short", "--branch"])
     if out is None:
@@ -349,13 +419,11 @@ def read_git_status(cwd: Path) -> str | None:
     trimmed = out.strip()
     return trimmed or None
 
-
 def _truncate_diff(diff: str) -> str:
     if len(diff) > MAX_GIT_DIFF_CHARS:
         diff = diff[:MAX_GIT_DIFF_CHARS]
         diff += "\n\n... [diff truncated — too large for system prompt]"
     return diff
-
 
 def read_git_diff(cwd: Path) -> str | None:
     sections: list[str] = []
@@ -373,13 +441,38 @@ def read_git_diff(cwd: Path) -> str | None:
         return None
     return _truncate_diff("\n\n".join(sections))
 
-
 def read_recent_commits(cwd: Path, count: int = 5) -> list[str]:
     out = _read_git_output(cwd, ["log", f"-{count}", "--oneline", "--no-color"])
     if not out:
         return []
     return [line.strip() for line in out.splitlines() if line.strip()]
 
+def read_current_branch(cwd: Path) -> str | None:
+    out = _read_git_output(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if out is None:
+        return None
+    val = out.strip()
+    return val or None
+
+def read_main_branch(cwd: Path) -> str | None:
+    """Pick the default branch the user would PR against. Tries (in order):
+    origin/HEAD symbolic ref, then a `main` / `master` head. Returns None if
+    neither exists (e.g. fresh repo with only the current branch)."""
+    out = _read_git_output(cwd, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    if out and out.strip():
+        ref = out.strip()
+        return ref.split("/", 1)[1] if "/" in ref else ref
+    for candidate in ("main", "master"):
+        if _read_git_output(cwd, ["show-ref", "--verify", "--quiet", f"refs/heads/{candidate}"]) is not None:
+            return candidate
+    return None
+
+def read_git_user(cwd: Path) -> str | None:
+    out = _read_git_output(cwd, ["config", "--get", "user.name"])
+    if out is None:
+        return None
+    val = out.strip()
+    return val or None
 
 @dataclass
 class ProjectContext:
@@ -388,6 +481,9 @@ class ProjectContext:
     git_status: str | None = None
     git_diff: str | None = None
     recent_commits: list[str] = field(default_factory=list)
+    current_branch: str | None = None
+    main_branch: str | None = None
+    git_user: str | None = None
     instruction_files: list[ContextFile] = field(default_factory=list)
 
     @classmethod
@@ -405,8 +501,10 @@ class ProjectContext:
         ctx.git_status = read_git_status(ctx.cwd)
         ctx.git_diff = read_git_diff(ctx.cwd)
         ctx.recent_commits = read_recent_commits(ctx.cwd)
+        ctx.current_branch = read_current_branch(ctx.cwd)
+        ctx.main_branch = read_main_branch(ctx.cwd)
+        ctx.git_user = read_git_user(ctx.cwd)
         return ctx
-
 
 # ---------------------------------------------------------------------------
 # Dynamic section renderers
@@ -418,7 +516,6 @@ def _truncate_instruction_content(content: str, remaining_chars: int) -> str:
     if len(trimmed) <= hard_limit:
         return trimmed
     return trimmed[:hard_limit] + "\n\n[truncated]"
-
 
 def _describe_instruction_file(file: ContextFile, files: list[ContextFile]) -> str:
     name = file.path.name
@@ -432,7 +529,6 @@ def _describe_instruction_file(file: ContextFile, files: list[ContextFile]) -> s
         scope = str(parent)
         break
     return f"{name} (scope: {scope})"
-
 
 def render_instruction_files(files: list[ContextFile]) -> str:
     sections = ["# Claude instructions"]
@@ -451,13 +547,21 @@ def render_instruction_files(files: list[ContextFile]) -> str:
         sections.append(rendered)
     return "\n\n".join(sections)
 
-
 def render_project_context(ctx: ProjectContext) -> str:
     lines = ["# Project context"]
     bullets = [
         f"Today's date is {ctx.current_date}.",
         f"Working directory: {ctx.cwd}",
     ]
+    if ctx.current_branch:
+        bullets.append(f"Current branch: {ctx.current_branch}")
+    if ctx.main_branch:
+        bullets.append(
+            f"Main branch (target this for PRs unless told otherwise): "
+            f"{ctx.main_branch}"
+        )
+    if ctx.git_user:
+        bullets.append(f"Git user: {ctx.git_user}")
     if ctx.instruction_files:
         bullets.append(
             f"Claude instruction files discovered: {len(ctx.instruction_files)}."
@@ -471,13 +575,71 @@ def render_project_context(ctx: ProjectContext) -> str:
         lines.append("")
         lines.append("Recent commits (last 5):")
         for c in ctx.recent_commits:
-            lines.append(f"  {c}")
+            lines.append(f" {c}")
     if ctx.git_diff:
         lines.append("")
         lines.append("Git diff snapshot:")
         lines.append(ctx.git_diff)
     return "\n".join(lines)
 
+# Per-tool budget for the MCP section so a server with verbose descriptions
+# doesn't blow up the prompt.
+MAX_MCP_SECTION_CHARS = 4_000
+
+def render_mcp_tools_section(mcp_tools: list) -> str:
+    """List MCP-loaded tools so the model knows they exist alongside native
+    tools. bind_tools() already gives the model the full schema; this section
+    just flags 'these are MCP, not native, here are the names'.
+
+    Returns "" when no MCP tools are loaded, so the caller can append
+    unconditionally and the empty-config path stays clutter-free."""
+    if not mcp_tools:
+        return ""
+
+    lines = [
+        "# Connected MCP tools",
+        "",
+        "Beyond the native tools listed above, the user has configured one or more "
+        "MCP (Model Context Protocol) servers in `.agent.json`. The tools below are "
+        "loaded from those servers and bound to your tool list — call them the same "
+        "way you call any native tool. Their full schemas are visible in your tool "
+        "list; the names + brief descriptions are surfaced here so you remember they "
+        "exist.",
+        "",
+        "Currently available:",
+    ]
+    remaining = MAX_MCP_SECTION_CHARS
+    overflow = 0
+    for t in mcp_tools:
+        name = getattr(t, "name", "") or "(unnamed)"
+        desc = (getattr(t, "description", "") or "").strip().splitlines()
+        first = (desc[0] if desc else "").strip()[:120]
+        entry = f" - `{name}` — {first}" if first else f" - `{name}`"
+        if remaining - len(entry) < 60:  # leave room for the overflow note
+            overflow += 1
+            continue
+        remaining -= len(entry)
+        lines.append(entry)
+    if overflow:
+        lines.append(
+            f" - …plus {overflow} more — see your full tool list for the complete set."
+        )
+    lines.extend([
+        "",
+        "Guidance:",
+        " - MCP tool names are prefixed with their server name "
+        "(e.g. `postgres_query`, `filesystem_read_file`) so you can tell them apart "
+        "from native tools and from each other.",
+        " - When BOTH a native tool and an MCP tool can do the same job, prefer the "
+        "native one — they're faster, don't depend on an external process, and have "
+        "richer error handling. Reserve MCP tools for capabilities the native set "
+        "doesn't provide (e.g. an MCP filesystem server for paths OUTSIDE the "
+        "workspace; the native `read_file` is still right for files inside it).",
+        " - MCP tools may have higher latency, external rate limits, or transient "
+        "connection failures. On error, surface the failure to the user rather than "
+        "silently retrying.",
+    ])
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # SystemPromptBuilder
@@ -496,6 +658,7 @@ class SystemPromptBuilder:
         self.project_context: ProjectContext | None = None
         self.config_section: str | None = None
         self.include_orchestration: bool = False
+        self.mcp_tools: list = []
 
     def with_output_style(self, name: str, prompt: str) -> "SystemPromptBuilder":
         self.output_style_name = name
@@ -525,6 +688,12 @@ class SystemPromptBuilder:
         self.include_orchestration = enabled
         return self
 
+    def with_mcp_tools(self, tools: list | None) -> "SystemPromptBuilder":
+        """Register MCP-loaded tools so they're surfaced in the prompt's
+        '# Connected MCP tools' section. Empty / None ⇒ no section appears."""
+        self.mcp_tools = list(tools or [])
+        return self
+
     def append_section(self, section: str) -> "SystemPromptBuilder":
         self.append_sections.append(section)
         return self
@@ -551,6 +720,8 @@ class SystemPromptBuilder:
         sections.append(get_simple_system_section())
         sections.append(get_simple_doing_tasks_section())
         sections.append(get_actions_section())
+        sections.append(get_tone_style_section())
+        sections.append(get_using_tools_section())
         if self.include_orchestration:
             sections.append(get_orchestration_section())
         sections.append(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
@@ -563,6 +734,11 @@ class SystemPromptBuilder:
                 )
         if self.config_section:
             sections.append(self.config_section)
+        # MCP tools section — render_mcp_tools_section() returns "" when no
+        # MCP tools are loaded, so the empty-config path adds nothing.
+        mcp_section = render_mcp_tools_section(self.mcp_tools)
+        if mcp_section:
+            sections.append(mcp_section)
         sections.extend(self.append_sections)
         return sections
 

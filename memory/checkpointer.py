@@ -7,11 +7,10 @@ Same workspace → same thread_id → resumes from last phase on restart.
 When the estimated context exceeds the auto-compaction threshold → summarise
 old messages → continue.
 
-Ported from Rust:
-  - runtime/src/conversation.rs  (auto-compaction trigger: 100_000 input tokens,
-    env CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS)
-  - runtime/src/compact.rs        (CompactionConfig: preserve_recent=4,
-    max_estimated_tokens=10_000; estimate_message_tokens = len/4 + 1 per block)
+ - runtime/src/conversation.rs (auto-compaction trigger: 100_000 input tokens,
+ env CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS)
+ - runtime/src/compact.rs (CompactionConfig: preserve_recent=4,
+ max_estimated_tokens=10_000; estimate_message_tokens = len/4 + 1 per block)
 """
 
 import os
@@ -21,21 +20,16 @@ from langchain_core.messages import SystemMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
 
-
-# Auto-compaction trigger — mirrors Rust conversation.rs:
-#   DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD = 100_000
-#   AUTO_COMPACTION_THRESHOLD_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
+# Auto-compaction trigger — rs:
+# DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD = 100_000
+# AUTO_COMPACTION_THRESHOLD_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 DEFAULT_AUTO_COMPACT_INPUT_TOKENS = 100_000
 AUTO_COMPACT_THRESHOLD_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 
-# Back-compat alias (was a hard-coded 80_000 single threshold).
-MAX_TOKENS_BEFORE_COMPACT = DEFAULT_AUTO_COMPACT_INPUT_TOKENS
-
 CHARS_PER_TOKEN = 4
-PRESERVE_RECENT = 4   # CompactionConfig.preserve_recent_messages
+PRESERVE_RECENT = 4  # CompactionConfig.preserve_recent_messages
 
-# Rust: COMPACT_CONTINUATION_PREAMBLE / COMPACT_RECENT_MESSAGES_NOTE /
-#       COMPACT_DIRECT_RESUME_INSTRUCTION (compact.rs)
+# COMPACT_DIRECT_RESUME_INSTRUCTION (compact.rs)
 COMPACT_PREAMBLE = (
     "This session is being continued from a previous conversation that ran out "
     "of context. The summary below covers the earlier portion of the "
@@ -48,9 +42,8 @@ COMPACT_DIRECT_RESUME_INSTRUCTION = (
     "do not recap what was happening, and do not preface with continuation text."
 )
 
-
 def _auto_compact_threshold() -> int:
-    """Auto-compaction token threshold (env-overridable, mirrors Rust)."""
+    """Auto-compaction token threshold."""
     raw = os.getenv(AUTO_COMPACT_THRESHOLD_ENV_VAR)
     if raw:
         try:
@@ -59,9 +52,8 @@ def _auto_compact_threshold() -> int:
             pass
     return DEFAULT_AUTO_COMPACT_INPUT_TOKENS
 
-
 def _estimate_block_tokens(block: Any) -> int:
-    """Per content-block estimate. Mirrors Rust estimate_message_tokens:
+    """Per content-block estimate.
     every block contributes `len // 4 + 1`."""
     if isinstance(block, str):
         return len(block) // CHARS_PER_TOKEN + 1
@@ -82,11 +74,9 @@ def _estimate_block_tokens(block: Any) -> int:
         return len(str(block)) // CHARS_PER_TOKEN + 1
     return len(str(block)) // CHARS_PER_TOKEN + 1
 
-
 def _estimate_tokens(messages: list) -> int:
     """Estimate the token footprint of a message list.
 
-    Mirrors Rust compact.rs estimate_message_tokens: sum of per-block
     `len // 4 + 1`.
     """
     total = 0
@@ -98,7 +88,6 @@ def _estimate_tokens(messages: list) -> int:
         else:
             total += _estimate_block_tokens(content if isinstance(content, str) else str(content))
     return total
-
 
 def _summarize_messages(messages: list) -> str:
     """Build a text summary of messages being compacted."""
@@ -117,7 +106,7 @@ def _summarize_messages(messages: list) -> str:
                 if isinstance(block, dict):
                     if block.get("type") == "tool_use":
                         name = block.get("name", "")
-                        inp  = block.get("input", {})
+                        inp = block.get("input", {})
                         info = name
                         if "path" in inp:
                             info += f"({inp['path']})"
@@ -131,14 +120,13 @@ def _summarize_messages(messages: list) -> str:
     parts = []
     if lines:
         parts.append("Conversation history:")
-        parts.extend(f"  {l}" for l in lines[:20])
+        parts.extend(f" {l}" for l in lines[:20])
     if tools_used:
         parts.append(f"\nTools used: {', '.join(tools_used[:10])}")
     if files_mentioned:
         parts.append(f"\nFiles referenced: {', '.join(sorted(files_mentioned)[:10])}")
 
     return "\n".join(parts) or "Previous conversation."
-
 
 def _compact_messages(messages: list) -> list:
     """
@@ -163,7 +151,7 @@ def _compact_messages(messages: list) -> list:
             break
 
     to_summarise = messages[:cut]
-    to_keep      = messages[cut:]
+    to_keep = messages[cut:]
 
     if not to_summarise:
         return messages
@@ -176,27 +164,28 @@ def _compact_messages(messages: list) -> list:
 
     return [SystemMessage(content=continuation)] + to_keep
 
-
 class CompactingCheckpointer(SqliteSaver):
     """
     SqliteSaver + automatic context compaction.
 
-    SqliteSaver:  checkpoints survive process restarts — same thread_id
-                  on next run resumes from the last completed node,
-                  not from Phase 1 again.
+    SqliteSaver: checkpoints survive process restarts — same thread_id
+    on next run resumes from the last completed node,
+    not from Phase 1 again.
 
-    Compaction:   when the estimated context exceeds the auto-compaction
-                  threshold (default 100k tokens, env
-                  CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS), old messages are
-                  summarised before saving so context never explodes.
+    Compaction: when the estimated context exceeds the auto-compaction
+    threshold (default 100k tokens, env
+    CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS), old messages are
+    summarised before saving so context never explodes.
 
-    DB location:  ~/.agent/checkpoints.db
+    DB location: ~/.agent/checkpoints.db
     """
 
     def __init__(self):
+        import sqlite3
         db_path = Path.home() / ".agent" / "checkpoints.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        super().__init__(str(db_path))
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        super().__init__(conn)
 
     def put(
         self,
@@ -208,25 +197,24 @@ class CompactingCheckpointer(SqliteSaver):
         """Intercept checkpoint save — compact messages if needed, then persist."""
         messages = checkpoint.get("channel_values", {}).get("messages", [])
 
-        # Mirror Rust should_compact: only compact when there are more than
         # preserve_recent messages AND the estimate crosses the threshold.
         if (
             len(messages) > PRESERVE_RECENT
             and _estimate_tokens(messages) >= _auto_compact_threshold()
         ):
             compacted = _compact_messages(messages)
-            removed   = len(messages) - len(compacted)
+            removed = len(messages) - len(compacted)
             if removed > 0:
                 print(
                     f"\033[2m[auto-compact: {removed} messages summarised, "
                     f"~{removed * 200} tokens freed]\033[0m"
                 )
-                checkpoint = {
-                    **checkpoint,
-                    "channel_values": {
-                        **checkpoint.get("channel_values", {}),
-                        "messages": compacted,
-                    },
-                }
+            checkpoint = {
+                **checkpoint,
+                "channel_values": {
+                    **checkpoint.get("channel_values", {}),
+                    "messages": compacted,
+                },
+            }
 
         return super().put(config, checkpoint, metadata, new_versions)

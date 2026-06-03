@@ -1,19 +1,19 @@
 """
 Hooks system — pre/post tool lifecycle scripts.
-Ported from Rust: runtime/src/hooks.rs
 
-Users configure shell scripts in .agent.json:
-  {
-    "hooks": {
-      "pre_tool_use":      "scripts/pre.sh",
-      "post_tool_use":     "scripts/post.sh",
-      "post_tool_failure": "scripts/on_error.sh"
-    }
-  }
+Users configure shell scripts in.agent.json:
+ {
+ "hooks": {
+ "pre_tool_use": "scripts/pre.sh",
+ "post_tool_use": "scripts/post.sh",
+ "post_tool_failure": "scripts/on_error.sh"
+ }
+ }
 
 Pre-hook can: allow / deny / modify the tool input
 Post-hook can: log / alert / append feedback to result
 """
+from __future__ import annotations
 
 import json
 import os
@@ -21,25 +21,22 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 
-
 class HookEvent(Enum):
-    PRE_TOOL_USE      = "PreToolUse"
-    POST_TOOL_USE     = "PostToolUse"
+    PRE_TOOL_USE = "PreToolUse"
+    POST_TOOL_USE = "PostToolUse"
     POST_TOOL_FAILURE = "PostToolUseFailure"
-
 
 @dataclass
 class HookResult:
     """
     Result returned by running a hook script.
-    Ported from Rust: hooks.rs HookRunResult
     """
-    allowed:          bool          = True
-    denied:           bool          = False
-    failed:           bool          = False
-    messages:         list[str]     = field(default_factory=list)
-    updated_input:    str | None    = None   # hook can modify tool input
-    permission_override: str | None = None   # "allow" or "deny"
+    allowed: bool = True
+    denied: bool = False
+    failed: bool = False
+    messages: list[str] = field(default_factory=list)
+    updated_input: str | None = None  # hook can modify tool input
+    permission_override: str | None = None  # "allow" or "deny"
 
     @classmethod
     def allow(cls, messages: list[str] | None = None) -> "HookResult":
@@ -53,22 +50,19 @@ class HookResult:
     def fail(cls, reason: str) -> "HookResult":
         return cls(allowed=False, failed=True, messages=[reason])
 
-
 @dataclass
 class HookConfig:
-    """Hook script paths from .agent.json config."""
-    pre_tool_use:      str | None = None
-    post_tool_use:     str | None = None
+    """Hook script paths from.agent.json config."""
+    pre_tool_use: str | None = None
+    post_tool_use: str | None = None
     post_tool_failure: str | None = None
-
 
 class HookRunner:
     """
     Runs hook scripts at tool lifecycle points.
-    Ported from Rust: runtime/src/hooks.rs HookRunner
     """
 
-    HOOK_TIMEOUT = 30   # seconds
+    HOOK_TIMEOUT = 30  # seconds
 
     def __init__(self, config: HookConfig | None = None):
         self.config = config or HookConfig()
@@ -80,17 +74,16 @@ class HookRunner:
         Hook can return JSON: {allow: bool, deny_reason: str, updated_input: str}
         Exit code 0 = allow, exit code 2 = deny.
 
-        Ported from Rust: hooks.rs run_pre_tool_use_with_context()
         """
         script = self.config.pre_tool_use
         if not script:
             return HookResult.allow()
 
         return self._run_hook(
-            script    = script,
-            event     = HookEvent.PRE_TOOL_USE,
-            tool_name = tool_name,
-            payload   = {"tool_name": tool_name, "input": input_str},
+            script=script,
+            event=HookEvent.PRE_TOOL_USE,
+            tool_name=tool_name,
+            payload={"tool_name": tool_name, "input": input_str},
         )
 
     def post_tool_use(
@@ -104,20 +97,19 @@ class HookRunner:
         Hook receives: {tool_name, input, output}
         Can append messages to the tool result.
 
-        Ported from Rust: hooks.rs run_post_tool_use_with_context()
         """
         script = self.config.post_tool_use
         if not script:
             return HookResult.allow()
 
         return self._run_hook(
-            script    = script,
-            event     = HookEvent.POST_TOOL_USE,
-            tool_name = tool_name,
-            payload   = {
+            script=script,
+            event=HookEvent.POST_TOOL_USE,
+            tool_name=tool_name,
+            payload={
                 "tool_name": tool_name,
-                "input":     input_str,
-                "output":    output[:2000],   # cap to avoid huge payloads
+                "input": input_str,
+                "output": output[:2000],  # cap to avoid huge payloads
             },
         )
 
@@ -131,35 +123,33 @@ class HookRunner:
         Run post-tool-failure hook.
         Called when a tool returns is_error=True.
 
-        Ported from Rust: hooks.rs run_post_tool_use_failure_hook()
         """
         script = self.config.post_tool_failure
         if not script:
             return HookResult.allow()
 
         return self._run_hook(
-            script    = script,
-            event     = HookEvent.POST_TOOL_FAILURE,
-            tool_name = tool_name,
-            payload   = {
+            script=script,
+            event=HookEvent.POST_TOOL_FAILURE,
+            tool_name=tool_name,
+            payload={
                 "tool_name": tool_name,
-                "input":     input_str,
-                "error":     error[:2000],
+                "input": input_str,
+                "error": error[:2000],
             },
         )
 
     def _run_hook(
         self,
-        script:    str,
-        event:     HookEvent,
+        script: str,
+        event: HookEvent,
         tool_name: str,
-        payload:   dict,
+        payload: dict,
     ) -> HookResult:
         """
         Run a hook script, passing payload as JSON on stdin.
         Interpret exit code and stdout as HookResult.
 
-        Ported from Rust: hooks.rs run_hook_command()
         """
         if not os.path.exists(script):
             return HookResult.allow()
@@ -169,11 +159,11 @@ class HookRunner:
         try:
             result = subprocess.run(
                 ["sh", script],
-                input          = stdin_data,
-                capture_output = True,
-                text           = True,
-                timeout        = self.HOOK_TIMEOUT,
-                env            = os.environ.copy(),
+                input=stdin_data,
+                capture_output=True,
+                text=True,
+                timeout=self.HOOK_TIMEOUT,
+                env=os.environ.copy(),
             )
         except subprocess.TimeoutExpired:
             return HookResult.fail(
@@ -182,21 +172,21 @@ class HookRunner:
         except Exception as e:
             return HookResult.fail(f"Hook '{script}' failed to run: {e}")
 
-        # exit code 2 = deny (Rust convention)
+        # exit code 2 = deny
         if result.returncode == 2:
             reason = result.stdout.strip() or result.stderr.strip() or \
-                     f"Hook '{script}' denied tool '{tool_name}'"
+                f"Hook '{script}' denied tool '{tool_name}'"
             return HookResult.deny(reason)
 
         # non-zero but not 2 = failure
         if result.returncode != 0:
             reason = result.stderr.strip() or \
-                     f"Hook '{script}' exited with code {result.returncode}"
+                f"Hook '{script}' exited with code {result.returncode}"
             return HookResult.fail(reason)
 
         # exit code 0 = allow
         # try to parse JSON response for updated_input or messages
-        messages      = []
+        messages = []
         updated_input = None
 
         stdout = result.stdout.strip()
@@ -213,7 +203,7 @@ class HookRunner:
                     messages.append(stdout)
 
         return HookResult(
-            allowed       = True,
-            messages      = messages,
-            updated_input = updated_input,
+            allowed=True,
+            messages=messages,
+            updated_input=updated_input,
         )

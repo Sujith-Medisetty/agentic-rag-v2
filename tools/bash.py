@@ -1,24 +1,26 @@
 """
 Bash tool — execute shell commands.
-Ported from Rust: runtime/src/bash.rs
 
 Handles subprocess spawning, timeout, background execution.
 Safety validation happens in safety/bash_validator.py before this runs.
 """
 
+from __future__ import annotations
+
 import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
-# Matches Rust runtime/src/bash.rs MAX_OUTPUT_BYTES = 16_384.
+# Per-command output cap. Long-form outputs (full test suite logs, large
+# `cat` dumps) are truncated to keep context cost predictable.
 MAX_OUTPUT_BYTES = 16_384
 
 
 @dataclass
 class BashInput:
     command: str
-    timeout: int | None = None             # milliseconds; None = no timeout (Rust parity)
+    timeout: int | None = None             # milliseconds; None = no timeout
     description: str | None = None
     run_in_background: bool = False
 
@@ -35,23 +37,18 @@ class BashOutput:
 
 
 def execute_bash(input: BashInput) -> BashOutput:
-    """
-    Execute a shell command and return its output.
-    Ported from Rust: runtime/src/bash.rs execute_bash().
+    """Execute a shell command and return its output.
 
-    Uses `sh -lc` (login shell) to match Rust's prepare_command/prepare_tokio_command.
+    Uses `sh -lc` (login shell) so the command sees the user's PATH,
+    aliases, and shell environment the same way an interactive run would.
     """
     if input.run_in_background:
         return _run_background(input.command)
-
     return _run_foreground(input.command, input.timeout)
 
 
 def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
-    """
-    Run command, wait for it, capture output.
-    Rust: execute_bash_async(). When timeout is None, runs without timeout.
-    """
+    """Run command, wait for it, capture output."""
     timeout_secs = (timeout_ms / 1000.0) if timeout_ms is not None else None
 
     try:
@@ -62,30 +59,27 @@ def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
             timeout=timeout_secs,
             env=os.environ.copy(),
         )
-
-        stdout = _truncate_output(result.stdout)
-        stderr = _truncate_output(result.stderr)
-
-        no_output = (not stdout.strip()) and (not stderr.strip())
-        rci = None
-        code = result.returncode
-        if code != 0:
-            rci = f"exit_code:{code}"
-
-        return BashOutput(
-            stdout=stdout,
-            stderr=stderr,
-            interrupted=False,
-            no_output_expected=no_output,
-            return_code_interpretation=rci,
-        )
-
     except subprocess.TimeoutExpired:
         return _timeout_output(command, timeout_ms or 0)
 
+    stdout = _truncate_output(result.stdout)
+    stderr = _truncate_output(result.stderr)
+    no_output = (not stdout.strip()) and (not stderr.strip())
+    rci = None
+    if result.returncode != 0:
+        rci = f"exit_code:{result.returncode}"
+
+    return BashOutput(
+        stdout=stdout,
+        stderr=stderr,
+        interrupted=False,
+        no_output_expected=no_output,
+        return_code_interpretation=rci,
+    )
+
 
 def _timeout_output(command: str, timeout_ms: int) -> BashOutput:
-    """Build the structured timeout output to match Rust's timeout_output()."""
+    """Structured timeout payload routed through the telemetry channel."""
     is_test = _is_test_command(command)
     rci = "test.hung" if is_test else "timeout"
     return BashOutput(
@@ -99,7 +93,9 @@ def _timeout_output(command: str, timeout_ms: int) -> BashOutput:
 
 
 def _is_test_command(command: str) -> bool:
-    """Mirrors Rust is_test_command()."""
+    """Detect whether `command` looks like a test invocation (pytest, npm
+    test, cargo test, …). Used to classify timeouts as 'test hang' vs
+    'command timeout' in the truncated-output telemetry."""
     normalized = " ".join(command.split()).lower()
     return any(
         marker in normalized
@@ -115,7 +111,8 @@ def _is_test_command(command: str) -> bool:
 
 
 def _test_timeout_provenance(command: str, timeout_ms: int, is_test: bool) -> dict:
-    """Mirrors Rust test_timeout_provenance()."""
+    """Classify a timed-out command for the telemetry channel —
+    'test.hung' if it looked like a test, 'command.timeout' otherwise."""
     event = "test.hung" if is_test else "command.timeout"
     failure_class = "test_hang" if is_test else "timeout"
     classification = "test.hung" if is_test else "timeout"
@@ -132,10 +129,7 @@ def _test_timeout_provenance(command: str, timeout_ms: int, is_test: bool) -> di
 
 
 def _run_background(command: str) -> BashOutput:
-    """
-    Spawn command in background, return immediately with task id.
-    Rust: run_in_background branch in execute_bash().
-    """
+    """Spawn command in background, return immediately with task id."""
     proc = subprocess.Popen(
         ["sh", "-lc", command],
         stdout=subprocess.DEVNULL,
@@ -151,10 +145,8 @@ def _run_background(command: str) -> BashOutput:
 
 
 def _truncate_output(s: str) -> str:
-    """
-    Truncate output to MAX_OUTPUT_BYTES, appending the marker when trimmed.
-    Mirrors Rust truncate_output() at runtime/src/bash.rs.
-    """
+    """Truncate output to MAX_OUTPUT_BYTES (16 KiB), appending a clear
+    marker when trimmed so the model knows the output was cut."""
     encoded = s.encode("utf-8")
     if len(encoded) <= MAX_OUTPUT_BYTES:
         return s

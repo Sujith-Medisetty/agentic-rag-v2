@@ -1,6 +1,5 @@
 """
 Web tools — WebFetch and WebSearch.
-Ported from Rust: tools/src/lib.rs execute_web_fetch() / execute_web_search().
 """
 
 import os
@@ -12,19 +11,13 @@ from urllib.parse import urlparse
 import requests
 from requests.adapters import HTTPAdapter
 
-
-# Rust uses a 20-second client timeout (tools/src/lib.rs build_http_client).
 DEFAULT_TIMEOUT = 20
 
-# Rust User-Agent for the http client.
 DEFAULT_USER_AGENT = "clawd-rust-tools/0.1"
 
-# Rust caps redirects at 10.
 MAX_REDIRECTS = 10
 
-# Rust truncates the dedup'd hit list to 8 (execute_web_search).
 WEB_SEARCH_RESULT_CAP = 8
-
 
 @dataclass
 class WebFetchOutput:
@@ -35,22 +28,19 @@ class WebFetchOutput:
     duration_ms: int
     url: str
 
-
 @dataclass
 class WebSearchOutput:
     query: str
     results: list[dict]
     duration_seconds: float
 
-
 # ---------------------------------------------------------------------------
-# WebFetch — Rust execute_web_fetch()
+# WebFetch
 # ---------------------------------------------------------------------------
 
 def web_fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> WebFetchOutput:
     """
     Fetch a URL and return readable text content.
-    Ported from Rust: tools/src/lib.rs execute_web_fetch().
     """
     started = time.monotonic()
     final_url = _upgrade_http_to_https(url)
@@ -80,9 +70,7 @@ def web_fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> WebFetchOutput:
         url=final_url,
     )
 
-
 def _upgrade_http_to_https(url: str) -> str:
-    """Mirrors Rust's auto-upgrade: rewrite non-localhost http:// to https://."""
     parsed = urlparse(url)
     if parsed.scheme != "http":
         return url
@@ -91,9 +79,8 @@ def _upgrade_http_to_https(url: str) -> str:
         return url
     return url.replace("http://", "https://", 1)
 
-
 # ---------------------------------------------------------------------------
-# WebSearch — Rust execute_web_search()
+# WebSearch
 # ---------------------------------------------------------------------------
 
 def web_search(
@@ -102,12 +89,12 @@ def web_search(
     blocked_domains: list[str] | None = None,
 ) -> WebSearchOutput:
     """
-    Search the web using DuckDuckGo. Mirrors Rust execute_web_search().
+    Search the web using DuckDuckGo.
 
     Honors:
-      - CLAWD_WEB_SEARCH_BASE_URL env override
-      - allowed_domains / blocked_domains filters
-      - dedupe + 8-result truncation
+    - CLAWD_WEB_SEARCH_BASE_URL env override
+    - allowed_domains / blocked_domains filters
+    - dedupe + 8-result truncation
     """
     started = time.monotonic()
     base_url = os.environ.get(
@@ -151,7 +138,6 @@ def web_search(
 
     duration = time.monotonic() - started
     return WebSearchOutput(query=query, results=results, duration_seconds=duration)
-
 
 # ---------------------------------------------------------------------------
 # Helpers

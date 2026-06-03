@@ -1,9 +1,8 @@
 """
 Sandbox — isolate bash execution to protect the host system.
-Faithful port of Rust: runtime/src/sandbox.rs
 
 Isolation is namespace-based and Linux-only, exactly like Rust:
-  namespace_supported = (os == linux) AND `unshare --user` works
+ namespace_supported = (os == linux) AND `unshare --user` works
 If unsupported (non-Linux, or unshare unavailable) the sandbox is inactive and
 bash runs directly (still gated by permission mode + bash validation).
 """
@@ -16,30 +15,26 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-
 class SandboxMode(Enum):
-    UNSHARE = "unshare"   # Linux user-namespace isolation (Rust's approach)
-    NONE    = "none"      # no isolation (validation only)
-
+    UNSHARE = "unshare" # Linux user-namespace isolation
+    NONE = "none" # no isolation (validation only)
 
 @dataclass
 class SandboxStatus:
     """Current sandbox state — what's available and active."""
-    mode:              SandboxMode = SandboxMode.NONE
-    active:            bool        = False
-    workspace:         str         = "."
-    network_isolated:  bool        = False
-    fallback_reason:   str         = ""
-    in_container:      bool        = False
-
+    mode: SandboxMode = SandboxMode.NONE
+    active: bool = False
+    workspace: str = "."
+    network_isolated: bool = False
+    fallback_reason: str = ""
+    in_container: bool = False
 
 @dataclass
 class SandboxResult:
-    stdout:      str
-    stderr:      str
-    exit_code:   int
+    stdout: str
+    stderr: str
+    exit_code: int
     interrupted: bool = False
-
 
 # ---------------------------------------------------------------------------
 # Container detection — port of detect_container_environment()
@@ -64,10 +59,9 @@ def detect_container_environment() -> bool:
         pass
     return any(markers)
 
-
 # ---------------------------------------------------------------------------
 # Sandbox resolver — port of resolve_sandbox_status_for_request()
-#   namespace_supported = (os == linux) && unshare_user_namespace_works()
+# namespace_supported = (os == linux) && unshare_user_namespace_works()
 # ---------------------------------------------------------------------------
 
 def resolve_sandbox(
@@ -103,7 +97,6 @@ def resolve_sandbox(
         fallback_reason="namespace isolation unavailable (requires Linux with `unshare`)",
     )
 
-
 # ---------------------------------------------------------------------------
 # Execute in sandbox
 # ---------------------------------------------------------------------------
@@ -120,7 +113,6 @@ def execute_sandboxed(
         return _run_unshare(command, status, timeout_secs)
     return _run_direct(command, timeout_secs)
 
-
 # ---------------------------------------------------------------------------
 # Linux unshare execution — port of build_linux_sandbox_command()
 # ---------------------------------------------------------------------------
@@ -130,7 +122,7 @@ def _run_unshare(
     status: SandboxStatus,
     timeout_secs: float,
 ) -> SandboxResult:
-    """Run command in a Linux user namespace (Rust build_linux_sandbox_command)."""
+    """Run command in a Linux user namespace."""
     workspace = Path(status.workspace).resolve()
 
     args = [
@@ -150,11 +142,9 @@ def _run_unshare(
 
     return _run_subprocess(args, timeout_secs, env=env)
 
-
 def _run_direct(command: str, timeout_secs: float) -> SandboxResult:
     """Run command directly on host. No isolation."""
     return _run_subprocess(["sh", "-c", command], timeout_secs)
-
 
 # ---------------------------------------------------------------------------
 # Shared subprocess runner
@@ -182,9 +172,8 @@ def _run_subprocess(
             stderr=f"[timed out after {timeout_secs:.0f}s]",
             exit_code=-1, interrupted=True,
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e: # noqa: BLE001
         return SandboxResult(stdout="", stderr=f"Failed to execute: {e}", exit_code=-1)
-
 
 # ---------------------------------------------------------------------------
 # Availability check — port of unshare_user_namespace_works()
@@ -200,5 +189,5 @@ def _unshare_available() -> bool:
             capture_output=True, timeout=5,
         )
         return result.returncode == 0
-    except Exception:  # noqa: BLE001
+    except Exception: # noqa: BLE001
         return False

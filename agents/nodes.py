@@ -4,19 +4,20 @@ runtime/src/conversation.rs::run_turn.
 
 The loop is expressed as a 2-node LangGraph cycle (see agents/graph.py):
 
-    node_agent  → call the model once, append the assistant message
-       │ should_continue: assistant requested tools?
-       ├── yes → node_tools (execute tools, append results) → back to node_agent
-       └── no  → END        (terminal: no pending tool uses → break)
+ node_agent → call the model once, append the assistant message
+ │ should_continue: assistant requested tools?
+ ├── yes → node_tools (execute tools, append results) → back to node_agent
+ └── no → END (terminal: no pending tool uses → break)
 
-Mirrors Rust run_turn semantics:
-  * explicit `iterations` counter, checked against max_iterations (raises if
-    exceeded, like conversation.rs:347-355);
-  * loop continues while the assistant keeps requesting tools, and stops the
-    moment it returns no tool uses (conversation.rs:407-409);
-  * compaction is handled by the CompactingCheckpointer on each checkpoint write
-    (before the next iteration runs).
+ * explicit `iterations` counter, checked against max_iterations (raises if
+ exceeded, like conversation.rs:347-355);
+ * loop continues while the assistant keeps requesting tools, and stops the
+ moment it returns no tool uses (conversation.rs:407-409);
+ * compaction is handled by the CompactingCheckpointer on each checkpoint write
+ (before the next iteration runs).
 """
+
+from __future__ import annotations
 
 from datetime import date
 import json
@@ -33,16 +34,15 @@ from agents.state import RunnerState
 from agents.prompt import SystemPromptBuilder, ProjectContext, FRONTIER_MODEL_NAME
 from tools.wrappers import get_all_tools
 
-
 # ---------------------------------------------------------------------------
-# Global config — set once at startup by main.py
+# Global config — set once at startup by server.app
 # ---------------------------------------------------------------------------
 
-_model:          str  = "claude-opus-4-6"
-_thinking:       bool = False
+_model: str = "claude-opus-4-6"
+_thinking: bool = False
 _thinking_budget: int = 10_000
-_mcp_tools:      list = []
-_token_counter        = None
+_mcp_tools: list = []  # extra LangChain tools loaded from MCP servers
+_token_counter = None
 
 
 def configure_model(
@@ -54,16 +54,23 @@ def configure_model(
     settings. (Iteration/token/time limits are the per-invocation run budget —
     see reset_run_budget.)"""
     global _model, _thinking, _thinking_budget
-    _model           = model
-    _thinking        = thinking
+    _model = model
+    _thinking = thinking
     _thinking_budget = thinking_budget
 
 
-def configure_tools(mcp_tools: list | None) -> None:
-    """Register MCP tools so the loop's tool set includes them."""
+def configure_tools(extra_tools: list | None = None) -> None:
+    """Register additional LangChain tools (typically loaded from MCP servers
+    by server.mcp_loader.load_mcp_tools). Called ONCE at server boot; passing
+    [] or omitting the arg leaves the agent with just the native toolset."""
     global _mcp_tools
-    _mcp_tools = mcp_tools or []
+    _mcp_tools = list(extra_tools or [])
 
+
+def get_mcp_tools() -> list:
+    """Snapshot of the currently-registered MCP tools. Used by the prompt
+    builder to surface them in the system prompt."""
+    return list(_mcp_tools)
 
 # ---------------------------------------------------------------------------
 # Per-invocation run budget — replaces the old hard max_iterations crash with a
@@ -71,6 +78,7 @@ def configure_tools(mcp_tools: list | None) -> None:
 # resume (same thread_id, new process) starts with a fresh budget and continues
 # from the last checkpoint instead of immediately re-pausing.
 # ---------------------------------------------------------------------------
+
 
 class _RunBudget:
     """Tracks one invocation's iteration / token / wall-clock spend + a
@@ -189,7 +197,9 @@ def get_token_counter():
 
 
 def _tools() -> list:
-    return get_all_tools(_mcp_tools)
+    # Native tools + any MCP tools registered at startup. bind_tools(...) sees
+    # the union; the LLM treats them identically.
+    return get_all_tools() + _mcp_tools
 
 
 def _get_llm() -> ChatAnthropic:
@@ -198,10 +208,10 @@ def _get_llm() -> ChatAnthropic:
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": _thinking_budget}
     return ChatAnthropic(**kwargs)
 
-
 # ---------------------------------------------------------------------------
 # System prompt assembly (done once per run, cached in state)
 # ---------------------------------------------------------------------------
+
 
 def _build_system_prompt(state: RunnerState) -> str:
     workspace = state.get("workspace", ".")
@@ -216,10 +226,13 @@ def _build_system_prompt(state: RunnerState) -> str:
         # Top-level loop is the sole orchestrator — sub-agents (multi_agent.py)
         # deliberately do NOT enable this; they cannot spawn further agents.
         .with_orchestration_guidance(True)
+        # Surface any MCP-loaded tools so the model knows they exist (in
+        # addition to seeing them in its bound tool list).
+        .with_mcp_tools(_mcp_tools)
     )
 
     # Extra instructions not covered by instruction-file discovery (README /
-    # .agent.md content injected by the caller) are appended verbatim.
+    #.agent.md content injected by the caller) are appended verbatim.
     extra = (state.get("project_context") or "").strip()
     if extra:
         builder.append_section(
@@ -227,15 +240,15 @@ def _build_system_prompt(state: RunnerState) -> str:
         )
     return builder.render()
 
-
 # ---------------------------------------------------------------------------
 # Streaming display + token accounting for one model call
 # ---------------------------------------------------------------------------
 
+
 def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage:
-    """Stream a single model call: print text, announce tool calls, return the
-    aggregated assistant message."""
-    from ui.progress import get_reporter
+    """Stream a single model call: forward text chunks + tool announcements
+    through the reporter, return the aggregated assistant message."""
+    from agents.reporter import get_reporter
     reporter = get_reporter()
 
     aggregate: AIMessageChunk | None = None
@@ -244,16 +257,18 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
     for chunk in llm_with_tools.stream(messages):
         aggregate = chunk if aggregate is None else aggregate + chunk
 
-        # print streamed text
+        # Stream text chunks to the UI via reporter.assistant_text. WebReporter
+        # publishes each chunk over the WebSocket so the browser bubble grows
+        # in real time; the noop base reporter just drops them.
         content = chunk.content
         if isinstance(content, str) and content:
-            print(content, end="", flush=True)
+            reporter.assistant_text(content, done=False)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
                     t = block.get("text", "")
                     if t:
-                        print(t, end="", flush=True)
+                        reporter.assistant_text(t, done=False)
 
         # announce tool calls as soon as they have a name (dedupe by id)
         for tc in getattr(aggregate, "tool_calls", None) or []:
@@ -266,8 +281,6 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
                     or args.get("pattern") or args.get("url") or args.get("action") or ""
                 )
                 reporter.tool_start(tc["name"], str(target)[:70])
-
-    print()  # newline after the turn's text
 
     if aggregate is None:
         return AIMessage(content="")
@@ -296,13 +309,13 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
 
     return ai
 
-
 # ---------------------------------------------------------------------------
 # Loop nodes
 # ---------------------------------------------------------------------------
 
+
 def node_agent(state: RunnerState) -> dict:
-    """One model call = one Rust run_turn iteration.
+    """One model call = one
 
     Before each call we consult the per-invocation run budget. If a budget is hit
     (iterations / tokens / wall-clock / stall) we PAUSE gracefully: return without
@@ -312,19 +325,18 @@ def node_agent(state: RunnerState) -> dict:
     """
     pause = _run_budget.check()
     if pause is not None:
-        from ui.progress import get_reporter
+        from agents.reporter import get_reporter
         try:
             get_reporter().tool_done("budget", f"paused: {pause['detail']}", error=False)
         except Exception:
             pass
-        print(f"\n\033[33m[paused — {pause['detail']}]\033[0m")
         # No "messages" update ⇒ last message stays a ToolMessage/Human ⇒ END.
         return {"paused": True, "pause_reason": pause}
 
     iterations = int(state.get("iterations", 0)) + 1
 
     # Assemble the system prompt once, then reuse for the rest of the run
-    # (Rust clones a precomputed system_prompt each iteration).
+    #.
     system_prompt = state.get("system_prompt") or _build_system_prompt(state)
 
     messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
@@ -353,7 +365,7 @@ def should_continue(state: RunnerState) -> str:
 def node_tools(state: RunnerState) -> dict:
     """Execute the assistant's requested tools (permissions enforced inside each
     tool wrapper) and append the results."""
-    from ui.progress import get_reporter
+    from agents.reporter import get_reporter
     reporter = get_reporter()
 
     result = ToolNode(_tools()).invoke(state)

@@ -1,23 +1,19 @@
 """
 File operations — read, write, edit, grep, glob.
-Ported from Rust: runtime/src/file_ops.rs
 
-The output shapes, defaults, and semantics here mirror the Rust crate
+The output shapes, defaults, and semantics here mirror
 exactly so callers see equivalent behavior across both implementations.
 """
 
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-
-# Mirrors Rust file_ops.rs MAX_READ_SIZE / MAX_WRITE_SIZE.
 MAX_READ_SIZE = 10 * 1024 * 1024
 MAX_WRITE_SIZE = 10 * 1024 * 1024
 
-# Mirrors Rust GLOB_SEARCH_IGNORED_DIRS — exact set, no additions.
 IGNORED_DIRS = {
     ".git",
     "node_modules",
@@ -27,13 +23,12 @@ IGNORED_DIRS = {
     "coverage",
 }
 
-
 # ---------------------------------------------------------------------------
-# Binary detection — Rust is_binary_file()
+# Binary detection
 # ---------------------------------------------------------------------------
 
 def _is_binary_file(path: Path) -> bool:
-    """Read first 8192 bytes and check for NUL bytes (Rust parity)."""
+    """Read first 8192 bytes and check for NUL bytes."""
     try:
         with open(path, "rb") as f:
             chunk = f.read(8192)
@@ -41,9 +36,8 @@ def _is_binary_file(path: Path) -> bool:
     except OSError:
         return False
 
-
 # ---------------------------------------------------------------------------
-# Structured patch hunk — Rust StructuredPatchHunk
+# Structured patch hunk
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -54,9 +48,7 @@ class StructuredPatchHunk:
     newLines: int
     lines: list[str]
 
-
 def _make_patch(original: str, updated: str) -> list[StructuredPatchHunk]:
-    """Mirrors Rust make_patch()."""
     lines: list[str] = []
     for line in original.splitlines():
         lines.append(f"-{line}")
@@ -72,9 +64,8 @@ def _make_patch(original: str, updated: str) -> list[StructuredPatchHunk]:
         )
     ]
 
-
 # ---------------------------------------------------------------------------
-# Path normalization — Rust normalize_path / normalize_path_allow_missing
+# Path normalization
 # ---------------------------------------------------------------------------
 
 def _normalize_path(path: str) -> Path:
@@ -82,7 +73,6 @@ def _normalize_path(path: str) -> Path:
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
     return candidate.resolve(strict=True)
-
 
 def _normalize_path_allow_missing(path: str) -> Path:
     candidate = Path(path)
@@ -98,9 +88,8 @@ def _normalize_path_allow_missing(path: str) -> Path:
             canonical_parent = parent
         return canonical_parent / candidate.name
 
-
 # ---------------------------------------------------------------------------
-# read_file — Rust file_ops.rs read_file()
+# read_file
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -111,12 +100,10 @@ class TextFilePayload:
     startLine: int
     totalLines: int
 
-
 @dataclass
 class ReadFileOutput:
     type: str
     file: TextFilePayload
-
 
 def read_file(
     path: str,
@@ -125,9 +112,8 @@ def read_file(
 ) -> ReadFileOutput:
     """
     Read a text file, optionally windowed by offset/limit.
-    Ported from Rust: file_ops.rs read_file().
 
-    Validation order matches Rust: metadata (existence + size) → binary → read.
+    Validation order matches
     """
     absolute_path = _normalize_path(path)
 
@@ -160,9 +146,8 @@ def read_file(
         ),
     )
 
-
 # ---------------------------------------------------------------------------
-# write_file — Rust file_ops.rs write_file()
+# write_file
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -174,11 +159,9 @@ class WriteFileOutput:
     originalFile: str | None
     gitDiff: dict | None = None
 
-
 def write_file(path: str, content: str) -> WriteFileOutput:
     """
     Write a file, creating parent dirs if needed.
-    Ported from Rust: file_ops.rs write_file().
     """
     if len(content) > MAX_WRITE_SIZE:
         raise OSError(
@@ -204,9 +187,8 @@ def write_file(path: str, content: str) -> WriteFileOutput:
         gitDiff=None,
     )
 
-
 # ---------------------------------------------------------------------------
-# edit_file — Rust file_ops.rs edit_file()
+# edit_file
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -220,7 +202,6 @@ class EditFileOutput:
     replaceAll: bool
     gitDiff: dict | None = None
 
-
 def edit_file(
     path: str,
     old_string: str,
@@ -229,7 +210,6 @@ def edit_file(
 ) -> EditFileOutput:
     """
     Replace exact text in a file.
-    Ported from Rust: file_ops.rs edit_file().
     """
     absolute_path = _normalize_path(path)
     original_file = absolute_path.read_text(encoding="utf-8")
@@ -258,9 +238,8 @@ def edit_file(
         gitDiff=None,
     )
 
-
 # ---------------------------------------------------------------------------
-# grep_search — Rust file_ops.rs grep_search()
+# grep_search
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -269,17 +248,16 @@ class GrepSearchInput:
     path: str | None = None
     glob: str | None = None
     output_mode: str | None = None
-    before: int | None = None             # -B
-    after: int | None = None              # -A
-    context_short: int | None = None      # -C
+    before: int | None = None  # -B
+    after: int | None = None  # -A
+    context_short: int | None = None  # -C
     context: int | None = None
-    line_numbers: bool | None = None      # -n (default True)
+    line_numbers: bool | None = None  # -n (default True)
     case_insensitive: bool | None = None  # -i (default False)
     file_type: str | None = None
     head_limit: int | None = None
     offset: int | None = None
-    multiline: bool | None = None         # toggles dot_matches_new_line
-
+    multiline: bool | None = None  # toggles dot_matches_new_line
 
 @dataclass
 class GrepSearchOutput:
@@ -292,17 +270,14 @@ class GrepSearchOutput:
     appliedLimit: int | None = None
     appliedOffset: int | None = None
 
-
 def grep_search(input: GrepSearchInput) -> GrepSearchOutput:
     """
     Recursive regex search across files.
-    Ported from Rust: file_ops.rs grep_search().
 
-    Mirrors Rust semantics:
-      - case_insensitive defaults to False (case-sensitive).
-      - multiline toggles dot_matches_new_line (re.DOTALL).
-      - output_mode defaults to "files_with_matches".
-      - context defaults to 0.
+    - case_insensitive defaults to False (case-sensitive).
+    - multiline toggles dot_matches_new_line (re.DOTALL).
+    - output_mode defaults to "files_with_matches".
+    - context defaults to 0.
     """
     base_path = (
         _normalize_path(input.path) if input.path is not None
@@ -404,9 +379,8 @@ def grep_search(input: GrepSearchInput) -> GrepSearchOutput:
         appliedOffset=applied_offset,
     )
 
-
 # ---------------------------------------------------------------------------
-# glob_search — Rust file_ops.rs glob_search()
+# glob_search
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -416,11 +390,9 @@ class GlobSearchOutput:
     filenames: list[str]
     truncated: bool
 
-
 def glob_search(pattern: str, path: str | None = None) -> GlobSearchOutput:
     """
     Find files by glob pattern.
-    Ported from Rust: file_ops.rs glob_search().
     """
     started = time.monotonic()
     base_dir = _normalize_path(path) if path is not None else Path.cwd().resolve()
@@ -466,9 +438,7 @@ def glob_search(pattern: str, path: str | None = None) -> GlobSearchOutput:
         truncated=truncated,
     )
 
-
 def _expand_braces(pattern: str) -> list[str]:
-    """Mirrors Rust expand_braces()."""
     open_pos = pattern.find("{")
     if open_pos == -1:
         return [pattern]
@@ -486,9 +456,7 @@ def _expand_braces(pattern: str) -> list[str]:
         result.extend(_expand_braces(f"{prefix}{alt}{suffix}"))
     return result
 
-
 def _derive_glob_walk_root(pattern: str) -> Path:
-    """Mirrors Rust derive_glob_walk_root()."""
     parts = Path(pattern).parts
     prefix: list[str] = []
     for component in parts:
@@ -499,9 +467,8 @@ def _derive_glob_walk_root(pattern: str) -> Path:
         return Path(*prefix)
     return Path.cwd()
 
-
 # ---------------------------------------------------------------------------
-# Search helpers — Rust collect_search_files / matches_optional_filters / apply_limit
+# Search helpers
 # ---------------------------------------------------------------------------
 
 def _collect_search_files(base_path: Path):
@@ -511,7 +478,6 @@ def _collect_search_files(base_path: Path):
     for root, dirs, files in os.walk(base_path):
         for name in files:
             yield Path(root) / name
-
 
 def _matches_optional_filters(
     path: Path,
@@ -528,13 +494,11 @@ def _matches_optional_filters(
             return False
     return True
 
-
 def _apply_limit(
     items: list,
     limit: int | None,
     offset: int | None,
 ) -> tuple[list, int | None, int | None]:
-    """Mirrors Rust apply_limit() — default limit 250, 0 means unlimited."""
     offset_value = offset or 0
     sliced = items[offset_value:]
     explicit_limit = limit if limit is not None else 250

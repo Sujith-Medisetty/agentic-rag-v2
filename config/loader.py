@@ -1,12 +1,15 @@
 """
-Config loader — reads .claw/.agent config files and merges with env + CLI.
-Ported from Rust: runtime/src/config.rs
+Config loader — reads .agent / .claw config files and merges with env vars.
 
 Config hierarchy (highest priority first):
-  CLI flags > environment variables
-  > project .claw/settings.local.json > project .claw/settings.json / .agent.json
-  > user .claw/settings.json / ~/.agent/settings.json > legacy .claw.json
+  environment variables
+  > project .claw/settings.local.json
+  > project .claw/settings.json / .agent.json
+  > user .claw/settings.json / ~/.agent/settings.json
+  > legacy .claw.json
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -31,34 +34,48 @@ class SandboxConfig:
 
 @dataclass
 class McpServerConfig:
-    command: str
-    args:    list[str]  = field(default_factory=list)
-    env:     dict       = field(default_factory=dict)
+    """One entry in .agent.json's `mcp_servers` map.
+
+    Two transport styles are supported (matches LangChain's
+    MultiServerMCPClient):
+      stdio — spawn a local process (e.g. `npx @modelcontextprotocol/...`).
+              Requires `command`; `args` and `env` are optional.
+      http / sse / streamable_http — connect to a hosted MCP endpoint over HTTP.
+              Requires `url`; `command` / `args` are unused.
+
+    Empty defaults so a partial entry doesn't crash JSON parsing — load-time
+    validation in server/mcp_loader.py warns and skips invalid entries instead.
+    """
+    command:   str       = ""
+    args:      list[str] = field(default_factory=list)
+    env:       dict      = field(default_factory=dict)
+    transport: str       = "stdio"
+    url:       str       = ""
 
 
 @dataclass
 class AgentConfig:
-    """
-    Fully merged runtime config.
-    Ported from Rust: config.rs RuntimeConfig / RuntimeFeatureConfig
-    """
-    provider:         str             = "anthropic"
-    model:            str             = "claude-opus-4-6"
-    # Default fallback matches Rust default_permission_mode → DangerFullAccess
-    # (used only when no env var / config file specifies a mode).
-    permission_mode:  PermissionMode  = PermissionMode.FULL_ACCESS
-    thinking:         bool            = False
-    thinking_budget:  int             = 10000
-    max_iterations:   int             = 50
+    """Fully merged runtime config."""
+    provider:          str             = "anthropic"
+    model:             str             = "claude-opus-4-6"
+    # Default mode is danger-full-access; only used when no env var / config
+    # file specifies an alternative.
+    permission_mode:   PermissionMode  = PermissionMode.FULL_ACCESS
+    thinking:          bool            = False
+    thinking_budget:   int             = 10000
+    max_iterations:    int             = 50
     # Long-run budgets — graceful pause (not crash) when exceeded. 0 = unbounded.
     # no_progress_limit is always on: N consecutive identical tool calls ⇒ stall.
-    max_run_tokens:   int             = 0
-    max_run_seconds:  int             = 0
-    no_progress_limit: int            = 8
-    workspace:        str             = "."
-    sandbox:          SandboxConfig   = field(default_factory=SandboxConfig)
-    hooks:            HookConfig      = field(default_factory=HookConfig)
-    mcp_servers:      dict[str, McpServerConfig] = field(default_factory=dict)
+    max_run_tokens:    int             = 0
+    max_run_seconds:   int             = 0
+    no_progress_limit: int             = 8
+    workspace:         str             = "."
+    sandbox:           SandboxConfig   = field(default_factory=SandboxConfig)
+    hooks:             HookConfig      = field(default_factory=HookConfig)
+    # Optional MCP servers. Empty dict ⇒ no MCP loading happens, zero overhead.
+    # Populated ⇒ tools from each server are loaded at backend boot and added
+    # to the agent's toolset (names prefixed with the server name).
+    mcp_servers:       dict[str, McpServerConfig] = field(default_factory=dict)
 
 
 _MODE_MAP = {
@@ -76,34 +93,30 @@ def load_config(
     cli_model:       str | None = None,
     cli_permission:  str | None = None,
 ) -> AgentConfig:
-    """
-    Load and merge config from all sources.
-    Ported from Rust: config.rs ConfigLoader::load()
-    """
+    """Load and merge config from all sources."""
     config = AgentConfig(workspace=str(Path(workspace).resolve()))
 
-    # Config files, lowest → highest priority (later overrides earlier),
-    # mirroring Rust config.rs discovery order. `.agent.*` names are kept for
-    # back-compat alongside the canonical `.claw.*` names.
+    # Config files, lowest → highest priority (later overrides earlier).
+    # `.agent.*` names are kept for back-compat alongside `.claw.*` names.
     home = Path.home()
     ws = Path(workspace)
     config_files = [
-        home / ".claw.json",                 # legacy user
-        home / ".claw" / "settings.json",    # user
-        home / ".agent" / "settings.json",   # user (back-compat)
-        ws / ".claw.json",                   # legacy project
-        ws / ".claw" / "settings.json",      # project
-        ws / ".agent.json",                  # project (back-compat)
-        ws / ".claw" / "settings.local.json",  # local override (highest file tier)
+        home / ".claw.json",                    # legacy user
+        home / ".claw" / "settings.json",       # user
+        home / ".agent" / "settings.json",      # user (back-compat)
+        ws / ".claw.json",                      # legacy project
+        ws / ".claw" / "settings.json",         # project
+        ws / ".agent.json",                     # project (back-compat)
+        ws / ".claw" / "settings.local.json",   # local override (highest file tier)
     ]
     for path in config_files:
         if path.exists():
             _merge_json_config(config, path)
 
-    # environment variables (higher priority than files)
+    # Environment variables override files.
     _merge_env(config)
 
-    # CLI flags (highest priority)
+    # CLI flags override everything.
     if cli_provider:
         config.provider = cli_provider
     if cli_model:
@@ -157,13 +170,17 @@ def _merge_json_config(config: AgentConfig, path: Path) -> None:
         config.hooks.post_tool_use     = h.get("post_tool_use")
         config.hooks.post_tool_failure = h.get("post_tool_failure")
 
-    # MCP servers
-    if "mcp_servers" in data:
+    # MCP servers — empty/missing block is the no-op default.
+    if isinstance(data.get("mcp_servers"), dict):
         for name, spec in data["mcp_servers"].items():
+            if not isinstance(spec, dict):
+                continue
             config.mcp_servers[name] = McpServerConfig(
-                command = spec.get("command", ""),
-                args    = spec.get("args", []),
-                env     = spec.get("env", {}),
+                command   = str(spec.get("command", "")),
+                args      = list(spec.get("args", []) or []),
+                env       = dict(spec.get("env", {}) or {}),
+                transport = str(spec.get("transport", "stdio")),
+                url       = str(spec.get("url", "")),
             )
 
 
@@ -173,9 +190,8 @@ def _merge_env(config: AgentConfig) -> None:
         config.provider = v
     if v := os.getenv("AGENT_MODEL"):
         config.model = v
-    # Permission mode: AGENT_PERMISSION_MODE, or Rust's RUSTY_CLAUDE_PERMISSION_MODE.
-    # When nothing is set the default is danger-full-access (matches Rust
-    # default_permission_mode in main.rs).
+    # Permission mode: AGENT_PERMISSION_MODE, plus the legacy
+    # RUSTY_CLAUDE_PERMISSION_MODE name for back-compat.
     perm = os.getenv("AGENT_PERMISSION_MODE") or os.getenv("RUSTY_CLAUDE_PERMISSION_MODE")
     if perm:
         mode = _MODE_MAP.get(perm)

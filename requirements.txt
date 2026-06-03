@@ -22,6 +22,8 @@ requests>=2.31.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 
-# RAG service (rag/ — semantic search ported from claw-rag-service)
-blake3>=0.4.0          # content hashing (matches Rust blake3); falls back to blake2b if absent
-# qdrant-client>=1.7.0  # optional: Qdrant vector backend (set CLAW_RAG_QDRANT_URL)
+# Web backend (Phase 1 — replaces CLI as primary user surface)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+itsdangerous>=2.1.0   # signed device-pair tokens

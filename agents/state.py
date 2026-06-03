@@ -11,24 +11,23 @@ from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 
-
 class RunnerState(TypedDict, total=False):
-    """State for the single run_turn-style agent loop."""
-    # Full conversation history (assistant turns + tool results).
-    messages:        Annotated[list[BaseMessage], add_messages]
+ """State for the single run_turn-style agent loop."""
+ # Full conversation history (assistant turns + tool results).
+ messages: Annotated[list[BaseMessage], add_messages]
 
-    # Task / environment info.
-    task:            str
-    workspace:       str
-    repo:            str
-    project_context: str          # extra instructions (CLAUDE.md / .agent.md)
-    mode:            str          # "cli" | "auto"
+ # Task / environment info.
+ task: str
+ workspace: str
+ repo: str
+ project_context: str # extra instructions (CLAUDE.md /.agent.md)
+ mode: str # "cli" | "auto"
 
-    # Loop bookkeeping (mirror Rust run_turn).
-    iterations:      int          # number of model calls so far this run
-    max_iterations:  int          # hard cap; raises when exceeded
-    system_prompt:   str          # assembled once on first iteration, reused
+ # Loop bookkeeping.
+ iterations: int # number of model calls so far this run
+ max_iterations: int # hard cap; raises when exceeded
+ system_prompt: str # assembled once on first iteration, reused
 
-    # Graceful-pause signalling (set when a run budget is hit; see nodes._RunBudget).
-    paused:          bool         # True when the loop stopped on a budget, not completion
-    pause_reason:    dict         # {"reason": ..., "detail": ...}
+ # Graceful-pause signalling (set when a run budget is hit; see nodes._RunBudget).
+ paused: bool # True when the loop stopped on a budget, not completion
+ pause_reason: dict # {"reason":..., "detail":...}

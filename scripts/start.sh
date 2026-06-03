@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# One-shot start script for Mac + Linux.
+#
+# Boots the FastAPI backend (uvicorn) on :8765 in the background, then the
+# Vite dev server on :5173 in the foreground. Ctrl-C kills both.
+#
+# Usage:
+#   ./scripts/start.sh
+#
+# Requirements (checked at runtime):
+#   python3 ≥ 3.10
+#   node    ≥ 18
+#   npm     (ships with node)
+#   ANTHROPIC_API_KEY (the agent needs it)
+#
+# First-run side effects:
+#   - Creates a venv at ./.venv if absent and installs requirements.txt
+#   - Runs `npm install` in web/ if node_modules is absent
+#   - Generates PWA icons via scripts/generate-pwa-icons.py if they're missing
+#     and Pillow + cairosvg are installable (skipped silently otherwise)
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+BLUE="\033[34m"; GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; DIM="\033[2m"; RST="\033[0m"
+
+log()  { printf "${BLUE}▸${RST} %s\n" "$*"; }
+ok()   { printf "${GREEN}✓${RST} %s\n" "$*"; }
+warn() { printf "${YELLOW}⚠${RST}  %s\n" "$*"; }
+die()  { printf "${RED}✗${RST} %s\n" "$*" >&2; exit 1; }
+
+# ---- Preflight ------------------------------------------------------------
+
+command -v python3 >/dev/null || die "python3 not found. Install Python 3.10+."
+command -v node    >/dev/null || die "node not found. Install Node 18+."
+command -v npm     >/dev/null || die "npm not found (should come with node)."
+
+py_major=$(python3 -c 'import sys; print(sys.version_info.major)')
+py_minor=$(python3 -c 'import sys; print(sys.version_info.minor)')
+if (( py_major < 3 || (py_major == 3 && py_minor < 10) )); then
+  die "Python 3.10+ required (found ${py_major}.${py_minor})."
+fi
+
+node_major=$(node -p 'process.versions.node.split(".")[0]')
+if (( node_major < 18 )); then
+  die "Node 18+ required (found v${node_major})."
+fi
+
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  warn "ANTHROPIC_API_KEY is not set. The agent will fail until you export it."
+  warn "  export ANTHROPIC_API_KEY=sk-ant-..."
+fi
+
+# ---- Backend: venv + deps -------------------------------------------------
+
+if [[ ! -d .venv ]]; then
+  log "creating Python venv at .venv"
+  python3 -m venv .venv
+fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+if [[ ! -f .venv/.deps_installed ]] || [[ requirements.txt -nt .venv/.deps_installed ]]; then
+  log "installing Python deps (one-time, ~30s)"
+  pip install --quiet --upgrade pip
+  pip install --quiet -r requirements.txt
+  touch .venv/.deps_installed
+  ok "Python deps installed"
+fi
+
+# ---- Frontend: npm install ------------------------------------------------
+
+if [[ ! -d web/node_modules ]]; then
+  log "installing web deps (one-time, ~1min)"
+  (cd web && npm install --silent)
+  ok "web deps installed"
+fi
+
+# ---- PWA icons (optional) -------------------------------------------------
+
+if [[ ! -f web/public/icons/icon-512.png ]]; then
+  log "generating PWA icons (one-time)"
+  if pip install --quiet pillow cairosvg 2>/dev/null; then
+    python3 scripts/generate-pwa-icons.py || warn "icon generation failed — using SVG only"
+  else
+    warn "Pillow/cairosvg not installable on this system — PWA will use SVG icons only"
+  fi
+fi
+
+# ---- Start both servers ---------------------------------------------------
+
+BACKEND_LOG="$ROOT/.venv/uvicorn.log"
+: > "$BACKEND_LOG"
+
+log "starting backend (uvicorn) on http://127.0.0.1:8765"
+uvicorn server.app:app --host 127.0.0.1 --port 8765 \
+  --log-level warning \
+  > "$BACKEND_LOG" 2>&1 &
+BACKEND_PID=$!
+
+# Wait briefly for backend to be ready (or fail fast)
+for _ in $(seq 1 20); do
+  if curl -fsS http://127.0.0.1:8765/api/health >/dev/null 2>&1; then
+    ok "backend is up"
+    break
+  fi
+  if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+    printf "${DIM}--- backend log ---${RST}\n"
+    cat "$BACKEND_LOG"
+    die "backend exited before responding"
+  fi
+  sleep 0.25
+done
+
+cleanup() {
+  log "stopping backend (pid $BACKEND_PID)"
+  kill "$BACKEND_PID" 2>/dev/null || true
+  wait "$BACKEND_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+log "starting frontend (vite) on http://127.0.0.1:5173"
+log "open in your browser: ${GREEN}http://127.0.0.1:5173${RST}"
+echo
+
+(cd web && npm run dev)
