@@ -449,8 +449,48 @@ legacy ~/.claw.json  <  ~/.claw/settings.json / ~/.agent/settings.json
 Key settings (`AgentConfig`): `provider`, `model` (default `claude-opus-4-6`),
 `permission_mode` (default `danger-full-access`), `thinking` + `thinking_budget`,
 `max_iterations` (50), `sandbox`, `hooks`, `mcp_servers`.
-Env vars: `AGENT_MODEL`, `AGENT_PERMISSION_MODE` (or `RUSTY_CLAUDE_PERMISSION_MODE`),
-`AGENT_MAX_ITERATIONS`, `AGENT_WORKSPACE`, plus `ANTHROPIC_API_KEY` for the model.
+Env vars: `AGENT_PROVIDER`, `AGENT_MODEL`, `AGENT_PERMISSION_MODE` (or
+`RUSTY_CLAUDE_PERMISSION_MODE`), `AGENT_MAX_ITERATIONS`, `AGENT_WORKSPACE`, plus the
+provider's API key (`ANTHROPIC_API_KEY` / `MINIMAX_API_KEY` / `AGENT_API_KEY`).
+
+### 10.1 Switching the model (Anthropic / MiniMax / other OpenAI-compatible)
+
+The agent supports three provider styles. Pick one with `AGENT_PROVIDER`:
+
+**Anthropic (default).** No extra setup — just keep using Claude.
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+# AGENT_PROVIDER=anthropic  (default, can omit)
+# AGENT_MODEL=claude-opus-4-6  (default)
+```
+
+**MiniMax** (M1 / M2 / etc. — OpenAI-compatible under the hood).
+```bash
+export AGENT_PROVIDER=minimax
+export AGENT_MODEL=MiniMax-M2        # whatever model your key allows
+export MINIMAX_API_KEY=your-key-here
+# Optional override (default is the international endpoint):
+# export MINIMAX_BASE_URL=https://api.minimax.io/v1
+```
+
+**Any other OpenAI-compatible endpoint** (DeepSeek, Together, Groq, local
+vLLM/llama.cpp, etc.):
+```bash
+export AGENT_PROVIDER=openai-compatible
+export AGENT_MODEL=deepseek-chat
+export AGENT_API_KEY=...
+export AGENT_BASE_URL=https://api.deepseek.com/v1
+```
+
+You can also put these in `.claw/settings.json` instead of env vars:
+```json
+{ "provider": "minimax", "model": "MiniMax-M2" }
+```
+(The API key still comes from the env var — never put secrets in the JSON.)
+
+Restart the backend after changing the provider. The agent leans heavily on tool
+calling; Claude models are the gold standard for that, but MiniMax M2 is
+specifically tuned for agentic / coding workloads and works well here too.
 
 ---
 

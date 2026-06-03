@@ -845,7 +845,25 @@ MULTI_AGENT_TOOLS = [Agent, AgentStatus]
 # ============================================================================
 # ALL_TOOLS + public API
 # ============================================================================
-ALL_TOOLS = WRITE_TOOLS + MULTI_AGENT_TOOLS # write + utility + multi-agent
+# Union of READ + WRITE + MULTI_AGENT, deduped while preserving order so the
+# read tools (read_file, grep_search, glob_search, git_read) actually reach
+# the LLM. Previously this was just WRITE_TOOLS + MULTI_AGENT_TOOLS, which
+# silently dropped every read tool — the model would call `read_file` and
+# get "not a valid tool" errors and fall back to bash.
+def _dedupe_tools(*groups):
+    seen: set = set()
+    out: list = []
+    for group in groups:
+        for t in group:
+            name = getattr(t, "name", None)
+            if name and name in seen:
+                continue
+            if name:
+                seen.add(name)
+            out.append(t)
+    return out
+
+ALL_TOOLS: list = _dedupe_tools(READ_TOOLS, WRITE_TOOLS, MULTI_AGENT_TOOLS)
 def get_read_tools() -> list:
     """Tools for plan/explore mode — no writes, no bash."""
     return list(READ_TOOLS)

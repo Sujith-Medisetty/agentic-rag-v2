@@ -120,6 +120,7 @@ async def _configure_runtime_singletons() -> None:
         model=cfg.model,
         thinking=cfg.thinking,
         thinking_budget=getattr(cfg, "thinking_budget", 10000),
+        provider=cfg.provider,
     )
 
     # MCP tools — empty `mcp_servers` config returns [] immediately, so this
@@ -336,13 +337,45 @@ async def messages_post(
         bus.bind_loop(asyncio.get_running_loop())
 
     # Fire-and-forget. Errors land on the bus via reporter.error().
-    asyncio.create_task(run_turn(
+    task = asyncio.create_task(run_turn(
         session_id=session_id,
         project_id=project["id"],
         workspace=project["workspace_path"],
         user_prompt=req.content,
     ))
+    _active_turns[session_id] = task
+    task.add_done_callback(lambda _t, sid=session_id: _active_turns.pop(sid, None))
     return {"accepted": True}
+
+
+# Per-session in-flight turn registry — used by the cancel endpoint to abort a
+# running turn. Cleared when the task finishes naturally.
+_active_turns: dict[str, asyncio.Task] = {}
+
+
+@app.post("/api/sessions/{session_id}/cancel")
+async def cancel_turn(
+    session_id: str,
+    _token: str = Depends(require_token),
+):
+    """Cancel the in-flight turn for this session, if any. Idempotent — if no
+    turn is running, returns ok=false rather than failing."""
+    task = _active_turns.get(session_id)
+    if task is None or task.done():
+        return {"ok": False, "reason": "no active turn"}
+    task.cancel()
+    # Surface the cancellation to the UI immediately so the user sees a clean
+    # end-of-turn instead of waiting for the worker thread to notice. The
+    # in-flight worker thread is hard to interrupt (Python limitation), so the
+    # WebSocket events may still drip in for a few seconds while the worker
+    # winds down — that's fine.
+    try:
+        bus = get_bus(session_id)
+        bus.publish("error", {"message": "cancelled by user"})
+        bus.publish("assistant_text", {"text": "", "done": True})
+    except Exception:
+        pass
+    return {"ok": True}
 
 
 @app.get(

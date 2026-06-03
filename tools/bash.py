@@ -47,9 +47,23 @@ def execute_bash(input: BashInput) -> BashOutput:
     return _run_foreground(input.command, input.timeout)
 
 
+_DEFAULT_BASH_TIMEOUT_MS = 60_000   # 60s — model can override via the `timeout` arg
+_HARD_BASH_TIMEOUT_MS    = 600_000  # 10m — absolute ceiling, even if the model asks for more
+
+
 def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
-    """Run command, wait for it, capture output."""
-    timeout_secs = (timeout_ms / 1000.0) if timeout_ms is not None else None
+    """Run command, wait for it, capture output.
+
+    Hard timeout: every foreground bash call gets a timeout. None / 0 →
+    default 60s, any model-supplied value is clamped to [1, _HARD_BASH_TIMEOUT_MS].
+    Without this, a command that waits on stdin or fills the pipe buffer
+    deadlocks the worker thread and the whole agent turn goes silent — which is
+    exactly the 14-minute hang we hit before. Better to fail loud at the
+    timeout boundary and let the loop recover than to wait forever.
+    """
+    effective_ms = timeout_ms if timeout_ms else _DEFAULT_BASH_TIMEOUT_MS
+    effective_ms = max(1_000, min(effective_ms, _HARD_BASH_TIMEOUT_MS))
+    timeout_secs = effective_ms / 1000.0
 
     try:
         result = subprocess.run(
@@ -57,10 +71,14 @@ def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
             capture_output=True,
             text=True,
             timeout=timeout_secs,
+            # Close stdin so any command that tries to read from it (interactive
+            # prompts, `read`, pagers like `less`) fails immediately instead of
+            # blocking forever. Pairs with the timeout as belt-and-braces.
+            stdin=subprocess.DEVNULL,
             env=os.environ.copy(),
         )
     except subprocess.TimeoutExpired:
-        return _timeout_output(command, timeout_ms or 0)
+        return _timeout_output(command, effective_ms)
 
     stdout = _truncate_output(result.stdout)
     stderr = _truncate_output(result.stderr)

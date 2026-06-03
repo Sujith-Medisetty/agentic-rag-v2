@@ -86,8 +86,26 @@ def allowed_tools_for_subagent(subagent_type: str) -> set[str]:
     return set(_ALLOWED_TOOLS_BY_TYPE.get(subagent_type, _ALLOWED_TOOLS_BY_TYPE["general-purpose"]))
 
 def resolve_agent_model(model: str | None) -> str:
+    """Pick the model for a sub-agent.
+
+    Priority:
+      1. Explicit `model` arg (what the orchestrator's Agent() call passed).
+      2. The currently-configured orchestrator model (so sub-agents on a
+         MiniMax / OpenAI-compat / Anthropic setup match the parent and we
+         don't accidentally send `claude-opus-4-6` to MiniMax's API).
+      3. The hardcoded fallback (only used in tests where configure_model
+         was never called).
+    """
     m = (model or "").strip()
-    return m if m else DEFAULT_AGENT_MODEL
+    if m:
+        return m
+    try:
+        from agents.nodes import _model as _orchestrator_model
+        if _orchestrator_model:
+            return _orchestrator_model
+    except Exception:
+        pass
+    return DEFAULT_AGENT_MODEL
 
 def _slugify_agent_name(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
@@ -140,23 +158,46 @@ def _persist_terminal_state(manifest: dict, status: str, final_text: str | None,
 def _run_agent_job(job: dict) -> None:
     """Background thread body — runs the sub-agent loop to completion."""
     try:
-        from langchain_anthropic import ChatAnthropic
         from langgraph.prebuilt import create_react_agent
         from langchain_core.messages import HumanMessage
         from tools.wrappers import get_all_tools
+        # Use the orchestrator's LLM factory so sub-agents respect the
+        # configured provider (anthropic / minimax / openai-compatible).
+        from agents.nodes import _get_llm
+        from agents.reporter import reporter_scope
 
         allowed = job["allowed_tools"]
         tools = [t for t in get_all_tools() if getattr(t, "name", None) in allowed]
-        llm = ChatAnthropic(model=job["model"], streaming=False)
-        agent = create_react_agent(llm, tools=tools, state_modifier=job["system_prompt"])
-        result = agent.invoke(
-            {"messages": [HumanMessage(content=job["prompt"])]},
-            config={"recursion_limit": DEFAULT_AGENT_MAX_ITERATIONS * 2 + 5},
+        # Sub-agents don't stream — their output is just the final text.
+        llm = _get_llm(model=job["model"], streaming=False)
+        agent = create_react_agent(llm, tools=tools, prompt=job["system_prompt"])
+
+        # Set a reporter scope tagged with this agent's id so every tool /
+        # text / token event published from inside the sub-agent's tools
+        # gets stamped with `agent_id` and the frontend can nest it under
+        # this sub-agent's tree (instead of dropping the event into the
+        # main turn's activity or — worse — into the no-op default).
+        sub_reporter = job.get("reporter")
+        ctx_mgr = (
+            reporter_scope(sub_reporter) if sub_reporter is not None
+            else _nullctx()
         )
+        with ctx_mgr:
+            result = agent.invoke(
+                {"messages": [HumanMessage(content=job["prompt"])]},
+                config={"recursion_limit": DEFAULT_AGENT_MAX_ITERATIONS * 2 + 5},
+            )
         final = _final_text(result.get("messages", []))
         _persist_terminal_state(job["manifest"], "completed", final, None)
     except Exception as e: # noqa: BLE001 - record any failure as terminal state
         _persist_terminal_state(job["manifest"], "failed", None, str(e))
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def _nullctx():
+    yield
 
 def _build_subagent_system_prompt(subagent_type: str, model: str) -> str:
     """Mirror build_agent_system_prompt: base system prompt + sub-agent note."""
@@ -236,12 +277,26 @@ def run_agent(
             "questions, and finish with a concise result."
         )
 
+    # Build a tagged WebReporter for the sub-agent if the parent is web-backed,
+    # so its events publish to the same session bus with this agent_id stamp.
+    # If the parent is the noop reporter (e.g. CLI / tests), we just don't tag.
+    sub_reporter = None
+    try:
+        from agents.reporter import get_reporter
+        from server.reporter import WebReporter as _WR
+        parent = get_reporter()
+        if isinstance(parent, _WR):
+            sub_reporter = _WR(parent.session_id, agent_id=agent_id)
+    except Exception:
+        sub_reporter = None
+
     job = {
         "manifest": manifest,
         "prompt": prompt,
         "system_prompt": system_prompt,
         "allowed_tools": allowed_tools_for_subagent(norm_type),
         "model": resolved_model,
+        "reporter": sub_reporter,
     }
     try:
         threading.Thread(

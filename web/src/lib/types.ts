@@ -93,6 +93,12 @@ export interface AgentRecord {
   error: string;
   spawned_at: number;       // ms epoch
   updated_at: number;       // ms epoch
+  // Nested state — tools fired by THIS sub-agent (events stamped with this
+  // agent_id arrive from the backend and get folded in here, not into the
+  // parent turn's activity tree). Same applies to live token deltas.
+  tools: ToolEvent[];
+  liveInputTokens: number;
+  liveOutputTokens: number;
 }
 
 export type FileChangeKind = "create" | "edit";
@@ -124,6 +130,7 @@ export interface ToolEvent {
   preview?: string;
   status: "running" | "done" | "error";
   startedAt: number;
+  endedAt?: number;             // set when tool_done lands; used to show duration
 }
 
 // Per-turn end-of-turn metrics. Token counts are PER TURN (the frontend
@@ -140,19 +147,42 @@ export interface TurnSummary {
 
 // One complete turn — user prompt + everything that happened in response.
 // The transcript on the chat page is a list of these.
+//
+// We keep BOTH a chronological `blocks` timeline (for rendering — Claude-Code
+// style: text / tools / thinking / sub-agents interleaved in the order they
+// actually happened) AND the legacy flat collections (kept so the stats
+// footer, debug panel, and per-agent lookup remain O(1)). Both views are
+// derived from the same event stream.
 export interface Turn {
   id: string;
   userPrompt: string;
   startedAt: number;          // ms epoch when the user sent the prompt
   assistantText: string;      // accumulates as chunks stream in
+  thinkingText: string;       // model reasoning — kept separate from the visible answer
   isStreaming: boolean;       // true until assistant_text(done=true)
-  tools: ToolEvent[];
+  tools: ToolEvent[];         // ONLY orchestrator-level tools (sub-agent tools live under their AgentRecord)
   fileChanges: FileChange[];
   agents: Record<string, AgentRecord>;
   commits: CommitRecord[];
+  blocks: TimelineBlock[];    // chronological view — drives TurnCard rendering
+  liveInputTokens: number;
+  liveOutputTokens: number;
   summary: TurnSummary | null;
   error: string | null;
 }
+
+// One row in the chronological turn timeline. Heterogeneous — each kind
+// renders with its own visual treatment (prose / mono / nested card / diff).
+// Identity-only refs (agentId, toolId) for `agent` / `tool` because the
+// underlying records live in `turn.agents` / `turn.tools` and may update
+// after the block is pushed (e.g. a running tool transitions to done).
+export type TimelineBlock =
+  | { id: string; kind: "text";     text: string; startedAt: number }
+  | { id: string; kind: "thinking"; text: string; startedAt: number }
+  | { id: string; kind: "tool";     toolId: string;  ts: number }
+  | { id: string; kind: "agent";    agentId: string; ts: number }
+  | { id: string; kind: "file";     file: FileChange }
+  | { id: string; kind: "commit";   commit: CommitRecord };
 
 // Pinned-header session totals computed by summing per-turn metrics.
 export interface SessionTotals {

@@ -24,9 +24,12 @@ import json
 import platform
 import time
 
+import os
+
 from langchain_core.messages import (
-    AIMessage, AIMessageChunk, SystemMessage, BaseMessage,
+    AIMessage, AIMessageChunk, SystemMessage, BaseMessage, ToolMessage,
 )
+from langchain_core.language_models import BaseChatModel
 from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import ToolNode
 
@@ -38,6 +41,7 @@ from tools.wrappers import get_all_tools
 # Global config — set once at startup by server.app
 # ---------------------------------------------------------------------------
 
+_provider: str = "anthropic"
 _model: str = "claude-opus-4-6"
 _thinking: bool = False
 _thinking_budget: int = 10_000
@@ -49,11 +53,13 @@ def configure_model(
     model: str,
     thinking: bool = False,
     thinking_budget: int = 10_000,
+    provider: str = "anthropic",
 ) -> None:
-    """Called once at startup so the loop uses the configured model + thinking
-    settings. (Iteration/token/time limits are the per-invocation run budget —
-    see reset_run_budget.)"""
-    global _model, _thinking, _thinking_budget
+    """Called once at startup so the loop uses the configured provider/model +
+    thinking settings. (Iteration/token/time limits are the per-invocation run
+    budget — see reset_run_budget.)"""
+    global _provider, _model, _thinking, _thinking_budget
+    _provider = (provider or "anthropic").lower()
     _model = model
     _thinking = thinking
     _thinking_budget = thinking_budget
@@ -202,11 +208,69 @@ def _tools() -> list:
     return get_all_tools() + _mcp_tools
 
 
-def _get_llm() -> ChatAnthropic:
-    kwargs: dict = {"model": _model, "streaming": True}
-    if _thinking:
-        kwargs["thinking"] = {"type": "enabled", "budget_tokens": _thinking_budget}
-    return ChatAnthropic(**kwargs)
+def _get_llm(
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    streaming: bool = True,
+    thinking: bool | None = None,
+) -> BaseChatModel:
+    """Build the LangChain chat client for the configured provider.
+
+    All kwargs are optional — defaults come from the module-level config set
+    by `configure_model()`. Pass overrides when callers (e.g. sub-agents) need
+    a different model or non-streaming mode without mutating module state, which
+    matters because the orchestrator and sub-agents may run concurrently.
+
+    Providers:
+      anthropic — native ChatAnthropic. Uses ANTHROPIC_API_KEY.
+      minimax / openai-compatible — ChatOpenAI pointed at the provider's
+        OpenAI-compatible endpoint. Lets us drop in MiniMax / DeepSeek /
+        Together / Groq / any local OpenAI-shaped server without code changes.
+    """
+    eff_provider = (provider or _provider).lower()
+    eff_model    = model or _model
+    eff_thinking = _thinking if thinking is None else thinking
+
+    if eff_provider == "anthropic":
+        kwargs: dict = {"model": eff_model, "streaming": streaming}
+        if eff_thinking:
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": _thinking_budget}
+        return ChatAnthropic(**kwargs)
+
+    # ChatOpenAI is imported lazily so installs that only ever use Anthropic
+    # never pay the import cost.
+    from langchain_openai import ChatOpenAI
+
+    if eff_provider == "minimax":
+        api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "MINIMAX_API_KEY is not set. Export it before starting the server."
+            )
+        base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
+        return ChatOpenAI(
+            model=eff_model, api_key=api_key, base_url=base_url, streaming=streaming,
+        )
+
+    if eff_provider in ("openai-compatible", "openai"):
+        api_key = (
+            os.getenv("AGENT_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
+        base_url = os.getenv("AGENT_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        if not api_key:
+            raise RuntimeError(
+                "AGENT_API_KEY (or OPENAI_API_KEY) is not set for openai-compatible provider."
+            )
+        kwargs = {"model": eff_model, "api_key": api_key, "streaming": streaming}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return ChatOpenAI(**kwargs)
+
+    raise RuntimeError(
+        f"unknown provider '{eff_provider}'. Supported: anthropic, minimax, openai-compatible."
+    )
 
 # ---------------------------------------------------------------------------
 # System prompt assembly (done once per run, cached in state)
@@ -245,6 +309,70 @@ def _build_system_prompt(state: RunnerState) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _ThinkingTagSplitter:
+    """Streaming splitter for inline `<think>...</think>` blocks.
+
+    OpenAI-compatible models (MiniMax M2, DeepSeek-R1, Qwen-thinking, etc.)
+    emit chain-of-thought as plain text wrapped in `<think>` / `</think>`
+    tags. Without parsing, that reasoning bleeds into the visible response.
+
+    The splitter is a tiny state machine: feed it raw text chunks, get back
+    a list of `(channel, text)` pairs where `channel` is `"thinking"` or
+    `"assistant"`. It buffers partial tags across chunk boundaries so a tag
+    split mid-stream (e.g. `…<th` then `ink>…`) is never misrouted."""
+
+    _OPEN  = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self.in_thinking = False
+        self._buf = ""
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        self._buf += text
+        while self._buf:
+            tag = self._CLOSE if self.in_thinking else self._OPEN
+            idx = self._buf.find(tag)
+            if idx >= 0:
+                head = self._buf[:idx]
+                if head:
+                    out.append(
+                        ("thinking" if self.in_thinking else "assistant", head)
+                    )
+                self._buf = self._buf[idx + len(tag):]
+                self.in_thinking = not self.in_thinking
+                continue
+            # No full tag — check whether the buffer ENDS with a prefix of
+            # the tag we're looking for. If so, hold those trailing bytes
+            # back; the next chunk may complete the tag.
+            hold = self._partial_tail(self._buf, tag)
+            safe = self._buf[: len(self._buf) - hold] if hold else self._buf
+            if safe:
+                out.append(
+                    ("thinking" if self.in_thinking else "assistant", safe)
+                )
+            self._buf = self._buf[len(self._buf) - hold:] if hold else ""
+            break
+        return out
+
+    def flush(self) -> list[tuple[str, str]]:
+        if not self._buf:
+            return []
+        out = [("thinking" if self.in_thinking else "assistant", self._buf)]
+        self._buf = ""
+        return out
+
+    @staticmethod
+    def _partial_tail(s: str, tag: str) -> int:
+        """Length of the longest suffix of `s` that is a strict prefix of `tag`."""
+        max_n = min(len(s), len(tag) - 1)
+        for n in range(max_n, 0, -1):
+            if tag.startswith(s[-n:]):
+                return n
+        return 0
+
+
 def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage:
     """Stream a single model call: forward text chunks + tool announcements
     through the reporter, return the aggregated assistant message."""
@@ -253,22 +381,44 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
 
     aggregate: AIMessageChunk | None = None
     announced: set[str] = set()
+    splitter = _ThinkingTagSplitter()
+
+    def _emit_text(t: str) -> None:
+        if not t:
+            return
+        for channel, piece in splitter.feed(t):
+            if channel == "thinking":
+                reporter.thinking_text(piece, done=False)
+            else:
+                reporter.assistant_text(piece, done=False)
 
     for chunk in llm_with_tools.stream(messages):
         aggregate = chunk if aggregate is None else aggregate + chunk
 
-        # Stream text chunks to the UI via reporter.assistant_text. WebReporter
-        # publishes each chunk over the WebSocket so the browser bubble grows
-        # in real time; the noop base reporter just drops them.
+        # Stream text chunks to the UI via reporter. Two content shapes:
+        #   - str  : OpenAI-compatible providers (incl. MiniMax) — routed
+        #            through the <think> splitter so reasoning stays separate.
+        #   - list : Anthropic block format — already typed; map type=text
+        #            into assistant_text and type=thinking into thinking_text.
         content = chunk.content
         if isinstance(content, str) and content:
-            reporter.assistant_text(content, done=False)
+            _emit_text(content)
         elif isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
                     t = block.get("text", "")
                     if t:
-                        reporter.assistant_text(t, done=False)
+                        # Even Anthropic occasionally returns raw <think> tags
+                        # if a sub-tool prompted the model that way — keep the
+                        # splitter on for safety.
+                        _emit_text(t)
+                elif btype == "thinking":
+                    t = block.get("thinking") or block.get("text") or ""
+                    if t:
+                        reporter.thinking_text(t, done=False)
 
         # announce tool calls as soon as they have a name (dedupe by id)
         for tc in getattr(aggregate, "tool_calls", None) or []:
@@ -282,6 +432,14 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
                 )
                 reporter.tool_start(tc["name"], str(target)[:70])
 
+    # Drain anything still in the splitter buffer (e.g. trailing text with
+    # no closing tag) so we don't silently swallow the tail of a response.
+    for channel, piece in splitter.flush():
+        if channel == "thinking":
+            reporter.thinking_text(piece, done=False)
+        else:
+            reporter.assistant_text(piece, done=False)
+
     if aggregate is None:
         return AIMessage(content="")
 
@@ -294,16 +452,20 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
         usage_metadata=getattr(aggregate, "usage_metadata", None),
     )
 
-    # record token usage
+    # record token usage + publish a live delta so the UI's per-turn
+    # counter ticks (instead of waiting for the end-of-turn summary).
     try:
         tc = get_token_counter()
         usage = getattr(ai, "usage_metadata", None)
         if tc and usage:
             from memory.token_counter import TokenUsage
-            tc.record(TokenUsage(
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-            ))
+            in_delta  = int(usage.get("input_tokens", 0) or 0)
+            out_delta = int(usage.get("output_tokens", 0) or 0)
+            tc.record(TokenUsage(input_tokens=in_delta, output_tokens=out_delta))
+            try:
+                reporter.token_update(input_delta=in_delta, output_delta=out_delta)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -312,6 +474,64 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
 # ---------------------------------------------------------------------------
 # Loop nodes
 # ---------------------------------------------------------------------------
+
+
+def _repair_orphan_tool_calls(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Repair message-history corruption left behind by a cancelled / killed turn.
+
+    Both OpenAI-compatible providers (MiniMax, DeepSeek, …) and Anthropic
+    require that every `AIMessage.tool_calls[i].id` is followed by a matching
+    `ToolMessage(tool_call_id=...)`. If a turn was cancelled mid-iteration the
+    checkpoint can land with an AIMessage requesting tools that never ran —
+    on the next turn the LLM call returns 400 ("tool call result does not
+    follow tool call (2013)" for MiniMax).
+
+    Fix: walk the history, and for any AIMessage whose tool_call ids are not
+    fully satisfied by the immediately-following run of ToolMessages, STRIP
+    the unsatisfied tool_calls. The AIMessage stays in history as a plain
+    text reply ("I was going to call X but didn't"), and the conversation can
+    continue. Synthesizing fake ToolMessage results would be worse — it lies
+    to the model about what executed.
+    """
+    if not messages:
+        return messages
+    repaired: list[BaseMessage] = []
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            call_ids = [tc.get("id") for tc in m.tool_calls if tc.get("id")]
+            # Look ahead: collect the contiguous ToolMessage run that follows.
+            j = i + 1
+            satisfied: set[str] = set()
+            while j < len(messages) and isinstance(messages[j], ToolMessage):
+                tcid = getattr(messages[j], "tool_call_id", None)
+                if tcid:
+                    satisfied.add(tcid)
+                j += 1
+            missing = [cid for cid in call_ids if cid not in satisfied]
+            if missing:
+                # Drop the unsatisfied tool_calls. Keep tool_calls that ARE
+                # satisfied (their ToolMessages are right behind them).
+                kept = [tc for tc in m.tool_calls if tc.get("id") in satisfied]
+                content = m.content if m.content else ""
+                if not kept and not content:
+                    # Empty AIMessage adds no signal — synthesize a brief note
+                    # so the model has SOMETHING to see and the conversation
+                    # has a clean breadcrumb of what happened.
+                    content = "(previous turn was interrupted before tools could run)"
+                repaired.append(AIMessage(
+                    content=content,
+                    tool_calls=kept,
+                    additional_kwargs=getattr(m, "additional_kwargs", {}) or {},
+                    response_metadata=getattr(m, "response_metadata", {}) or {},
+                ))
+            else:
+                repaired.append(m)
+        else:
+            repaired.append(m)
+        i += 1
+    return repaired
 
 
 def node_agent(state: RunnerState) -> dict:
@@ -339,13 +559,26 @@ def node_agent(state: RunnerState) -> dict:
     #.
     system_prompt = state.get("system_prompt") or _build_system_prompt(state)
 
+    # Repair any orphaned tool_calls left by a previously cancelled/killed turn
+    # BEFORE we send the message history to the LLM. Without this, MiniMax /
+    # OpenAI-compatible providers reject the conversation with a 400.
+    raw_history = list(state.get("messages", []))
+    history = _repair_orphan_tool_calls(raw_history)
+
     messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
-    messages.extend(state.get("messages", []))
+    messages.extend(history)
 
     llm = _get_llm().bind_tools(_tools())
     ai = _stream_model_call(llm, messages)
     _run_budget.record(ai)
 
+    # If we had to repair, surface the repaired messages back into LangGraph
+    # state so subsequent turns / checkpoints see the cleaned history. Using
+    # RemoveMessage + re-add would be cleaner, but LangGraph's default `add`
+    # reducer on `messages` appends — so the simplest fix is to overwrite via
+    # the same list we used for the call. For now we just record `ai`; the
+    # orphans remain in checkpoint but the repair runs again next turn (cheap
+    # and idempotent).
     return {
         "messages": [ai],
         "iterations": iterations,

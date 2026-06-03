@@ -22,10 +22,12 @@ Per-session config:
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import re
 import time
 from pathlib import Path
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agents.reporter import reporter_scope
 from server import db
@@ -79,6 +81,19 @@ async def run_turn(
     before = tc.cumulative if tc else None
     cost_before = tc.cost().total if tc else 0.0
 
+    # Tool-count snapshot — LangGraph keeps cumulative message history across
+    # turns (same thread_id), so we diff before vs. after to get "tools used
+    # in THIS turn" rather than "tools used in the whole session".
+    tools_before = 0
+    try:
+        from agents.graph import runner_graph
+        _state_before = runner_graph.get_state({
+            "configurable": {"thread_id": session_id},
+        }).values
+        tools_before = _count_tool_uses(_state_before.get("messages", []) or [])
+    except Exception:
+        pass
+
     iters = 0
     turn_failed = False
 
@@ -127,7 +142,15 @@ async def run_turn(
 
     try:
         with reporter_scope(reporter):
-            iters = await loop.run_in_executor(None, _drive)
+            # `loop.run_in_executor` does NOT propagate ContextVars to the
+            # worker thread, so without this snapshot the agent loop would see
+            # the no-op default reporter — every tool_start / tool_done /
+            # token_update / assistant_text chunk would silently vanish, and
+            # the user would only see the final flushed text + turn_summary
+            # (which fire from this async context where the scope IS active).
+            # Wrapping `_drive` in `ctx.run(...)` carries the scope through.
+            ctx = contextvars.copy_context()
+            iters = await loop.run_in_executor(None, ctx.run, _drive)
     except Exception as e:
         # Error path — surface the error, close the stream so the UI stops
         # showing "Thinking…", and persist a system message so the user
@@ -150,8 +173,22 @@ async def run_turn(
     turn_cw   = (after.cache_creation_tokens - before.cache_creation_tokens) if before and after else 0
     turn_cost = max(0.0, cost_after - cost_before)
 
+    # `tools_used` should be the count of tool invocations in THIS turn, not
+    # cumulative across the session. ToolMessages-in-state diff is the most
+    # reliable signal (iter count over-counts by 1 for the final no-tool turn).
+    tool_count = max(0, iters - 1)  # fallback if state lookup fails
+    try:
+        from agents.graph import runner_graph
+        _state_after = runner_graph.get_state({
+            "configurable": {"thread_id": session_id},
+        }).values
+        tools_after = _count_tool_uses(_state_after.get("messages", []) or [])
+        tool_count = max(0, tools_after - tools_before)
+    except Exception:
+        pass
+
     reporter.turn_summary(
-        tools_used         = iters,
+        tools_used         = tool_count,
         duration_ms        = int((time.monotonic() - started) * 1000),
         input_tokens       = max(0, turn_in),
         output_tokens      = max(0, turn_out),
@@ -234,15 +271,16 @@ def _autocommit_and_maybe_push(
 # ---------------------------------------------------------------------------
 
 def _final_assistant_text(messages: list) -> str:
-    """Return the last assistant message's text. Handles string and list
-    content (Anthropic returns a list of content blocks)."""
+    """Return the last assistant message's text, with any inline `<think>…</think>`
+    chain-of-thought blocks stripped. Handles string and list content
+    (Anthropic returns a list of content blocks)."""
     for msg in reversed(messages):
         if not isinstance(msg, AIMessage):
             continue
         c = msg.content
+        text: str = ""
         if isinstance(c, str):
-            if c.strip():
-                return c
+            text = c
         elif isinstance(c, list):
             parts = []
             for block in c:
@@ -252,10 +290,30 @@ def _final_assistant_text(messages: list) -> str:
                         parts.append(t)
                 elif isinstance(block, str):
                     parts.append(block)
-            joined = "\n".join(parts).strip()
-            if joined:
-                return joined
+            text = "\n".join(parts)
+        if text.strip():
+            return _strip_thinking_tags(text).strip()
     return ""
+
+
+# Inline-thinking format used by MiniMax M2 / DeepSeek-R1 / Qwen-thinking.
+# We already route streamed-chunk thinking to its own UI channel via the
+# splitter in agents/nodes.py, but the canonical AIMessage.content still
+# contains the raw tags — strip them here so the final flush + the
+# persisted-message DB row are tag-free.
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_thinking_tags(text: str) -> str:
+    return _THINK_TAG_RE.sub("", text)
+
+
+def _count_tool_uses(messages: list) -> int:
+    """Count unique tool invocations across the turn. Each tool call lands as
+    one ToolMessage (the tool's result) — counting those is the most reliable
+    way to get the "real" tool count, independent of how many model iterations
+    the agent loop took."""
+    return sum(1 for m in messages if isinstance(m, ToolMessage))
 
 
 def _load_claude_md(workspace: str) -> str:

@@ -128,4 +128,9 @@ export const sessionApi = {
       `/api/sessions/${encodeURIComponent(sessionId)}/push`,
       { method: "POST" },
     ),
+  cancel: (sessionId: string) =>
+    request<{ ok: boolean; reason?: string }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/cancel`,
+      { method: "POST" },
+    ),
 };

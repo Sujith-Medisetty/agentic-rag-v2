@@ -137,9 +137,18 @@ fi
 BACKEND_LOG="$ROOT/.venv/uvicorn.log"
 : > "$BACKEND_LOG"
 
-log "starting backend (uvicorn) on http://127.0.0.1:8765"
+log "starting backend (uvicorn) on http://127.0.0.1:8765 — auto-reloads on .py changes"
+# --reload makes uvicorn watch the project tree and restart the worker on any
+# Python file change. Without this, edits to agents/*.py or server/*.py just sit
+# on disk until the user restarts start.sh — which is exactly the foot-gun we
+# kept hitting. --reload-dir is scoped to the project root so we don't watch
+# .venv (huge tree, would thrash the file watcher).
 uvicorn server.app:app --host 127.0.0.1 --port 8765 \
   --log-level warning \
+  --reload --reload-dir . \
+  --reload-exclude '.venv/*' \
+  --reload-exclude 'web/*' \
+  --reload-exclude '**/__pycache__/*' \
   > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 

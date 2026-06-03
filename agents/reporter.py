@@ -42,6 +42,17 @@ class ProgressReporter:
         """Streamed assistant text chunk. `done=True` marks the end of a turn —
         the WebReporter uses this to flush the live bubble into history."""
 
+    def thinking_text(self, text: str, done: bool = False) -> None:
+        """Streamed model-reasoning chunk. Routed to a dedicated UI section so
+        the chain-of-thought never blends into the visible answer. Used for
+        Anthropic's `thinking` content blocks AND OpenAI-compatible models
+        that emit `<think>...</think>` inline (MiniMax M2, DeepSeek-R1, Qwen)."""
+
+    def token_update(self, input_delta: int = 0, output_delta: int = 0) -> None:
+        """Published after each LLM call within a turn so the UI can show live,
+        ticking input/output token counts (rather than waiting for the
+        end-of-turn summary). Deltas — frontend accumulates them per turn."""
+
     # ---- rich activity (Phase 2) --------------------------------------
     def todo_update(self, items: list[dict]) -> None:
         """Full current todo list after a TodoWrite call. Items are

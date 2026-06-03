@@ -77,6 +77,41 @@ class SessionBus:
             db.append_event(self.session_id, kind, payload)
         except Exception:
             pass
+        # Diagnostic trace — one line per event with sub-second timing and
+        # subscriber count. Wired so we can confirm events ARE being published
+        # in real time and aren't getting buffered. Set AGENT_TRACE_EVENTS=0
+        # to silence once we've confirmed everything works.
+        import os, sys
+        if os.getenv("AGENT_TRACE_EVENTS", "1") != "0":
+            try:
+                t = time.strftime("%H:%M:%S") + f".{int(time.time()*1000)%1000:03d}"
+                sub_n = len(self._subscribers)
+                bound = "BOUND" if self._loop is not None else "UNBOUND"
+                preview = ""
+                if kind in ("assistant_text", "thinking_text"):
+                    preview = f"+{len(payload.get('text',''))} chars" + (
+                        " DONE" if payload.get("done") else "")
+                elif kind == "tool_start":
+                    preview = f"{payload.get('tool')}({str(payload.get('target',''))[:40]})"
+                elif kind == "tool_done":
+                    preview = f"{payload.get('tool')}{' ✗' if payload.get('error') else ' ✓'}"
+                elif kind == "token_update":
+                    preview = (
+                        f"+{payload.get('input_delta',0)} in / "
+                        f"+{payload.get('output_delta',0)} out"
+                    )
+                elif kind == "turn_summary":
+                    preview = (
+                        f"tools={payload.get('tools_used')} "
+                        f"in={payload.get('input_tokens')} "
+                        f"out={payload.get('output_tokens')}"
+                    )
+                print(
+                    f"[trace {t}] {bound} subs={sub_n} kind={kind} {preview}",
+                    file=sys.stderr, flush=True,
+                )
+            except Exception:
+                pass
         if self._loop is not None and self._queue is not None:
             try:
                 self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
@@ -147,27 +182,49 @@ class WebReporter(ProgressReporter):
     worker thread) and is drained by session_runner from the asyncio loop
     thread; guarded by a Lock so concurrent access is safe."""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, agent_id: str = "") -> None:
         self.session_id = session_id
+        # If set, every event published by this reporter is stamped with this
+        # agent_id. The frontend uses that tag to route the event into the
+        # right sub-agent's nested tree instead of the turn's main activity.
+        # Orchestrator reporter has agent_id="" → events route to the turn.
+        self.agent_id = agent_id
         self._bus = get_bus(session_id)
         self._changed_paths: set[str] = set()
         self._changed_lock = threading.Lock()
 
+    # ---- internal publish — stamps every payload with the agent_id ------
+    def _pub(self, kind: str, payload: dict) -> None:
+        if self.agent_id:
+            payload = {**payload, "agent_id": self.agent_id}
+        self._bus.publish(kind, payload)
+
     # ---- ProgressReporter methods ---------------------------------------
     def tool_start(self, tool: str, target: str = "") -> None:
-        self._bus.publish("tool_start", {"tool": tool, "target": target[:200]})
+        self._pub("tool_start", {"tool": tool, "target": target[:200]})
 
     def tool_done(self, tool: str, preview: str = "", error: bool = False) -> None:
-        self._bus.publish("tool_done", {
+        self._pub("tool_done", {
             "tool": tool, "preview": preview[:500], "error": error,
         })
 
     def message(self, text: str) -> None:
-        self._bus.publish("message", {"text": text})
+        self._pub("message", {"text": text})
+
+    def token_update(self, input_delta: int = 0, output_delta: int = 0) -> None:
+        self._pub("token_update", {
+            "input_delta": int(input_delta or 0),
+            "output_delta": int(output_delta or 0),
+        })
+
+    def thinking_text(self, text: str, done: bool = False) -> None:
+        if not text and not done:
+            return
+        self._pub("thinking_text", {"text": text, "done": bool(done)})
 
     # ---- Phase 2 — rich UI events ---------------------------------------
     def todo_update(self, items: list[dict]) -> None:
-        self._bus.publish("todo_update", {"items": items})
+        self._pub("todo_update", {"items": items})
 
     def agent_spawn(
         self,
@@ -177,7 +234,7 @@ class WebReporter(ProgressReporter):
         name: str = "",
         model: str = "",
     ) -> None:
-        self._bus.publish("agent_spawn", {
+        self._pub("agent_spawn", {
             "agent_id": agent_id,
             "description": description,
             "subagent_type": subagent_type,
@@ -192,7 +249,7 @@ class WebReporter(ProgressReporter):
         output_file: str = "",
         error: str = "",
     ) -> None:
-        self._bus.publish("agent_status_update", {
+        self._pub("agent_status_update", {
             "agent_id": agent_id,
             "status": status,
             "output_file": output_file,
@@ -208,7 +265,7 @@ class WebReporter(ProgressReporter):
     ) -> None:
         with self._changed_lock:
             self._changed_paths.add(path)
-        self._bus.publish("file_changed", {
+        self._pub("file_changed", {
             "path": path,
             "kind": kind,
             "diff": diff[:50_000],   # cap so a 10MB file doesn't choke the WS
@@ -223,7 +280,7 @@ class WebReporter(ProgressReporter):
         message: str,
         files: list[str],
     ) -> None:
-        self._bus.publish("commit_made", {
+        self._pub("commit_made", {
             "sha": sha, "branch": branch, "message": message,
             "files": list(files),
         })
@@ -234,7 +291,7 @@ class WebReporter(ProgressReporter):
         branch: str = "",
         hook_output: str = "",
     ) -> None:
-        self._bus.publish("commit_skipped", {
+        self._pub("commit_skipped", {
             "reason": reason, "branch": branch,
             "hook_output": hook_output[:2000],
         })
@@ -246,7 +303,7 @@ class WebReporter(ProgressReporter):
         remote: str = "",
         error: str = "",
     ) -> None:
-        self._bus.publish("push_done", {
+        self._pub("push_done", {
             "branch": branch, "ok": ok, "remote": remote,
             "error": error[:500],
         })
@@ -262,12 +319,12 @@ class WebReporter(ProgressReporter):
 
     def assistant_text(self, text: str, done: bool = False) -> None:
         """Streaming assistant text chunk. `done=True` marks end-of-turn."""
-        self._bus.publish("assistant_text", {"text": text, "done": done})
+        self._pub("assistant_text", {"text": text, "done": done})
 
     def user_message(self, text: str) -> None:
         """Echoed back so reconnecting clients see the prompt that started
         this turn."""
-        self._bus.publish("user_message", {"text": text})
+        self._pub("user_message", {"text": text})
 
     def turn_summary(
         self,
@@ -282,7 +339,7 @@ class WebReporter(ProgressReporter):
         """End-of-turn metrics. Token counts are PER-TURN (diff from the
         process-wide counter before vs after this turn). The frontend sums
         across turns to display session totals."""
-        self._bus.publish("turn_summary", {
+        self._pub("turn_summary", {
             "tools_used":         tools_used,
             "duration_ms":        duration_ms,
             "input_tokens":       input_tokens,
@@ -293,4 +350,4 @@ class WebReporter(ProgressReporter):
         })
 
     def error(self, message: str) -> None:
-        self._bus.publish("error", {"message": message})
+        self._pub("error", {"message": message})
