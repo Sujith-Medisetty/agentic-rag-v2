@@ -168,6 +168,24 @@ def create_project(name: str, workspace_path: str) -> dict:
     return get_project(pid)   # round-trip so callers see the defaults filled in
 
 
+def delete_project(project_id: str) -> bool:
+    """Delete a project and CASCADE everything under it: sessions, messages,
+    events. Returns True if a row was deleted, False if the project didn't
+    exist. FK cascades are wired in the schema, so a single DELETE here
+    cleans up the entire subtree without orphan rows."""
+    with _connect() as cx:
+        cur = cx.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        return cur.rowcount > 0
+
+
+def delete_session(session_id: str) -> bool:
+    """Delete one session and CASCADE its messages + events. Returns True if
+    a row was deleted, False if the session didn't exist."""
+    with _connect() as cx:
+        cur = cx.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        return cur.rowcount > 0
+
+
 def list_projects() -> list[dict]:
     with _connect() as cx:
         rows = cx.execute(
@@ -285,14 +303,21 @@ def append_message(session_id: str, role: str, content: str) -> dict:
     }
 
 
-def list_messages(session_id: str, limit: int = 500) -> list[dict]:
+def list_messages(session_id: str, limit: int | None = None) -> list[dict]:
+    """Return chat messages for this session. `limit=None` returns all rows;
+    same reasoning as `list_events` — silently truncating long sessions
+    produced wrong UI state on refresh."""
+    sql = (
+        "SELECT id, session_id, role, content, created_at "
+        "FROM messages WHERE session_id = ? "
+        "ORDER BY created_at ASC"
+    )
+    args: list[Any] = [session_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(limit)
     with _connect() as cx:
-        rows = cx.execute(
-            "SELECT id, session_id, role, content, created_at "
-            "FROM messages WHERE session_id = ? "
-            "ORDER BY created_at ASC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()
+        rows = cx.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -321,8 +346,20 @@ def append_event(session_id: str, kind: str, payload: dict) -> dict:
 def list_events(
     session_id: str,
     since: int | None = None,
-    limit: int = 1000,
+    limit: int | None = None,
 ) -> list[dict]:
+    """Return events for this session, chronologically.
+
+    `limit=None` (the default) returns ALL events for the session. The
+    earlier 1000-row default was silently dropping the most recent events
+    on long sessions — a Pulse-class build emits thousands of events
+    (every tool_start/done, token_update, todo_update is one row) and the
+    LIMIT chopped off the final `turn_summary` + `todo_update(all done)`,
+    making the UI's rebuilt state stale on refresh ("plan completed live
+    but shows as middle on reload"). Sessions with hundreds of thousands of
+    events would benefit from explicit paging, but for current scale a
+    single full fetch is simpler and correct.
+    """
     sql = (
         "SELECT id, session_id, kind, payload_json, created_at "
         "FROM events WHERE session_id = ?"
@@ -331,8 +368,10 @@ def list_events(
     if since is not None:
         sql += " AND created_at > ?"
         args.append(since)
-    sql += " ORDER BY created_at ASC LIMIT ?"
-    args.append(limit)
+    sql += " ORDER BY created_at ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(limit)
     with _connect() as cx:
         rows = cx.execute(sql, args).fetchall()
     out = []

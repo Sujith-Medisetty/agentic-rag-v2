@@ -45,6 +45,7 @@ const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
   { cmd: "/stop",     desc: "Cancel the in-flight turn (same as the Stop button)" },
   { cmd: "/cancel",   desc: "Alias of /stop" },
   { cmd: "/history",  desc: "Show the last 50 prompts you've sent in this session" },
+  { cmd: "/compact",  desc: "Compact the agent's context now (summarise old turns, keep recent)" },
   { cmd: "/debug",    desc: "Toggle the raw WebSocket event panel (for troubleshooting)" },
 ];
 
@@ -590,6 +591,20 @@ export default function ChatPage() {
       case "cancel": {
         if (!sessionId) return true;
         try { await sessionApi.cancel(sessionId); } catch {}
+        return true;
+      }
+      case "compact": {
+        if (!sessionId) return true;
+        try {
+          const res = await sessionApi.compact(sessionId);
+          if (res.ok) {
+            alert(`Context compacted: ${res.before} → ${res.after} messages.\n\nThe agent's working memory is now smaller. The chat history above is unaffected — only the agent's internal context was trimmed.`);
+          } else {
+            alert(`Couldn't compact: ${res.reason ?? "unknown reason"}`);
+          }
+        } catch (e: any) {
+          alert(`Compact failed: ${e?.message ?? "request error"}`);
+        }
         return true;
       }
       case "history": {

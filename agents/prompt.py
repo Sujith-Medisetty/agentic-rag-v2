@@ -68,6 +68,17 @@ def get_simple_system_section() -> str:
 
 def get_simple_doing_tasks_section() -> str:
     items = prepend_bullets([
+        "STAY INSIDE THE WORKSPACE. Every file you create, read, edit, or "
+        "delete MUST resolve to a path inside the `Working directory` shown "
+        "in Project context. Never use absolute paths outside that root, "
+        "never `cd` out of it in bash, never write to /tmp, ~/, "
+        "/Users/<other>, /etc, system paths, or any sibling project's "
+        "folder. If a request seems to require touching outside the "
+        "workspace (e.g. \"install a package globally\", \"edit my shell "
+        "rc\"), refuse and explain — the user opted into this workspace "
+        "specifically and cross-workspace writes corrupt other projects' "
+        "state. Read-only filesystem inspection (ls / which / git config) "
+        "of common paths is fine; WRITES are workspace-only.",
         "Read relevant code before changing it and keep changes tightly scoped to "
         "the request.",
         "Do not add speculative abstractions, compatibility shims, or unrelated "

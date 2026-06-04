@@ -87,6 +87,25 @@ export const projectsApi = {
       method: "PATCH",
       body: JSON.stringify(patch),
     }),
+  remove: (id: string) =>
+    request<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+};
+
+export const pathsApi = {
+  common: () =>
+    request<{ locations: { label: string; path: string }[] }>(
+      "/api/paths/common",
+    ),
+  browse: (cwd?: string) =>
+    request<{
+      cwd: string;
+      parent: string | null;
+      entries: { name: string; path: string }[];
+    }>(
+      `/api/paths/browse${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`,
+    ),
 };
 
 // ---- Sessions ------------------------------------------------------------
@@ -101,6 +120,10 @@ export const sessionsApi = {
       `/api/projects/${encodeURIComponent(projectId)}/sessions`,
       { method: "POST", body: JSON.stringify({ name }) },
     ),
+  remove: (sessionId: string) =>
+    request<{ ok: true }>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    }),
 };
 
 // ---- Messages + events ---------------------------------------------------
@@ -131,6 +154,11 @@ export const sessionApi = {
   cancel: (sessionId: string) =>
     request<{ ok: boolean; reason?: string }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/cancel`,
+      { method: "POST" },
+    ),
+  compact: (sessionId: string) =>
+    request<{ ok: boolean; reason?: string; before?: number; after?: number }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/compact`,
       { method: "POST" },
     ),
 };

@@ -246,6 +246,125 @@ def projects_get(project_id: str, _token: str = Depends(require_token)):
     return ProjectResponse(**p)
 
 
+@app.delete("/api/projects/{project_id}")
+def projects_delete(project_id: str, _token: str = Depends(require_token)):
+    """Delete a project and every session/message/event under it. The
+    workspace folder on disk is NOT touched — only the agent's record of
+    the project is removed. FK cascades handle the rest."""
+    # Cancel any in-flight turn in any session of this project so we don't
+    # leak a running task or have it write events to a deleted session.
+    sessions = db.list_sessions(project_id)
+    for s in sessions:
+        task = _active_turns.get(s["id"])
+        if task is not None and not task.done():
+            task.cancel()
+    if not db.delete_project(project_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+    return {"ok": True}
+
+
+@app.delete("/api/sessions/{session_id}")
+def sessions_delete(session_id: str, _token: str = Depends(require_token)):
+    """Delete one session and CASCADE its messages + events."""
+    task = _active_turns.get(session_id)
+    if task is not None and not task.done():
+        task.cancel()
+    if not db.delete_session(session_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    return {"ok": True}
+
+
+@app.get("/api/paths/browse")
+def paths_browse(
+    cwd: str | None = Query(default=None),
+    _token: str = Depends(require_token),
+):
+    """Server-side directory browser. The web platform refuses to give the
+    page a real filesystem path (showDirectoryPicker returns an opaque
+    handle, <input webkitdirectory> hides absolute paths), so we build a
+    custom navigator: backend lists subdirectories of a given path,
+    frontend renders them as clickable rows. Same pattern VS Code Web and
+    webmail use.
+
+    Returns `{cwd, parent, entries}` where entries are folder rows
+    (sorted, name-only-visible, hidden dirs excluded). `parent` is None at
+    the filesystem root.
+
+    `cwd=None` → user home directory.
+    """
+    import os
+    if cwd is None or cwd == "":
+        target = Path(os.path.expanduser("~"))
+    else:
+        target = Path(cwd).expanduser()
+    try:
+        target = target.resolve(strict=False)
+    except OSError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"bad path: {e}")
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"not a directory: {target}",
+        )
+    entries: list[dict] = []
+    try:
+        for child in target.iterdir():
+            name = child.name
+            if name.startswith("."):
+                continue   # hide dotfiles + dotfolders (.git, .DS_Store, etc.)
+            try:
+                if not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            entries.append({"name": name, "path": str(child)})
+    except PermissionError:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"permission denied reading {target}",
+        )
+    entries.sort(key=lambda e: e["name"].lower())
+    parent = str(target.parent) if target.parent != target else None
+    return {"cwd": str(target), "parent": parent, "entries": entries}
+
+
+@app.get("/api/paths/common")
+def paths_common(_token: str = Depends(require_token)):
+    """Return a list of common dev-directory locations that actually exist on
+    this user's machine. Used by the New Project modal to offer one-tap
+    prefill chips instead of forcing the user to type a long path.
+
+    Read-only, single-pass, no recursion. Each entry is `{label, path}`."""
+    import os
+    home = Path(os.path.expanduser("~"))
+    candidates: list[tuple[str, Path]] = [
+        ("Home",      home),
+        ("Documents", home / "Documents"),
+        ("Desktop",   home / "Desktop"),
+        ("Downloads", home / "Downloads"),
+        ("code",      home / "code"),
+        ("Code",      home / "Code"),
+        ("dev",       home / "dev"),
+        ("Projects",  home / "Projects"),
+        ("workspace", home / "workspace"),
+        ("github",    home / "github"),
+        ("Documents/GitHub", home / "Documents" / "GitHub"),
+    ]
+    out = []
+    seen: set[str] = set()
+    for label, p in candidates:
+        try:
+            resolved = str(p.resolve())
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        if p.is_dir():
+            out.append({"label": label, "path": resolved})
+            seen.add(resolved)
+    return {"locations": out}
+
+
 @app.patch("/api/projects/{project_id}/settings", response_model=ProjectResponse)
 def projects_update_settings(
     project_id: str,
@@ -375,6 +494,49 @@ async def cancel_turn(
         return {"ok": False, "reason": "no active turn"}
     task.cancel()
     return {"ok": True}
+
+
+@app.post("/api/sessions/{session_id}/compact")
+async def compact_session(
+    session_id: str,
+    _token: str = Depends(require_token),
+):
+    """Manually compact this session's LangGraph message history NOW, instead
+    of waiting for the automatic 100K-token trigger. Useful when responses
+    are getting slow and the user wants a fresh context budget without
+    starting a new session.
+
+    Replaces the entire `messages` list in the checkpoint with the compacted
+    version: a SystemMessage summary + the last few messages verbatim. The
+    `add_messages` reducer accepts `RemoveMessage(id=...)` for deletion, so
+    we send removes for every existing message followed by the compacted
+    list — no orphans, no duplication.
+    """
+    if _active_turns.get(session_id) and not _active_turns[session_id].done():
+        return {"ok": False, "reason": "a turn is in flight — cancel it first"}
+
+    from agents.graph import runner_graph
+    from langchain_core.messages import RemoveMessage
+    from memory.checkpointer import _compact_messages
+
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = runner_graph.get_state(config)
+    messages = list(snapshot.values.get("messages", []) or [])
+    before = len(messages)
+    if before == 0:
+        return {"ok": False, "reason": "no messages to compact"}
+
+    compacted = _compact_messages(messages)
+    if len(compacted) >= before:
+        return {"ok": False, "reason": "nothing to compact (history is already small)"}
+
+    removes = [
+        RemoveMessage(id=m.id)
+        for m in messages
+        if getattr(m, "id", None)
+    ]
+    runner_graph.update_state(config, {"messages": removes + compacted})
+    return {"ok": True, "before": before, "after": len(compacted)}
 
 
 @app.get(

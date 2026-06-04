@@ -552,7 +552,33 @@ def _repair_orphan_tool_calls(messages: list[BaseMessage]) -> list[BaseMessage]:
         else:
             repaired.append(m)
         i += 1
-    return repaired
+
+    # Second pass: drop orphan ToolMessages whose tool_call_id is never
+    # introduced by a PRECEDING AIMessage in the surviving history. This
+    # catches the OpenAI / MiniMax shape of the same problem from the other
+    # side: when compaction summarises away an AIMessage that issued a
+    # tool_call, its matching ToolMessage stays in the preserved tail —
+    # MiniMax then rejects the request with "tool result's tool id(...) not
+    # found (2013)". Dropping the orphan silently is correct: synthesising a
+    # fake AIMessage to "own" the ToolMessage would lie to the model about
+    # what it had asked for.
+    cleaned: list[BaseMessage] = []
+    known_ids: set[str] = set()
+    for m in repaired:
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                tcid = tc.get("id")
+                if tcid:
+                    known_ids.add(tcid)
+            cleaned.append(m)
+        elif isinstance(m, ToolMessage):
+            tcid = getattr(m, "tool_call_id", None)
+            if tcid in known_ids:
+                cleaned.append(m)
+            # else: drop the orphan silently
+        else:
+            cleaned.append(m)
+    return cleaned
 
 
 def node_agent(state: RunnerState) -> dict:

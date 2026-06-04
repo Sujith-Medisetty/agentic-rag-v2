@@ -117,21 +117,44 @@ export default function SessionList() {
 
       <div className="grid gap-2.5">
         {sessions.map((s) => (
-          <Link
-            key={s.id}
-            to={`/p/${projectId}/s/${s.id}`}
-            className="list-card"
-          >
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="truncate font-medium text-text">{s.name}</div>
-                <div className="mt-0.5 text-xs text-muted">
-                  Last active {new Date(s.last_active_at * 1000).toLocaleString()}
-                </div>
+          <div key={s.id} className="list-card flex items-center gap-3">
+            <Link
+              to={`/p/${projectId}/s/${s.id}`}
+              className="min-w-0 flex-1"
+            >
+              <div className="truncate font-medium text-text">{s.name}</div>
+              <div className="mt-0.5 text-xs text-muted">
+                Last active {new Date(s.last_active_at * 1000).toLocaleString()}
               </div>
-              <span className="text-subtle">→</span>
-            </div>
-          </Link>
+            </Link>
+            <button
+              type="button"
+              onClick={async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!confirm(
+                  `Delete session "${s.name}"?\n\nThis permanently removes the chat history, plan state, and event log for this session. This cannot be undone.`
+                )) return;
+                try {
+                  await sessionsApi.remove(s.id);
+                  setSessions((prev) => prev.filter((x) => x.id !== s.id));
+                } catch (e: any) {
+                  setErr(e?.message ?? "delete failed");
+                }
+              }}
+              className="min-h-touch min-w-touch rounded-md border border-border/60 px-2 text-sm text-muted hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
+              title="Delete session (chat + plan + events; project workspace untouched)"
+              aria-label={`Delete session ${s.name}`}
+            >
+              Delete
+            </button>
+            <Link
+              to={`/p/${projectId}/s/${s.id}`}
+              className="text-subtle hover:text-accent"
+            >
+              →
+            </Link>
+          </div>
         ))}
       </div>
     </div>

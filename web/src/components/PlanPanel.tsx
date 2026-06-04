@@ -1,6 +1,8 @@
 // Sticky plan panel — pinned above the chat scroll area, shows the current
 // TodoWrite state. Collapses to a one-line summary when there are >5 items;
-// click the header to expand. Auto-hides when there are zero todos.
+// click the header to expand. Auto-hides when there are zero todos OR when
+// every item is completed (cleaner UX — once the work is done there's no
+// reason for a static "all green" widget to keep occupying chrome).
 
 import { useState } from "react";
 import type { TodoItem } from "@/lib/types";
@@ -25,6 +27,15 @@ export default function PlanPanel({ items }: { items: TodoItem[] }) {
   const done = items.filter((t) => t.status === "completed").length;
   const inProgress = items.filter((t) => t.status === "in_progress").length;
   const pending = items.filter((t) => t.status === "pending").length;
+
+  // Hide once the plan is fully done. The events log still keeps every
+  // todo_update for replay; this is a pure presentation choice so the
+  // chrome doesn't carry a stale "all green" widget after the work is over.
+  // The panel reappears automatically if the agent emits a new TodoWrite
+  // (e.g. starting a follow-up phase).
+  if (done === items.length && inProgress === 0 && pending === 0) {
+    return null;
+  }
 
   // If the user hasn't toggled, default to expanded for small lists.
   const expanded = open == null ? items.length <= 5 : open;
