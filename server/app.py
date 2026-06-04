@@ -359,22 +359,21 @@ async def cancel_turn(
     _token: str = Depends(require_token),
 ):
     """Cancel the in-flight turn for this session, if any. Idempotent — if no
-    turn is running, returns ok=false rather than failing."""
+    turn is running, returns ok=false rather than failing.
+
+    The end-of-turn events (error + assistant_text(done=True) + turn_summary
+    + persisted system message) are emitted by session_runner's
+    CancelledError handler, so the turn closes consistently regardless of
+    whether it ended by success, exception, or cancel. Publishing them here
+    too would double up on the wire and risk drift between the two paths.
+
+    The in-flight worker thread is hard to interrupt (Python limitation), so
+    late events from the LangGraph worker may still drip onto the bus for a
+    few seconds — the UI ignores them once turn_summary has arrived."""
     task = _active_turns.get(session_id)
     if task is None or task.done():
         return {"ok": False, "reason": "no active turn"}
     task.cancel()
-    # Surface the cancellation to the UI immediately so the user sees a clean
-    # end-of-turn instead of waiting for the worker thread to notice. The
-    # in-flight worker thread is hard to interrupt (Python limitation), so the
-    # WebSocket events may still drip in for a few seconds while the worker
-    # winds down — that's fine.
-    try:
-        bus = get_bus(session_id)
-        bus.publish("error", {"message": "cancelled by user"})
-        bus.publish("assistant_text", {"text": "", "done": True})
-    except Exception:
-        pass
     return {"ok": True}
 
 

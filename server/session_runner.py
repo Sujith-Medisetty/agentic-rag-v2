@@ -151,6 +151,18 @@ async def run_turn(
             # Wrapping `_drive` in `ctx.run(...)` carries the scope through.
             ctx = contextvars.copy_context()
             iters = await loop.run_in_executor(None, ctx.run, _drive)
+    except asyncio.CancelledError:
+        # Cancel path — user hit cancel (or the task was aborted). MUST be a
+        # separate clause because CancelledError inherits from BaseException,
+        # not Exception, so the `except Exception` below would miss it and
+        # the turn_summary block would never run — leaving the UI's live
+        # indicators frozen and the turn unclosed in the persisted event log.
+        # Don't re-raise: we want the finalizer below to publish turn_summary
+        # and the function to return cleanly.
+        turn_failed = True
+        reporter.error("cancelled by user")
+        reporter.assistant_text("", done=True)
+        db.append_message(session_id, "assistant", "[cancelled by user]")
     except Exception as e:
         # Error path — surface the error, close the stream so the UI stops
         # showing "Thinking…", and persist a system message so the user
