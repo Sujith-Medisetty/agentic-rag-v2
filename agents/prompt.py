@@ -172,6 +172,180 @@ def get_using_tools_section() -> str:
         "user asks for a plan before acting.",
     ])
 
+def get_frontend_ui_quality_section() -> str:
+    """Frontend UI quality rules — applied whenever the task is to build or
+    modify a user-facing interface.
+
+    UI is the primary deliverable. Without these rules, the agent tends to
+    reach for plain Tailwind utilities, skip the design system, skip mobile,
+    and produce a UI that "works" but feels generic. These are the defaults
+    that produce UI you'd be proud to ship — production-grade, mobile-first,
+    accessible, and motion-polished.
+    """
+    return "\n".join([
+        "# Frontend UI quality — UI is the primary deliverable",
+        "",
+        "When the task is to build or modify a user-facing interface, the UI "
+        "IS the deliverable — not a side-effect of the backend. Every pixel, "
+        "every motion, every touch target matters. A UI that 'works but feels "
+        "generic' is a failed UI. Default to the following stack and "
+        "patterns:",
+        "",
+        "## Component layer",
+        "- Use **shadcn/ui** with Radix primitives. Install via the shadcn "
+        "CLI: `npx shadcn@latest init`, then add every component you'll "
+        "use: `button`, `card`, `input`, `label`, `dialog`, `dropdown-menu`, "
+        "`select`, `badge`, `separator`, `skeleton`, `form`, `sheet`, "
+        "`tooltip`, `command`, `sonner`, `tabs`, `accordion`, `popover`, "
+        "`scroll-area`, `avatar`, `switch`, `checkbox`, `radio-group`, "
+        "`progress`, `alert`. Do not copy components in by hand — use the "
+        "CLI so they stay in your repo and you can edit them.",
+        "- Use **lucide-react** for icons. No emoji, no text glyphs.",
+        "- Use **sonner** for toasts — every success, error, and warning. "
+        "Never show errors as inline red text.",
+        "- Use the **shadcn Form** component with **react-hook-form** + "
+        "**zod** for any form. Inline `useState` error strings are a code "
+        "smell.",
+        "- Use **shadcn Command** (cmdk) for any search/cmd-k interface.",
+        "- Use **shadcn Sheet** (drawer) for mobile-side menus, not a "
+        "desktop modal.",
+        "",
+        "## Visual system",
+        "- Set up a real design system in CSS variables: `--background`, "
+        "`--foreground`, `--primary`, `--primary-foreground`, `--secondary`, "
+        "`--muted`, `--muted-foreground`, `--accent`, `--accent-foreground`, "
+        "`--destructive`, `--destructive-foreground`, `--border`, "
+        "`--input`, `--ring`, `--radius`. Don't sprinkle raw hex values "
+        "across components.",
+        "- Define a typography scale: `--text-xs` through `--text-4xl`, "
+        "`--leading-tight`, `--leading-relaxed`. Use `text-sm`/`text-base`/"
+        "`text-lg` for body, `text-2xl`+ for headings, `text-xs` for "
+        "captions and metadata.",
+        "- Use **Inter** (or Geist) from Google Fonts with proper "
+        "`font-feature-settings: 'cv11', 'ss01'` for the nicer variant. "
+        "Never system fonts.",
+        "- Pick a coherent palette up front (e.g. `zinc` + `indigo`, or "
+        "`slate` + `violet`). Don't choose brand colors ad-hoc.",
+        "- **Support both light and dark mode by default** unless told "
+        "otherwise. Use the `next-themes` pattern or CSS `prefers-color-"
+        "scheme` with a manual toggle in the header.",
+        "- Use an **8pt grid** for spacing — `p-2` (8px), `p-4` (16px), "
+        "`p-6` (24px), `p-8` (32px). Don't use random spacing like `p-3` "
+        "or `p-5`.",
+        "",
+        "## Motion and polish",
+        "- Add **framer-motion** for everything that moves. Page "
+        "transitions (`AnimatePresence`), list enter/exit with stagger, "
+        "modal scale+fade, drawer slide, toast slide, hover lift.",
+        "- Replace `Loading…` text with the **shadcn Skeleton** component "
+        "shaped exactly like the real content (same height, same width, "
+        "same number of lines).",
+        "- Design every empty state — icon + 1-line copy + primary CTA, "
+        "not a one-liner.",
+        "- Use proper focus rings (`focus-visible:ring-2 ring-ring ring-"
+        "offset-2 ring-offset-background`). Never the default browser "
+        "outline, never `outline: none` without a replacement.",
+        "- Add hover effects on every interactive element — subtle scale "
+        "(`hover:scale-[1.02]`), shadow (`hover:shadow-md`), or color shift. "
+        "Static UIs feel unfinished.",
+        "- Add `transition-colors duration-150` (or framer equivalent) on "
+        "every element that changes color on hover/focus.",
+        "- Respect `prefers-reduced-motion` — disable non-essential "
+        "animations for users who request it (`useReducedMotion()` from "
+        "framer-motion).",
+        "",
+        "## Structure and responsiveness — MOBILE IS THE DEFAULT",
+        "- **Build mobile-first.** Design for 375px first, then scale up. "
+        "Not the other way around. Most users will touch this on a phone "
+        "before they ever see it on a desktop.",
+        "- Verify every page at 375px (mobile), 768px (tablet), 1280px "
+        "(desktop). Use Chrome DevTools responsive mode AND a real device "
+        "before declaring done.",
+        "- **Touch targets ≥ 44px** (Apple HIG) or 48dp (Material). Every "
+        "button, link, input, checkbox, radio, switch must be tappable "
+        "without zooming. Use `min-h-[44px]` on interactive elements.",
+        "- **No horizontal scroll** at any viewport width. If content "
+        "overflows, restructure it (stack, wrap, scroll-region), don't "
+        "scroll the whole page.",
+        "- Use **hamburger nav** below 768px (Sheet component), top nav "
+        "above. Don't try to fit desktop nav on mobile.",
+        "- Use **bottom sheets** for mobile modals (Sheet with `side=\""
+        "bottom\"` on mobile, `Dialog` on desktop).",
+        "- Add **safe-area insets** for iOS notches: `pb-[env(safe-area-"
+        "inset-bottom)]` on the bottom nav, `pt-[env(safe-area-inset-"
+        "top)]` on the top bar.",
+        "- **Forms on mobile**: stack labels above inputs, full-width "
+        "inputs, `inputMode=\"email\"` / `\"numeric\"` / `\"tel\"` / "
+        "`\"decimal\"` on the right fields, `autocomplete=\"email\"` / "
+        "`\"current-password\"` / `\"name\"` etc. for browser autofill, "
+        "`enterKeyHint=\"next\"` / `\"done\"` / `\"send\"` to control the "
+        "keyboard's return key.",
+        "- **Bottom nav on mobile** for primary navigation (3-5 items, "
+        "icons + labels), not a top bar. Top bar shows context (title, "
+        "user menu) only.",
+        "- If the app has a marketing/landing surface, build a `/welcome` "
+        "(or equivalent) public route with a hero, a 3-column feature grid "
+        "(stack on mobile), and a primary CTA. The first impression "
+        "matters for a demo.",
+        "",
+        "## Accessibility (not optional)",
+        "- Every interactive element is reachable by keyboard (Tab, Enter, "
+        "Escape, arrow keys for menus).",
+        "- Every form input has a visible `<label>` (not just a placeholder).",
+        "- Every icon-only button has an `aria-label`.",
+        "- Modals trap focus and return it to the trigger on close.",
+        "- Color contrast ≥ 4.5:1 for body text, ≥ 3:1 for large text and "
+        "UI components. Verify with a contrast checker.",
+        "- Use semantic HTML (`<button>` for buttons, `<a href>` for links, "
+        "`<nav>` for nav, `<main>` for main content, `<header>`/`<footer>` "
+        "for chrome).",
+        "",
+        "## Performance",
+        "- **Code split per route** with `React.lazy()` + `Suspense`. No "
+        "page should ship the entire app's JS.",
+        "- **Virtualize long lists** (≥50 items) with `react-virtuoso` or "
+        "`@tanstack/react-virtual`.",
+        "- **Lazy-load images** below the fold with `loading=\"lazy\"` and "
+        "set explicit `width`/`height` to prevent CLS.",
+        "- Avoid layout shift — reserve space for images, fonts, async "
+        "content. Target CLS < 0.1.",
+        "- Memoize expensive computations. Don't re-render the whole tree "
+        "on every keystroke.",
+        "",
+        "## Error handling",
+        "- Add an **error boundary** at the route level — a page crash "
+        "should show a recoverable error UI with a 'Try again' button, "
+        "not a blank screen.",
+        "- Show field-level validation errors inline (next to the input), "
+        "not just in a toast.",
+        "- Every async action has a loading state and an error state. No "
+        "silent failures.",
+        "",
+        "## Anti-defaults — do NOT do these",
+        "- Do not use a plain `<div>` or unstyled `<button>` for buttons.",
+        "- Do not use system fonts.",
+        "- Do not show errors as red text on the page — use a toast.",
+        "- Do not use the default browser focus ring.",
+        "- Do not skip the empty state.",
+        "- Do not use raw hex colors in components — use the design tokens.",
+        "- Do not build a desktop-only layout and call it responsive.",
+        "- Do not put interactive elements closer than 44px on mobile.",
+        "- Do not break horizontal scroll at any viewport width.",
+        "- Do not skip keyboard navigation.",
+        "- Do not ship the entire app's JS on every page.",
+        "- Do not use emoji as UI icons.",
+        "- Do not put desktop nav on mobile — use a hamburger.",
+        "- Do not skip dark mode if light mode is built — build both.",
+        "",
+        "## When a reference helps",
+        "If the user can name a product whose visual style they like "
+        "(\"looks like Linear\", \"Vercel-clean\", \"Stripe-polished\", "
+        "\"Notion-warm\", \"Cal.com-friendly\"), match that vocabulary. "
+        "Without a reference, the agent picks the most generic version of "
+        "every choice — explicit references produce dramatically better "
+        "results. A screenshot is even better than a name.",
+    ])
+
 def get_orchestration_section() -> str:
     """Orchestration playbook — only injected for the top-level orchestrator (via
     SystemPromptBuilder.with_orchestration_guidance). Sub-agents must NOT receive
