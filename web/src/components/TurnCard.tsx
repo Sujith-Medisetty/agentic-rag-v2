@@ -31,7 +31,7 @@
 
 import { useEffect, useState } from "react";
 import type {
-  Turn, ToolEvent, FileChange, AgentRecord, CommitRecord, TimelineBlock,
+  Turn, ToolEvent, FileChange, AgentRecord, CommitRecord, TimelineBlock, LlmCall,
 } from "@/lib/types";
 import TurnFooter from "@/components/TurnFooter";
 import Markdown from "@/components/Markdown";
@@ -125,7 +125,78 @@ function TimelineBlockRow({
       return <div className="font-mono text-tx-sm"><FileNode file={block.file} /></div>;
     case "commit":
       return <div className="font-mono text-tx-sm"><CommitNode commit={block.commit} /></div>;
+    case "llm_call":
+      return <LlmCallBlock inputTokens={block.inputTokens} outputTokens={block.outputTokens} />;
   }
+}
+
+// ============================================================================
+// LlmCallBlock — chronological marker for one model call inside the turn.
+// Shows in / out tokens for THAT iteration so the user can see how each step
+// in the agent's reasoning loop spent the token budget, not just the total.
+// ============================================================================
+
+function LlmCallBlock({
+  inputTokens, outputTokens,
+}: { inputTokens: number; outputTokens: number }) {
+  return (
+    <div
+      className="inline-flex items-baseline gap-2 rounded-md border border-border/60 bg-elevated/30 px-2 py-0.5 font-sans text-tx-xs"
+      title={`Model call · ${inputTokens.toLocaleString()} input / ${outputTokens.toLocaleString()} output tokens`}
+    >
+      <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-subtle">
+        LLM
+      </span>
+      <span className="font-mono">
+        <span className="text-accent">{formatTokensCompact(inputTokens)}</span>
+        <span className="text-subtle"> in </span>
+        <span className="text-accent-2">{formatTokensCompact(outputTokens)}</span>
+        <span className="text-subtle"> out</span>
+      </span>
+    </div>
+  );
+}
+
+// ============================================================================
+// SubAgentCallsBreakdown — collapsible per-call token list shown inside a
+// sub-agent card. Each row = one model call the sub-agent made. Collapsed by
+// default; the card stays compact unless the user wants the detail.
+// ============================================================================
+
+function SubAgentCallsBreakdown({ calls }: { calls: LlmCall[] }) {
+  const [open, setOpen] = useState(false);
+  const totalIn  = calls.reduce((a, c) => a + c.inputTokens, 0);
+  const totalOut = calls.reduce((a, c) => a + c.outputTokens, 0);
+  return (
+    <div className="border-t border-accent-2/15 px-3 py-1.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-baseline gap-2 font-sans text-tx-xs text-subtle hover:text-text"
+      >
+        <span className="font-semibold uppercase tracking-[0.14em] text-accent-2/80">
+          LLM calls
+        </span>
+        <span className="font-mono text-muted">
+          {calls.length} · {formatTokensCompact(totalIn)} in / {formatTokensCompact(totalOut)} out
+        </span>
+        <span>{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <ul className="mt-1 space-y-0.5">
+          {calls.map((c, i) => (
+            <li key={`${c.ts}-${i}`} className="flex items-baseline gap-3 font-mono text-tx-xs">
+              <span className="w-10 text-right text-subtle">#{i + 1}</span>
+              <span className="text-accent">{formatTokensCompact(c.inputTokens)}</span>
+              <span className="text-subtle">in</span>
+              <span className="text-accent-2">{formatTokensCompact(c.outputTokens)}</span>
+              <span className="text-subtle">out</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 // ============================================================================
@@ -503,6 +574,12 @@ function AgentNode({ agent }: { agent: AgentRecord }) {
             <span className="text-warn"> ({subRunning} running)</span>
           )}
         </span>
+        {agent.llmCalls.length > 0 && (
+          <span className="text-muted">
+            <span className="text-subtle">calls:</span>{" "}
+            <span className="text-text">{agent.llmCalls.length}</span>
+          </span>
+        )}
         {totalTok > 0 && (
           <span className="text-muted">
             <span className="text-subtle">tokens:</span>{" "}
@@ -513,6 +590,13 @@ function AgentNode({ agent }: { agent: AgentRecord }) {
           </span>
         )}
       </div>
+
+      {/* Per-LLM-call breakdown for this sub-agent — collapsed by default to
+          keep the card compact. Click to expand and see how each iteration
+          spent its token budget. */}
+      {agent.llmCalls.length > 0 && (
+        <SubAgentCallsBreakdown calls={agent.llmCalls} />
+      )}
 
       {/* Nested tool tree — what THIS sub-agent ran. Same ToolNode component
           as the main tree, just inside the sub-agent card. */}

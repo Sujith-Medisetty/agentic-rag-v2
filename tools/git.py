@@ -14,14 +14,34 @@ from __future__ import annotations
 
 import subprocess
 
+# Most git operations are local + fast (status, log, diff). The ones that
+# CAN hang are the network-touching ones (fetch, pull, push, clone, ls-remote)
+# — and even local operations can hang if there's an orphan lockfile at
+# `.git/index.lock`, or if a hook script is interactive. So every git call
+# gets a generous-but-bounded timeout to mirror the safety the bash tool now
+# has. 60s is enough for any reasonable local op AND for most repo-sized
+# fetches; commands that legitimately need longer (giant clones) should be
+# called via `bash` with an explicit longer `timeout`.
+_DEFAULT_GIT_TIMEOUT_SECS = 60
+
 def _run(cmd: list[str], cwd: str = ".") -> tuple[str, str, int]:
-    """Run a git command, return (stdout, stderr, exit_code)."""
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-    )
+    """Run a git command, return (stdout, stderr, exit_code).
+
+    Hard timeout + closed stdin so a hung interactive prompt (e.g. credential
+    helper waiting for a password) can't wedge the worker thread. A timeout
+    surfaces as exit code 124 with a "git command timed out" stderr so the
+    caller can detect and report it instead of returning silently."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=_DEFAULT_GIT_TIMEOUT_SECS,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return "", f"git command timed out after {_DEFAULT_GIT_TIMEOUT_SECS}s: {' '.join(cmd)}", 124
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 def _git_stdout(args: list[str], cwd: str = ".") -> str | None:

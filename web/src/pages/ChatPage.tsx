@@ -191,23 +191,31 @@ export default function ChatPage() {
         return;
       }
       case "token_update": {
-        // Live in/out token deltas — accumulate into the right scope. If the
-        // event is stamped with an agent_id, it belongs to that sub-agent's
-        // per-agent counter; otherwise the orchestrator (this turn).
+        // Live in/out token deltas — every model call inside a turn emits
+        // ONE token_update after it completes (see _stream_model_call in
+        // agents/nodes.py). We use that fact to surface PER-CALL token usage
+        // in the UI, not just the running total: each event either pushes a
+        // chronological `llm_call` block (orchestrator) or appends an
+        // `LlmCall` entry inside the sub-agent that issued it.
         const inDelta  = Number(p.input_delta  ?? 0);
         const outDelta = Number(p.output_delta ?? 0);
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
+        if (inDelta === 0 && outDelta === 0) return;  // skip zero-deltas
         setCurrentTurn((curr) => {
           if (!curr) return curr;
           if (aid && curr.agents[aid]) {
+            const a = curr.agents[aid];
             return {
               ...curr,
               agents: {
                 ...curr.agents,
                 [aid]: {
-                  ...curr.agents[aid],
-                  liveInputTokens:  curr.agents[aid].liveInputTokens  + inDelta,
-                  liveOutputTokens: curr.agents[aid].liveOutputTokens + outDelta,
+                  ...a,
+                  liveInputTokens:  a.liveInputTokens  + inDelta,
+                  liveOutputTokens: a.liveOutputTokens + outDelta,
+                  llmCalls: [...a.llmCalls, {
+                    ts: ev.ts, inputTokens: inDelta, outputTokens: outDelta,
+                  }],
                 },
               },
             };
@@ -216,6 +224,11 @@ export default function ChatPage() {
             ...curr,
             liveInputTokens:  curr.liveInputTokens  + inDelta,
             liveOutputTokens: curr.liveOutputTokens + outDelta,
+            blocks: [...curr.blocks, {
+              id: _newBlockId("llm_call", ev.ts, curr.blocks.length),
+              kind: "llm_call", ts: ev.ts,
+              inputTokens: inDelta, outputTokens: outDelta,
+            }],
           };
         });
         return;
@@ -375,6 +388,7 @@ export default function ChatPage() {
           tools:         [],
           liveInputTokens:  0,
           liveOutputTokens: 0,
+          llmCalls:        [],
         };
         setCurrentTurn((curr) => curr ? {
           ...curr,
@@ -1072,7 +1086,7 @@ function rebuildTranscript(events: LiveEvent[]): {
           name: String(p.name ?? ""), model: String(p.model ?? ""),
           status: "running", output_file: "", error: "",
           spawned_at: ev.ts, updated_at: ev.ts,
-          tools: [], liveInputTokens: 0, liveOutputTokens: 0,
+          tools: [], liveInputTokens: 0, liveOutputTokens: 0, llmCalls: [],
         };
         curr.blocks.push({
           id: _newBlockId("agent", ev.ts, curr.blocks.length),
@@ -1085,12 +1099,21 @@ function rebuildTranscript(events: LiveEvent[]): {
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
         const inD  = Number(p.input_delta  ?? 0);
         const outD = Number(p.output_delta ?? 0);
+        if (inD === 0 && outD === 0) break;
         if (aid && curr.agents[aid]) {
           curr.agents[aid].liveInputTokens  += inD;
           curr.agents[aid].liveOutputTokens += outD;
+          curr.agents[aid].llmCalls.push({
+            ts: ev.ts, inputTokens: inD, outputTokens: outD,
+          });
         } else {
           curr.liveInputTokens  += inD;
           curr.liveOutputTokens += outD;
+          curr.blocks.push({
+            id: _newBlockId("llm_call", ev.ts, curr.blocks.length),
+            kind: "llm_call", ts: ev.ts,
+            inputTokens: inD, outputTokens: outD,
+          });
         }
         break;
       }

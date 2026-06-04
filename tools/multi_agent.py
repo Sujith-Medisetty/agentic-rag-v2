@@ -28,7 +28,28 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 DEFAULT_AGENT_MODEL = "claude-opus-4-6"
-DEFAULT_AGENT_MAX_ITERATIONS = 32
+# Hard cap on the sub-agent's LangGraph recursion. Lower than the orchestrator's
+# 50 because sub-agents are deliberately scoped: a focused search shouldn't need
+# more than a dozen turns. Cap on iters bounds worst-case cost even if the
+# wall-clock watchdog fails to fire (e.g. thread blocked in a C extension).
+DEFAULT_AGENT_MAX_ITERATIONS = 16
+
+# Sub-agent watchdog — two-axis: idle vs total wall-clock.
+#
+# IDLE budget (the important one): how long the sub-agent may go without any
+# observable progress (tool_start / tool_done / token_update / status_update).
+# A genuinely productive long-running task keeps emitting these events, so it
+# never trips the idle cap. A wedged / looping sub-agent goes silent and dies
+# at the idle limit. This is the same pattern as the orchestrator's
+# `_RunBudget._repeat_streak`, but here measured in seconds rather than calls.
+#
+# TOTAL budget (the safety net): absolute wall-clock cap, so even a
+# misconfigured "kept emitting tool calls forever" sub-agent eventually stops.
+# Set very generously — 6 hours by default; the model can pass anything up to
+# HARD_AGENT_MAX_TOTAL_SECONDS (24h) if it genuinely needs longer.
+DEFAULT_AGENT_MAX_IDLE_SECONDS    = 300       # 5 min of no progress = dead
+DEFAULT_AGENT_MAX_TOTAL_SECONDS   = 6 * 3600  # 6 hours absolute
+HARD_AGENT_MAX_TOTAL_SECONDS      = 24 * 3600 # 24h hard ceiling
 
 # Tool allowlists per subagent type (lib.rs allowed_tools_for_subagent).
 # NOTE: `Agent` is intentionally absent from every set — sub-agents cannot spawn
@@ -225,8 +246,22 @@ def run_agent(
     subagent_type: str | None = None,
     name: str | None = None,
     model: str | None = None,
+    max_idle_seconds: int | None = None,
+    max_total_seconds: int | None = None,
 ) -> dict:
-    """Spawn a sub-agent. Faithful port of execute_agent_with_spawn (lib.rs:3928)."""
+    """Spawn a sub-agent. Faithful port of execute_agent_with_spawn (lib.rs:3928).
+
+    Watchdog parameters:
+      `max_idle_seconds` — kill if no progress events for this long (default
+        DEFAULT_AGENT_MAX_IDLE_SECONDS = 300s). "Progress" = any tool_start /
+        tool_done / token_update / status_update from this sub-agent's
+        reporter. A productive long-running task keeps emitting events and
+        never trips this.
+      `max_total_seconds` — absolute wall-clock cap regardless of activity
+        (default DEFAULT_AGENT_MAX_TOTAL_SECONDS = 6h; clamped to
+        HARD_AGENT_MAX_TOTAL_SECONDS = 24h). Belt-and-braces so even a
+        sub-agent that keeps emitting noise can't run forever.
+    """
     if not description.strip():
         raise ValueError("description must not be empty")
     if not prompt.strip():
@@ -290,6 +325,17 @@ def run_agent(
     except Exception:
         sub_reporter = None
 
+    # Two-axis budget: idle + total. Clamped to safe ranges.
+    eff_idle  = max(10, int(max_idle_seconds  or DEFAULT_AGENT_MAX_IDLE_SECONDS))
+    eff_total = max(eff_idle,
+                    min(int(max_total_seconds or DEFAULT_AGENT_MAX_TOTAL_SECONDS),
+                        HARD_AGENT_MAX_TOTAL_SECONDS))
+
+    # Seed the progress tracker BEFORE the worker starts so the first idle
+    # check has a baseline. The reporter's _pub hook updates this on every
+    # event the sub-agent emits.
+    note_agent_progress(agent_id)
+
     job = {
         "manifest": manifest,
         "prompt": prompt,
@@ -299,14 +345,126 @@ def run_agent(
         "reporter": sub_reporter,
     }
     try:
-        threading.Thread(
+        thread = threading.Thread(
             target=_run_agent_job, args=(job,), name=f"clawd-agent-{agent_id}", daemon=True
-        ).start()
+        )
+        thread.start()
     except Exception as e: # noqa: BLE001
         _persist_terminal_state(manifest, "failed", None, f"failed to spawn sub-agent: {e}")
         raise RuntimeError(f"failed to spawn sub-agent: {e}") from e
 
+    # Watchdog — a daemon thread that wakes every WATCHDOG_TICK_SECONDS,
+    # checks idle elapsed AND total elapsed against the budgets, and
+    # terminates the sub-agent if either is exceeded. Exits cleanly the
+    # moment the manifest shows the agent finished naturally.
+    def _watchdog() -> None:
+        started = time.monotonic()
+        while True:
+            time.sleep(WATCHDOG_TICK_SECONDS)
+            # Did the agent already finish? Exit if so.
+            status = _read_manifest_status(manifest_file)
+            if status in ("completed", "failed"):
+                _clear_agent_progress(agent_id)
+                return
+            now = time.monotonic()
+            last = _get_agent_last_progress(agent_id) or started
+            idle_for  = now - last
+            total_for = now - started
+            tripped: str | None = None
+            if idle_for >= eff_idle:
+                tripped = (f"sub-agent idle for {int(idle_for)}s "
+                           f"(no progress events) — exceeded idle budget of {eff_idle}s")
+            elif total_for >= eff_total:
+                tripped = (f"sub-agent total wall-clock {int(total_for)}s "
+                           f"exceeded budget of {eff_total}s")
+            if tripped:
+                try:
+                    _persist_terminal_state(manifest, "failed", None, tripped)
+                    _interrupt_thread(thread)
+                finally:
+                    _clear_agent_progress(agent_id)
+                return
+
+    threading.Thread(
+        target=_watchdog, name=f"watchdog-{agent_id}", daemon=True,
+    ).start()
     return manifest
+
+
+# ---------------------------------------------------------------------------
+# Progress tracker — used by the idle watchdog.
+# ---------------------------------------------------------------------------
+#
+# WebReporter._pub calls note_agent_progress(agent_id) on every event from a
+# tagged sub-agent reporter (see server/reporter.py). The watchdog reads
+# _last_progress to decide whether the sub-agent has gone silent. All access
+# is guarded by a single lock — these dicts are touched from many threads.
+
+WATCHDOG_TICK_SECONDS = 5  # how often the watchdog wakes to check budgets
+_progress_lock = threading.Lock()
+_last_progress: dict[str, float] = {}
+
+
+def note_agent_progress(agent_id: str) -> None:
+    """Mark a sub-agent as having made progress (idle-watchdog reset)."""
+    if not agent_id:
+        return
+    with _progress_lock:
+        _last_progress[agent_id] = time.monotonic()
+
+
+def _get_agent_last_progress(agent_id: str) -> float | None:
+    with _progress_lock:
+        return _last_progress.get(agent_id)
+
+
+def _clear_agent_progress(agent_id: str) -> None:
+    with _progress_lock:
+        _last_progress.pop(agent_id, None)
+
+
+def _read_manifest_status(manifest_file: Path) -> str:
+    """Read just the `status` field from the on-disk manifest, returning
+    "" if the file is missing or unreadable. Used by the watchdog to avoid
+    overwriting a manifest that the agent already finished writing."""
+    try:
+        import json as _json
+        data = _json.loads(Path(manifest_file).read_text(encoding="utf-8"))
+        return str(data.get("status", ""))
+    except Exception:
+        return ""
+
+
+def _interrupt_thread(thread: threading.Thread) -> None:
+    """Best-effort interruption of a daemon worker thread via the
+    `PyThreadState_SetAsyncExc` C-API. CPython only.
+
+    Caveats — the model thinks this is magic, but it isn't:
+      1. The injected exception fires at the next BYTECODE boundary inside
+         the target thread. Python code yields constantly, so for any code
+         doing pure-Python work this is near-instant.
+      2. If the thread is blocked inside a C-level call (e.g. requests.get,
+         subprocess.run, socket.recv), the exception is queued and waits
+         for that call to return. This is why every IO-bound tool now has
+         its own bounded timeout (bash=60s, git=60s, web=20s) — the slowest
+         tool is the worst-case delay before the SystemExit actually fires.
+      3. If the thread has already finished, the call is a no-op.
+    """
+    try:
+        if not thread.is_alive():
+            return
+        tid = thread.ident
+        if tid is None:
+            return
+        import ctypes
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_long(tid), ctypes.py_object(SystemExit),
+        )
+        if res > 1:
+            # Affected more than one thread (CPython API quirk) — undo.
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), None)
+    except Exception:
+        pass
 
 def get_agent_status(agent_id: str) -> dict:
     """Read a spawned agent's manifest (so callers can poll for completion)."""

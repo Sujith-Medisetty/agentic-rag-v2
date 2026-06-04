@@ -22,6 +22,7 @@ import functools
 import inspect
 import json
 import re
+from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 # Production implementations (untouched). Imports aliased where the public tool
@@ -138,6 +139,32 @@ def _safe_report(fn):
         fn()
     except Exception:
         pass
+
+
+def _python_syntax_error(path: str, content: str) -> str | None:
+    """Compile `content` as Python source for syntax-only validation.
+
+    Returns None if the source parses, or a short human-readable error string
+    if it doesn't. We use `compile(..., "exec")` rather than spawning
+    `python -m py_compile` because it's ~100× faster (no subprocess) and
+    operates on the in-memory content — so we can call it BEFORE persisting
+    a broken file to disk.
+
+    Only `.py` files are checked. Anything else returns None unconditionally.
+    """
+    if not path.lower().endswith(".py"):
+        return None
+    try:
+        compile(content, path, "exec")
+        return None
+    except SyntaxError as e:
+        # e.lineno / e.offset / e.msg are the user-actionable bits — formatted
+        # to match what `python` itself would print so the model can act on it.
+        line = e.lineno if e.lineno is not None else "?"
+        col  = e.offset if e.offset is not None else "?"
+        return f"SyntaxError at {path}:{line}:{col} — {e.msg}"
+    except Exception as e:  # noqa: BLE001 - catch IndentationError etc. as the same
+        return f"{type(e).__name__}: {e}"
 # ============================================================================
 # Pydantic input schemas — declared up here so @tool(args_schema=...) can bind
 # them, and so the LLM sees rich Field(description=...) hints per argument.
@@ -233,6 +260,8 @@ class AgentToolInput(BaseModel):
     subagent_type: str | None = Field(None, description="general-purpose | Explore | Plan | Verification | claw-guide | statusline-setup")
     name: str | None = Field(None, description="Optional name for the sub-agent")
     model: str | None = Field(None, description="Optional model override")
+    max_idle_seconds: int | None = Field(None, description="Idle timeout in seconds — sub-agent is killed if it goes this long with NO progress events (tool calls / token updates). Default 300 (5min). Productive long-running tasks keep emitting events and never trip this.")
+    max_total_seconds: int | None = Field(None, description="Absolute wall-clock cap in seconds, regardless of activity. Default 21600 (6h). Clamped to [idle, 86400]. Belt-and-braces only — most sub-agents finish well within their idle budget.")
 class AgentStatusInput(BaseModel):
     agent_id: str = Field(description="The agent_id returned by a prior Agent spawn")
 # ============================================================================
@@ -269,6 +298,16 @@ def write_file(path: str, content: str) -> str:
     err = _check_permission("write_file", {"path": path})
     if err:
         return f"BLOCKED: {err}"
+    # Syntax-check Python files BEFORE writing — a broken .py file on disk
+    # will crash the uvicorn auto-reloader the moment it lands, taking the
+    # whole backend down until the file is fixed (we hit this in the wild —
+    # see the duplicate-class IndentationError incident in agents/prompt.py).
+    # Validating on the in-memory content means a bad write is rejected
+    # without ever touching the filesystem; the model sees the error in the
+    # tool result and can immediately retry with a corrected version.
+    syntax_err = _python_syntax_error(path, content)
+    if syntax_err:
+        return f"Error: refusing to write — {syntax_err}"
     try:
         result = _write_file_impl(path, content)
         verb = "Created" if result.type == "create" else "Updated"
@@ -308,6 +347,18 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
         updated = result.originalFile.replace(
             old_string, new_string, 0 if replace_all else 1
         )
+        # Syntax-check Python results BEFORE accepting the edit. If the edit
+        # produces invalid Python (typos, half-finished refactors, lost
+        # indentation), atomically restore the original file and surface the
+        # error to the model — no broken file is ever left on disk. See the
+        # same rationale in write_file above.
+        syntax_err = _python_syntax_error(path, updated)
+        if syntax_err:
+            try:
+                Path(result.filePath).write_text(result.originalFile, encoding="utf-8")
+            except Exception:
+                pass  # best-effort rollback
+            return f"Error: edit reverted — {syntax_err}"
         # Notify the UI — always a unified diff for edits.
         from agents.reporter import get_reporter
         diff_text = _build_unified_diff(result.filePath, result.originalFile, updated)
@@ -787,6 +838,8 @@ def Agent(
     subagent_type: str | None = None,
     name: str | None = None,
     model: str | None = None,
+    max_idle_seconds: int | None = None,
+    max_total_seconds: int | None = None,
 ) -> str:
     """Launch a BACKGROUND sub-agent in a fresh conversation. Returns immediately with `{agentId, status: "running", outputFile,...}` — you must poll completion with `AgentStatus`.
     When to use:
@@ -809,7 +862,11 @@ def Agent(
     - Never delegate UNDERSTANDING — don't write "based on what you find, decide what to do." Decide yourself, then delegate the execution.
     """
     from tools.multi_agent import run_agent
-    manifest = run_agent(description, prompt, subagent_type, name, model)
+    manifest = run_agent(
+        description, prompt, subagent_type, name, model,
+        max_idle_seconds=max_idle_seconds,
+        max_total_seconds=max_total_seconds,
+    )
     # Notify the UI — populates the sub-agent tree the moment the spawn lands.
     from agents.reporter import get_reporter
     _safe_report(lambda: get_reporter().agent_spawn(

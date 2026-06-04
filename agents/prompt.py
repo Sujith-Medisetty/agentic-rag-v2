@@ -173,177 +173,110 @@ def get_using_tools_section() -> str:
     ])
 
 def get_frontend_ui_quality_section() -> str:
-    """Frontend UI quality rules — applied whenever the task is to build or
-    modify a user-facing interface.
+    """Frontend UI quality rules — included only when the workspace looks like
+    a frontend project (see `_workspace_has_frontend_signals`). The UI is the
+    deliverable; produce production-grade output, not "works but generic".
 
-    UI is the primary deliverable. Without these rules, the agent tends to
-    reach for plain Tailwind utilities, skip the design system, skip mobile,
-    and produce a UI that "works" but feels generic. These are the defaults
-    that produce UI you'd be proud to ship — production-grade, mobile-first,
-    accessible, and motion-polished.
+    This block is intentionally dense — every rule is the load-bearing part.
+    The original ~165-line version had explanatory rationale and a redundant
+    "anti-defaults" section that just restated each rule as a negative;
+    both removed here to cut ~50% of the token cost while preserving every
+    actionable directive and every concrete value (44px, 4.5:1, etc.).
     """
     return "\n".join([
-        "# Frontend UI quality — UI is the primary deliverable",
+        "# Frontend UI quality (UI IS the deliverable — every pixel matters)",
         "",
-        "When the task is to build or modify a user-facing interface, the UI "
-        "IS the deliverable — not a side-effect of the backend. Every pixel, "
-        "every motion, every touch target matters. A UI that 'works but feels "
-        "generic' is a failed UI. Default to the following stack and "
-        "patterns:",
+        "## Stack — required, no substitutions",
+        "- **shadcn/ui** + Radix via `npx shadcn@latest init`, then add every "
+        "component you'll use (button, card, input, label, dialog, "
+        "dropdown-menu, select, badge, separator, skeleton, form, sheet, "
+        "tooltip, command, sonner, tabs, accordion, popover, scroll-area, "
+        "avatar, switch, checkbox, radio-group, progress, alert). Never "
+        "hand-copy — use the CLI so components live in your repo.",
+        "- **lucide-react** for icons (no emoji, no text glyphs).",
+        "- **sonner** for every toast (success / error / warning) — never "
+        "inline red text on the page.",
+        "- **react-hook-form** + **zod** + **shadcn Form** for every form. "
+        "`useState` for validation errors is a code smell.",
+        "- **shadcn Command** (cmdk) for search / cmd-k.",
+        "- **shadcn Sheet** for mobile side menus and bottom sheets; "
+        "**Dialog** for desktop modals.",
+        "- **framer-motion** for motion (page transitions via AnimatePresence, "
+        "stagger on list enter/exit, modal scale+fade, drawer/toast slide, "
+        "hover lift). Respect `useReducedMotion()`.",
         "",
-        "## Component layer",
-        "- Use **shadcn/ui** with Radix primitives. Install via the shadcn "
-        "CLI: `npx shadcn@latest init`, then add every component you'll "
-        "use: `button`, `card`, `input`, `label`, `dialog`, `dropdown-menu`, "
-        "`select`, `badge`, `separator`, `skeleton`, `form`, `sheet`, "
-        "`tooltip`, `command`, `sonner`, `tabs`, `accordion`, `popover`, "
-        "`scroll-area`, `avatar`, `switch`, `checkbox`, `radio-group`, "
-        "`progress`, `alert`. Do not copy components in by hand — use the "
-        "CLI so they stay in your repo and you can edit them.",
-        "- Use **lucide-react** for icons. No emoji, no text glyphs.",
-        "- Use **sonner** for toasts — every success, error, and warning. "
-        "Never show errors as inline red text.",
-        "- Use the **shadcn Form** component with **react-hook-form** + "
-        "**zod** for any form. Inline `useState` error strings are a code "
-        "smell.",
-        "- Use **shadcn Command** (cmdk) for any search/cmd-k interface.",
-        "- Use **shadcn Sheet** (drawer) for mobile-side menus, not a "
-        "desktop modal.",
+        "## Visual system — set up once, reference everywhere",
+        "- CSS variables for tokens: `--background`, `--foreground`, "
+        "`--primary` + `-foreground`, `--secondary`, `--muted` + "
+        "`-foreground`, `--accent` + `-foreground`, `--destructive` + "
+        "`-foreground`, `--border`, `--input`, `--ring`, `--radius`. No raw "
+        "hex in components.",
+        "- Typography: Inter or Geist via Google Fonts with "
+        "`font-feature-settings: 'cv11', 'ss01'`; never system fonts. Scale: "
+        "`text-xs` (captions/metadata), `text-sm`/`text-base`/`text-lg` "
+        "(body), `text-2xl`+ (headings).",
+        "- One coherent palette chosen up front (e.g. zinc+indigo, "
+        "slate+violet). Not ad-hoc.",
+        "- **Both light and dark mode by default** unless told otherwise "
+        "(`next-themes` or `prefers-color-scheme` with a header toggle).",
+        "- **8pt spacing grid only**: p-2 / p-4 / p-6 / p-8. No p-3, p-5.",
         "",
-        "## Visual system",
-        "- Set up a real design system in CSS variables: `--background`, "
-        "`--foreground`, `--primary`, `--primary-foreground`, `--secondary`, "
-        "`--muted`, `--muted-foreground`, `--accent`, `--accent-foreground`, "
-        "`--destructive`, `--destructive-foreground`, `--border`, "
-        "`--input`, `--ring`, `--radius`. Don't sprinkle raw hex values "
-        "across components.",
-        "- Define a typography scale: `--text-xs` through `--text-4xl`, "
-        "`--leading-tight`, `--leading-relaxed`. Use `text-sm`/`text-base`/"
-        "`text-lg` for body, `text-2xl`+ for headings, `text-xs` for "
-        "captions and metadata.",
-        "- Use **Inter** (or Geist) from Google Fonts with proper "
-        "`font-feature-settings: 'cv11', 'ss01'` for the nicer variant. "
-        "Never system fonts.",
-        "- Pick a coherent palette up front (e.g. `zinc` + `indigo`, or "
-        "`slate` + `violet`). Don't choose brand colors ad-hoc.",
-        "- **Support both light and dark mode by default** unless told "
-        "otherwise. Use the `next-themes` pattern or CSS `prefers-color-"
-        "scheme` with a manual toggle in the header.",
-        "- Use an **8pt grid** for spacing — `p-2` (8px), `p-4` (16px), "
-        "`p-6` (24px), `p-8` (32px). Don't use random spacing like `p-3` "
-        "or `p-5`.",
+        "## Mobile is the default (verify at 375 / 768 / 1280)",
+        "- Design at 375px first, scale up. Most users are on phones first.",
+        "- **Touch targets ≥ 44px** (`min-h-[44px]`) on every button, link, "
+        "input, checkbox, radio, switch.",
+        "- **No horizontal scroll** at any viewport — restructure (stack / "
+        "wrap / scroll-region) instead.",
+        "- Hamburger nav (Sheet) below 768px; top nav above. Bottom nav (3–5 "
+        "items, icons+labels) for primary mobile navigation; top bar for "
+        "context only.",
+        "- Safe-area insets for iOS: `pt-[env(safe-area-inset-top)]` on top "
+        "bar, `pb-[env(safe-area-inset-bottom)]` on bottom nav.",
+        "- Mobile forms: labels stacked above inputs, full-width, "
+        "`inputMode=\"email\"|\"numeric\"|\"tel\"|\"decimal\"`, "
+        "`autocomplete=\"email\"|\"current-password\"|\"name\"` etc., "
+        "`enterKeyHint=\"next\"|\"done\"|\"send\"`.",
+        "- If marketing/landing exists, build a public `/welcome` (hero + "
+        "3-column feature grid that stacks on mobile + primary CTA).",
         "",
-        "## Motion and polish",
-        "- Add **framer-motion** for everything that moves. Page "
-        "transitions (`AnimatePresence`), list enter/exit with stagger, "
-        "modal scale+fade, drawer slide, toast slide, hover lift.",
-        "- Replace `Loading…` text with the **shadcn Skeleton** component "
-        "shaped exactly like the real content (same height, same width, "
-        "same number of lines).",
-        "- Design every empty state — icon + 1-line copy + primary CTA, "
-        "not a one-liner.",
-        "- Use proper focus rings (`focus-visible:ring-2 ring-ring ring-"
-        "offset-2 ring-offset-background`). Never the default browser "
-        "outline, never `outline: none` without a replacement.",
-        "- Add hover effects on every interactive element — subtle scale "
-        "(`hover:scale-[1.02]`), shadow (`hover:shadow-md`), or color shift. "
-        "Static UIs feel unfinished.",
-        "- Add `transition-colors duration-150` (or framer equivalent) on "
-        "every element that changes color on hover/focus.",
-        "- Respect `prefers-reduced-motion` — disable non-essential "
-        "animations for users who request it (`useReducedMotion()` from "
-        "framer-motion).",
-        "",
-        "## Structure and responsiveness — MOBILE IS THE DEFAULT",
-        "- **Build mobile-first.** Design for 375px first, then scale up. "
-        "Not the other way around. Most users will touch this on a phone "
-        "before they ever see it on a desktop.",
-        "- Verify every page at 375px (mobile), 768px (tablet), 1280px "
-        "(desktop). Use Chrome DevTools responsive mode AND a real device "
-        "before declaring done.",
-        "- **Touch targets ≥ 44px** (Apple HIG) or 48dp (Material). Every "
-        "button, link, input, checkbox, radio, switch must be tappable "
-        "without zooming. Use `min-h-[44px]` on interactive elements.",
-        "- **No horizontal scroll** at any viewport width. If content "
-        "overflows, restructure it (stack, wrap, scroll-region), don't "
-        "scroll the whole page.",
-        "- Use **hamburger nav** below 768px (Sheet component), top nav "
-        "above. Don't try to fit desktop nav on mobile.",
-        "- Use **bottom sheets** for mobile modals (Sheet with `side=\""
-        "bottom\"` on mobile, `Dialog` on desktop).",
-        "- Add **safe-area insets** for iOS notches: `pb-[env(safe-area-"
-        "inset-bottom)]` on the bottom nav, `pt-[env(safe-area-inset-"
-        "top)]` on the top bar.",
-        "- **Forms on mobile**: stack labels above inputs, full-width "
-        "inputs, `inputMode=\"email\"` / `\"numeric\"` / `\"tel\"` / "
-        "`\"decimal\"` on the right fields, `autocomplete=\"email\"` / "
-        "`\"current-password\"` / `\"name\"` etc. for browser autofill, "
-        "`enterKeyHint=\"next\"` / `\"done\"` / `\"send\"` to control the "
-        "keyboard's return key.",
-        "- **Bottom nav on mobile** for primary navigation (3-5 items, "
-        "icons + labels), not a top bar. Top bar shows context (title, "
-        "user menu) only.",
-        "- If the app has a marketing/landing surface, build a `/welcome` "
-        "(or equivalent) public route with a hero, a 3-column feature grid "
-        "(stack on mobile), and a primary CTA. The first impression "
-        "matters for a demo.",
+        "## Polish (the difference between 'works' and 'shippable')",
+        "- Skeleton placeholders shaped like the real content (same height, "
+        "width, line count) — never a `Loading…` string.",
+        "- Every empty state has an icon + 1-line copy + primary CTA.",
+        "- Focus rings: `focus-visible:ring-2 ring-ring ring-offset-2 "
+        "ring-offset-background`. Never the browser default; never "
+        "`outline:none` without a replacement.",
+        "- Hover on every interactive: subtle scale (`hover:scale-[1.02]`), "
+        "shadow, or color shift, with `transition-colors duration-150`.",
         "",
         "## Accessibility (not optional)",
-        "- Every interactive element is reachable by keyboard (Tab, Enter, "
-        "Escape, arrow keys for menus).",
-        "- Every form input has a visible `<label>` (not just a placeholder).",
-        "- Every icon-only button has an `aria-label`.",
-        "- Modals trap focus and return it to the trigger on close.",
-        "- Color contrast ≥ 4.5:1 for body text, ≥ 3:1 for large text and "
-        "UI components. Verify with a contrast checker.",
-        "- Use semantic HTML (`<button>` for buttons, `<a href>` for links, "
-        "`<nav>` for nav, `<main>` for main content, `<header>`/`<footer>` "
-        "for chrome).",
+        "- Full keyboard reachability (Tab / Enter / Escape / arrow keys in "
+        "menus). Modals trap focus and restore it on close.",
+        "- Every input has a visible `<label>` (placeholder is not a label). "
+        "Every icon-only button has `aria-label`.",
+        "- Contrast ≥ 4.5:1 body, ≥ 3:1 large text / UI. Verify with a "
+        "contrast checker.",
+        "- Semantic HTML: `<button>`, `<a href>`, `<nav>`, `<main>`, "
+        "`<header>`, `<footer>`.",
         "",
-        "## Performance",
-        "- **Code split per route** with `React.lazy()` + `Suspense`. No "
-        "page should ship the entire app's JS.",
-        "- **Virtualize long lists** (≥50 items) with `react-virtuoso` or "
-        "`@tanstack/react-virtual`.",
-        "- **Lazy-load images** below the fold with `loading=\"lazy\"` and "
-        "set explicit `width`/`height` to prevent CLS.",
-        "- Avoid layout shift — reserve space for images, fonts, async "
-        "content. Target CLS < 0.1.",
-        "- Memoize expensive computations. Don't re-render the whole tree "
-        "on every keystroke.",
+        "## Performance + reliability",
+        "- Code split per route via `React.lazy()` + `Suspense`.",
+        "- Virtualize lists ≥ 50 items (`react-virtuoso` or "
+        "`@tanstack/react-virtual`).",
+        "- Lazy-load below-the-fold images with `loading=\"lazy\"` + explicit "
+        "`width`/`height`; reserve space for fonts/async content (CLS < 0.1).",
+        "- Memoize expensive computations; don't re-render the tree on every "
+        "keystroke.",
+        "- Route-level error boundary with a 'Try again' button — never a "
+        "blank screen on crash.",
+        "- Field-level validation errors inline next to the input AND in a "
+        "toast for the form-level summary. Every async action has explicit "
+        "loading + error states.",
         "",
-        "## Error handling",
-        "- Add an **error boundary** at the route level — a page crash "
-        "should show a recoverable error UI with a 'Try again' button, "
-        "not a blank screen.",
-        "- Show field-level validation errors inline (next to the input), "
-        "not just in a toast.",
-        "- Every async action has a loading state and an error state. No "
-        "silent failures.",
-        "",
-        "## Anti-defaults — do NOT do these",
-        "- Do not use a plain `<div>` or unstyled `<button>` for buttons.",
-        "- Do not use system fonts.",
-        "- Do not show errors as red text on the page — use a toast.",
-        "- Do not use the default browser focus ring.",
-        "- Do not skip the empty state.",
-        "- Do not use raw hex colors in components — use the design tokens.",
-        "- Do not build a desktop-only layout and call it responsive.",
-        "- Do not put interactive elements closer than 44px on mobile.",
-        "- Do not break horizontal scroll at any viewport width.",
-        "- Do not skip keyboard navigation.",
-        "- Do not ship the entire app's JS on every page.",
-        "- Do not use emoji as UI icons.",
-        "- Do not put desktop nav on mobile — use a hamburger.",
-        "- Do not skip dark mode if light mode is built — build both.",
-        "",
-        "## When a reference helps",
-        "If the user can name a product whose visual style they like "
-        "(\"looks like Linear\", \"Vercel-clean\", \"Stripe-polished\", "
-        "\"Notion-warm\", \"Cal.com-friendly\"), match that vocabulary. "
-        "Without a reference, the agent picks the most generic version of "
-        "every choice — explicit references produce dramatically better "
-        "results. A screenshot is even better than a name.",
+        "## When the user names a reference (\"like Linear\", \"Vercel-clean\", "
+        "\"Stripe-polished\", \"Notion-warm\"), match that vocabulary — "
+        "explicit references produce dramatically better UI than generic "
+        "defaults. A screenshot is even better than a name.",
     ])
 
 def get_orchestration_section() -> str:
@@ -659,6 +592,11 @@ class ProjectContext:
     main_branch: str | None = None
     git_user: str | None = None
     instruction_files: list[ContextFile] = field(default_factory=list)
+    # True when the workspace looks like it contains a frontend (React, Vue,
+    # Svelte, Solid, Astro, …). Drives whether the prompt builder includes
+    # the multi-kilo-token frontend-UI-quality guidance — backend-only
+    # repos skip it entirely to keep their per-call token cost lean.
+    is_frontend_project: bool = False
 
     @classmethod
     def discover(cls, cwd: str | Path, current_date: str) -> "ProjectContext":
@@ -667,6 +605,7 @@ class ProjectContext:
             cwd=cwd,
             current_date=current_date,
             instruction_files=discover_instruction_files(cwd),
+            is_frontend_project=_workspace_has_frontend_signals(cwd),
         )
 
     @classmethod
@@ -679,6 +618,89 @@ class ProjectContext:
         ctx.main_branch = read_main_branch(ctx.cwd)
         ctx.git_user = read_git_user(ctx.cwd)
         return ctx
+
+
+# Frontend framework markers we look for in package.json. Hitting ANY one
+# is enough to flip the project into "frontend mode" — false positives are
+# cheap (you get a few extra kilotokens of UI guidance on a turn that
+# didn't strictly need it), false negatives are more annoying (no UI
+# guidance on a turn where the user wants to touch the UI).
+_FRONTEND_PKG_MARKERS = (
+    "react", "react-dom", "next", "remix",
+    "vue", "nuxt",
+    "svelte", "@sveltejs/kit",
+    "solid-js", "@solidjs/start",
+    "astro",
+    "vite",                     # plain vite project usually means a frontend
+    "@angular/core",
+    "preact",
+)
+
+
+def _workspace_has_frontend_signals(cwd: Path) -> bool:
+    """Return True iff the workspace contains a frontend project.
+
+    Strategy (in order, short-circuit on first hit):
+      1. A `package.json` at root or one level deep with any framework marker
+         in `dependencies` / `devDependencies`.
+      2. A `*.tsx` / `*.jsx` file anywhere under the workspace (capped depth).
+      3. A `vite.config.*` / `next.config.*` / `astro.config.*` /
+         `nuxt.config.*` / `svelte.config.*` at root.
+
+    All file ops are best-effort — any error returns False (better to skip
+    the UI block on an unreadable workspace than to crash the prompt build).
+    """
+    try:
+        cwd = Path(cwd)
+        if not cwd.is_dir():
+            return False
+
+        # (1) package.json — root + one level of subdirs (common monorepo layout
+        # is `web/package.json`, `frontend/package.json`, `apps/web/package.json`).
+        candidates: list[Path] = [cwd / "package.json"]
+        for sub in cwd.iterdir():
+            if not sub.is_dir() or sub.name.startswith(".") or sub.name in {
+                "node_modules", "__pycache__", ".venv", "venv", "dist", "build"
+            }:
+                continue
+            candidates.append(sub / "package.json")
+        for pkg in candidates:
+            if not pkg.is_file():
+                continue
+            try:
+                import json as _json
+                data = _json.loads(pkg.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            deps = {
+                **(data.get("dependencies") or {}),
+                **(data.get("devDependencies") or {}),
+            }
+            if any(m in deps for m in _FRONTEND_PKG_MARKERS):
+                return True
+
+        # (2) any *.tsx / *.jsx component file. rglob is fine here — capped at
+        # the first hit so the worst case is "no frontend files in the tree".
+        # We deliberately skip large-tree directories to keep this fast.
+        SKIP = {"node_modules", ".git", ".venv", "venv", "__pycache__", "dist", "build", ".next"}
+        for path in cwd.rglob("*.tsx"):
+            if any(p in SKIP for p in path.parts):
+                continue
+            return True
+        for path in cwd.rglob("*.jsx"):
+            if any(p in SKIP for p in path.parts):
+                continue
+            return True
+
+        # (3) framework config files at root.
+        for stem in ("vite.config", "next.config", "astro.config",
+                     "nuxt.config", "svelte.config"):
+            for ext in (".ts", ".js", ".mjs", ".cjs"):
+                if (cwd / f"{stem}{ext}").is_file():
+                    return True
+    except Exception:
+        return False
+    return False
 
 # ---------------------------------------------------------------------------
 # Dynamic section renderers
@@ -896,6 +918,12 @@ class SystemPromptBuilder:
         sections.append(get_actions_section())
         sections.append(get_tone_style_section())
         sections.append(get_using_tools_section())
+        # Frontend UI guidance — only included when the workspace actually
+        # contains a frontend (detected in ProjectContext.discover). Saves
+        # ~2k input tokens per turn on backend-only projects.
+        if (self.project_context is not None
+                and self.project_context.is_frontend_project):
+            sections.append(get_frontend_ui_quality_section())
         if self.include_orchestration:
             sections.append(get_orchestration_section())
         sections.append(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)

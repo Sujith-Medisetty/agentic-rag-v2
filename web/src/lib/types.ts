@@ -99,6 +99,10 @@ export interface AgentRecord {
   tools: ToolEvent[];
   liveInputTokens: number;
   liveOutputTokens: number;
+  // Per-LLM-call breakdown for THIS sub-agent — one entry per `token_update`
+  // event stamped with this agent_id. Lets the UI show "the sub-agent made N
+  // model calls, each cost X tokens".
+  llmCalls: LlmCall[];
 }
 
 export type FileChangeKind = "create" | "edit";
@@ -182,7 +186,17 @@ export type TimelineBlock =
   | { id: string; kind: "tool";     toolId: string;  ts: number }
   | { id: string; kind: "agent";    agentId: string; ts: number }
   | { id: string; kind: "file";     file: FileChange }
-  | { id: string; kind: "commit";   commit: CommitRecord };
+  | { id: string; kind: "commit";   commit: CommitRecord }
+  | { id: string; kind: "llm_call"; ts: number; inputTokens: number; outputTokens: number };
+
+// Per-LLM-call record kept INSIDE an AgentRecord so a sub-agent's individual
+// iterations show up nested under it (orchestrator's calls live in
+// `turn.blocks` as `llm_call` entries instead).
+export interface LlmCall {
+  ts: number;
+  inputTokens: number;
+  outputTokens: number;
+}
 
 // Pinned-header session totals computed by summing per-turn metrics.
 export interface SessionTotals {

@@ -197,6 +197,14 @@ class WebReporter(ProgressReporter):
     def _pub(self, kind: str, payload: dict) -> None:
         if self.agent_id:
             payload = {**payload, "agent_id": self.agent_id}
+            # Sub-agent progress signal — every event from a tagged reporter
+            # (tool_start, tool_done, token_update, etc.) means the sub-agent
+            # is still productively working, so the idle watchdog resets.
+            try:
+                from tools.multi_agent import note_agent_progress
+                note_agent_progress(self.agent_id)
+            except Exception:
+                pass
         self._bus.publish(kind, payload)
 
     # ---- ProgressReporter methods ---------------------------------------
