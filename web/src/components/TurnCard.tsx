@@ -34,6 +34,7 @@ import type {
   Turn, ToolEvent, FileChange, AgentRecord, CommitRecord, TimelineBlock,
 } from "@/lib/types";
 import TurnFooter from "@/components/TurnFooter";
+import Markdown from "@/components/Markdown";
 import { formatDuration } from "@/lib/format";
 
 // ============================================================================
@@ -128,14 +129,15 @@ function TimelineBlockRow({
 }
 
 // ============================================================================
-// TextBlockView — response prose. Sans, readable, no chrome.
+// TextBlockView — response prose, rendered as markdown so headings, bold,
+// tables, code blocks, etc. format correctly instead of showing raw syntax.
 // ============================================================================
 
 function TextBlockView({ text, isStreaming }: { text: string; isStreaming: boolean }) {
   return (
-    <div className="whitespace-pre-wrap font-sans text-[14px] leading-relaxed text-text">
-      {text}
-      {isStreaming && <span className="stream-dot ml-1.5" />}
+    <div className="relative">
+      <Markdown text={text} />
+      {isStreaming && <span className="stream-dot ml-1.5 align-middle" />}
     </div>
   );
 }
