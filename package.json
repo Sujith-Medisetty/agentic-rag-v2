@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "stockfish.wasm": "^0.10.0"
+  }
+}

@@ -16,7 +16,7 @@ old messages → continue.
 import os
 from pathlib import Path
 from typing import Any
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
 
@@ -138,17 +138,31 @@ def _compact_messages(messages: list) -> list:
 
     cut = len(messages) - PRESERVE_RECENT
 
-    # never split a tool-use / tool-result pair
+    # Never split a tool-use / tool-result pair. Two equivalent shapes to
+    # detect:
+    #   - Anthropic: a single message whose content list contains a
+    #     `tool_result` block (paired with the preceding `tool_use` block).
+    #   - OpenAI / MiniMax: a separate ToolMessage object whose
+    #     `tool_call_id` points back to a tool_calls entry on the preceding
+    #     AIMessage.
+    # Without the OpenAI-shape check, compaction summarised the AIMessage
+    # away while leaving the ToolMessage in the kept tail, producing the
+    # MiniMax error "tool result's tool id(call_function_xxx) not found".
+    # Walk the cut backwards past either shape so each tool result stays
+    # paired with the AIMessage that issued the tool_call.
     while cut > 0:
         msg = messages[cut]
+        if isinstance(msg, ToolMessage):
+            cut -= 1
+            continue
         content = msg.content if hasattr(msg, "content") else []
         if isinstance(content, list) and any(
             isinstance(b, dict) and b.get("type") == "tool_result"
             for b in content
         ):
             cut -= 1
-        else:
-            break
+            continue
+        break
 
     to_summarise = messages[:cut]
     to_keep = messages[cut:]
