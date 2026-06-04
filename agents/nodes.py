@@ -208,6 +208,20 @@ def _tools() -> list:
     return get_all_tools() + _mcp_tools
 
 
+def _llm_request_timeout() -> float:
+    # Hard per-call timeout for ANY single LLM request. Without this, a
+    # silent provider stall (Anthropic/OpenAI infra hiccup, dropped TCP
+    # connection, slow streaming response) would sit forever in the worker
+    # thread — the UI freezes, the cancel button only closes the asyncio
+    # task while the thread stays blocked on the socket read. With a
+    # timeout, the model raises, the agent loop catches it, and the turn
+    # closes cleanly via the existing error path.
+    try:
+        return float(os.getenv("AGENT_LLM_TIMEOUT_SECS", "300"))
+    except ValueError:
+        return 300.0
+
+
 def _get_llm(
     *,
     provider: str | None = None,
@@ -231,9 +245,12 @@ def _get_llm(
     eff_provider = (provider or _provider).lower()
     eff_model    = model or _model
     eff_thinking = _thinking if thinking is None else thinking
+    timeout      = _llm_request_timeout()
 
     if eff_provider == "anthropic":
-        kwargs: dict = {"model": eff_model, "streaming": streaming}
+        kwargs: dict = {
+            "model": eff_model, "streaming": streaming, "timeout": timeout,
+        }
         if eff_thinking:
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": _thinking_budget}
         return ChatAnthropic(**kwargs)
@@ -250,7 +267,8 @@ def _get_llm(
             )
         base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
         return ChatOpenAI(
-            model=eff_model, api_key=api_key, base_url=base_url, streaming=streaming,
+            model=eff_model, api_key=api_key, base_url=base_url,
+            streaming=streaming, timeout=timeout,
         )
 
     if eff_provider in ("openai-compatible", "openai"):
@@ -263,7 +281,10 @@ def _get_llm(
             raise RuntimeError(
                 "AGENT_API_KEY (or OPENAI_API_KEY) is not set for openai-compatible provider."
             )
-        kwargs = {"model": eff_model, "api_key": api_key, "streaming": streaming}
+        kwargs = {
+            "model": eff_model, "api_key": api_key,
+            "streaming": streaming, "timeout": timeout,
+        }
         if base_url:
             kwargs["base_url"] = base_url
         return ChatOpenAI(**kwargs)
