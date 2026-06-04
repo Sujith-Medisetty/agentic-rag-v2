@@ -132,6 +132,7 @@ export interface ToolEvent {
   tool: string;
   target?: string;
   preview?: string;
+  previewTruncated?: boolean;   // true when the backend capped the preview (rare; outputs > ~100KB)
   status: "running" | "done" | "error";
   startedAt: number;
   endedAt?: number;             // set when tool_done lands; used to show duration

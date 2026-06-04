@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import os
 import re
 import time
 from pathlib import Path
@@ -38,12 +39,27 @@ from server.git_autocommit import (
 from server.reporter import WebReporter, get_bus
 
 
+def _default_max_iterations() -> int:
+    # Unlimited by default — this is an autonomous coding agent, and a hard
+    # iteration cap was cutting off legitimate long builds mid-way. The real
+    # safety net is elsewhere:
+    #   - no_progress_limit=8 catches actual stalls (8 identical tool calls)
+    #   - per-LLM-call timeout catches model hangs
+    #   - the cancel button is your manual escape hatch
+    # If you DO want a cap (e.g. cost control in a deployment), set
+    # AGENT_MAX_ITERATIONS to a positive integer. 0 or unset = no cap.
+    try:
+        return max(0, int(os.getenv("AGENT_MAX_ITERATIONS", "0")))
+    except ValueError:
+        return 0
+
+
 async def run_turn(
     session_id: str,
     project_id: str,
     workspace: str,
     user_prompt: str,
-    max_iterations: int = 50,
+    max_iterations: int | None = None,
 ) -> None:
     """Persist the user message, run one agent turn end-to-end, persist the
     final assistant text. Designed to be fire-and-forgotten from the HTTP
@@ -57,6 +73,8 @@ async def run_turn(
       the live counters forever; that's how the "still counting after
       error" bug previously happened.
     """
+    if max_iterations is None:
+        max_iterations = _default_max_iterations()
     # Persist the user message immediately so the chat history is up to date
     # even before the model produces anything.
     db.append_message(session_id, "user", user_prompt)

@@ -47,7 +47,17 @@ def execute_bash(input: BashInput) -> BashOutput:
     return _run_foreground(input.command, input.timeout)
 
 
-_DEFAULT_BASH_TIMEOUT_MS = 60_000   # 60s — model can override via the `timeout` arg
+# 60s was too tight: `npm install`, `pip install`, `vite build`, etc. routinely
+# run 1-3 minutes and were getting killed mid-execution — the agent then burned
+# iterations retrying. 180s default covers normal package installs and builds;
+# the model can still pass a smaller timeout for fast commands or a bigger one
+# (up to the hard ceiling) for slow installs. Override via env var.
+def _default_bash_timeout_ms() -> int:
+    try:
+        return max(1_000, int(os.getenv("AGENT_BASH_DEFAULT_TIMEOUT_MS", "180000")))
+    except ValueError:
+        return 180_000
+
 _HARD_BASH_TIMEOUT_MS    = 600_000  # 10m — absolute ceiling, even if the model asks for more
 
 
@@ -61,7 +71,7 @@ def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
     exactly the 14-minute hang we hit before. Better to fail loud at the
     timeout boundary and let the loop recover than to wait forever.
     """
-    effective_ms = timeout_ms if timeout_ms else _DEFAULT_BASH_TIMEOUT_MS
+    effective_ms = timeout_ms if timeout_ms else _default_bash_timeout_ms()
     effective_ms = max(1_000, min(effective_ms, _HARD_BASH_TIMEOUT_MS))
     timeout_secs = effective_ms / 1000.0
 

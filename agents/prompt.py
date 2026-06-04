@@ -148,9 +148,17 @@ def get_using_tools_section() -> str:
         "Only sequence calls when a later call genuinely depends on an "
         "earlier result.",
         " - Use `TodoWrite` to plan multi-step work (3+ distinct steps) and "
-        "update it as you go. Mark each item `completed` the moment it's "
-        "done — do not batch completions at the end. Skip TodoWrite for "
-        "trivial single-step requests.",
+        "update it as you go. Skip TodoWrite for trivial single-step requests.",
+        " - TodoWrite update cadence is STRICT: the user is watching a live "
+        "progress widget, and batched updates make it jump (e.g. 1 in-progress → "
+        "suddenly all 3 done). Emit a separate TodoWrite call AT EACH of these "
+        "transitions: (a) when you start an item, mark it `in_progress`; "
+        "(b) when you start MULTIPLE items in parallel, mark all of them "
+        "`in_progress` in ONE TodoWrite call so the user sees them as a parallel "
+        "batch; (c) when ANY item completes, immediately emit a TodoWrite call "
+        "marking THAT item `completed` — even if other items in the batch are "
+        "still running. Do not wait until all parallel items finish to update. "
+        "One completion = one TodoWrite call.",
         " - Read before you edit. `edit_file` requires the file to have been "
         "read this conversation, and your `old_string` must match the file "
         "exactly (whitespace included). When in doubt, read the surrounding "

@@ -316,6 +316,7 @@ export default function ChatPage() {
         const toolName = String(p.tool ?? "?");
         const isError = !!p.error;
         const preview = typeof p.preview === "string" ? p.preview : undefined;
+        const previewTruncated = !!p.preview_truncated;
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
         setCurrentTurn((curr) => {
           if (!curr) return curr;
@@ -327,6 +328,7 @@ export default function ChatPage() {
                   ...next[i],
                   status: isError ? "error" : "done",
                   preview,
+                  previewTruncated,
                   endedAt: ev.ts,
                 };
                 break;
@@ -1052,6 +1054,7 @@ function rebuildTranscript(events: LiveEvent[]): {
               ...list[i],
               status: p.error ? "error" : "done",
               preview: typeof p.preview === "string" ? p.preview : undefined,
+              previewTruncated: !!p.preview_truncated,
               endedAt: ev.ts,
             };
             break;

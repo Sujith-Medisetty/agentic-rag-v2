@@ -212,8 +212,19 @@ class WebReporter(ProgressReporter):
         self._pub("tool_start", {"tool": tool, "target": target[:200]})
 
     def tool_done(self, tool: str, preview: str = "", error: bool = False) -> None:
+        # Cap is generous (~100KB) so "expand" in the UI actually shows the full
+        # output for normal tool runs (npm install, vite build, file reads,
+        # test logs all fit). Without a generous cap, the collapsed/expanded
+        # toggle was a lie — both views showed the same truncated string.
+        # Outputs above the cap are extremely rare for tool calls; truncating
+        # there is reasonable since a human can't usefully skim 100KB anyway.
+        # The model still sees the full untruncated tool result regardless.
+        MAX_PREVIEW_CHARS = 100_000
         self._pub("tool_done", {
-            "tool": tool, "preview": preview[:500], "error": error,
+            "tool": tool,
+            "preview": preview[:MAX_PREVIEW_CHARS],
+            "preview_truncated": len(preview) > MAX_PREVIEW_CHARS,
+            "error": error,
         })
 
     def message(self, text: str) -> None:

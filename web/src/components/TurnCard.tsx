@@ -399,9 +399,16 @@ function ToolNode({ tool }: { tool: ToolEvent }) {
             )}
           </div>
           {expanded && (
-            <pre className="mx-5 mt-1 max-h-72 overflow-auto rounded border border-border bg-bg p-2 whitespace-pre-wrap break-words font-mono text-tx-xs leading-snug text-text">
-              {preview}
-            </pre>
+            <>
+              <pre className="mx-5 mt-1 max-h-72 overflow-auto rounded border border-border bg-bg p-2 whitespace-pre-wrap break-words font-mono text-tx-xs leading-snug text-text">
+                {preview}
+              </pre>
+              {tool.previewTruncated && (
+                <div className="mx-5 mt-1 font-sans text-tx-xs text-muted">
+                  output was truncated — full result is in the model's context
+                </div>
+              )}
+            </>
           )}
         </>
       )}
