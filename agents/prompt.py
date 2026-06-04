@@ -247,6 +247,62 @@ def get_frontend_ui_quality_section() -> str:
         "- If marketing/landing exists, build a public `/welcome` (hero + "
         "3-column feature grid that stacks on mobile + primary CTA).",
         "",
+        "## PWA & installable on mobile (mandatory for every app)",
+        "- Every user-facing app is a PWA, no exceptions. Same codebase runs "
+        "as a website on desktop AND installs as a native-feel app on "
+        "phones. Do not ask the user to pick mobile/web/both — ship both "
+        "from one codebase, mobile-first.",
+        "- **manifest.json** at the public root: `name` (full title), "
+        "`short_name` (≤12 chars, the home-screen label), "
+        "`display: \"standalone\"` (kills browser chrome on launch), "
+        "`theme_color` matching the app's top bar, `background_color` for "
+        "the splash, `start_url: \"/\"`, `scope: \"/\"`, and `icons` at BOTH "
+        "192×192 and 512×512 PNG.",
+        "- **Service worker** registered on first load (Workbox or "
+        "hand-rolled). Without it, the browser will NOT mark the app as "
+        "installable and the install prompt will never fire.",
+        "- **Install banner** wired into the UI from day one. "
+        "Android Chrome: intercept `BeforeInstallPromptEvent`, show a "
+        "prominent 'Install' button, call `prompt()` on tap — one-tap "
+        "install. iOS Safari (no API): detect `navigator.standalone === "
+        "false` + iOS user agent, show a dismissible inline guide ('Tap the "
+        "Share icon → Add to Home Screen') with a small diagram. Never "
+        "leave the user to discover install on their own.",
+        "- **Native-feel chrome when installed**: `<meta name=\"theme-color\">` "
+        "matched to the app's top color so the iOS notch / Android status "
+        "bar blends; `<meta name=\"apple-mobile-web-app-capable\" "
+        "content=\"yes\">` and `apple-mobile-web-app-status-bar-style` so "
+        "iOS hides Safari chrome; apple-touch-icon link tags at the right "
+        "sizes. Launched from the home-screen icon, the app must show no "
+        "URL bar, no back/forward, no browser UI — only the app itself.",
+        "- **Desktop is responsive, mobile is native-feeling.** Same code, "
+        "different surfaces: at ≥768px render the desktop layout (sidebar, "
+        "multi-column, hover affordances, keyboard shortcuts); at <768px "
+        "render the mobile layout (bottom tab bar, full-bleed content, "
+        "sticky bottom action bars, swipe where natural, no hover-only "
+        "interactions). On install, the mobile layout is what the user "
+        "sees full-screen.",
+        "- **Refuse-and-explain when a PWA can't deliver.** Some requests "
+        "genuinely exceed PWA capabilities: deep camera/AR pipelines (iOS "
+        "gates this severely), Bluetooth/USB on iOS, background sync on "
+        "iOS, real native push pre-iOS 16.4, multi-GB on-device media "
+        "libraries with no eviction risk, App Store / Play Store "
+        "distribution. In those cases, DO NOT silently switch to React "
+        "Native / Expo / Flutter and DO NOT half-deliver a degraded PWA "
+        "version. State the limit plainly, propose a simpler scope that "
+        "fits PWA constraints, and let the user decide. The user has "
+        "explicitly chosen PWA as the single deliverable target.",
+        "- **Data storage stays server-side by default.** Do NOT introduce "
+        "IndexedDB / sql.js / Dexie as the primary store unless the user "
+        "explicitly asks for offline-first / local-first behavior. Use "
+        "`localStorage` only for tiny UI prefs (theme, last-route, "
+        "dismissed banners). The server's REST/WebSocket API is the source "
+        "of truth.",
+        "- **App naming**: pick a short memorable name (≤12 chars for "
+        "`short_name`), write it into `manifest.json`, and surface it in "
+        "the end-of-turn summary so the user knows what will appear on "
+        "their home screen icon after install.",
+        "",
         "## Polish (the difference between 'works' and 'shippable')",
         "- Skeleton placeholders shaped like the real content (same height, "
         "width, line count) — never a `Loading…` string.",
