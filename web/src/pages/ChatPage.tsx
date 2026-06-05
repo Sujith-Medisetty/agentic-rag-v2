@@ -955,7 +955,7 @@ export default function ChatPage() {
 
       {/* Sticky plan panel — turn-independent state */}
       <PlanPanel items={plan} />
-      {previewUrl && <PreviewBanner url={previewUrl} sessionId={sessionId ?? ""} sessionName={turns[0]?.userPrompt ?? "app"} onDismiss={() => setPreviewUrl(null)} />}
+      {previewUrl && <PreviewBanner url={previewUrl} sessionId={sessionId ?? ""} sessionName={turns[0]?.userPrompt ?? "app"} turnInProgress={!!currentTurn?.isStreaming} onDismiss={() => setPreviewUrl(null)} />}
 
       {/* Debug stream — floating raw WS event log. Use to diagnose live-event
           delivery: if events appear here in real time but the transcript
@@ -1946,8 +1946,11 @@ function DebugStream({
 // ============================================================================
 
 function PreviewBanner({
-  url, sessionId, sessionName, onDismiss,
-}: { url: string; sessionId: string; sessionName: string; onDismiss: () => void }) {
+  url, sessionId, sessionName, turnInProgress, onDismiss,
+}: {
+  url: string; sessionId: string; sessionName: string;
+  turnInProgress: boolean; onDismiss: () => void;
+}) {
   // Resolve relative URLs to the current origin so the banner works on
   // any deployment (localhost dev, forge.karmacode.cloud, etc.).
   const fullUrl = url.startsWith("http")
@@ -1965,6 +1968,18 @@ function PreviewBanner({
     .replace(/-{2,}/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 32) || "app";
+
+  // Remember the LAST slug this session was deployed to, so when the agent
+  // rebuilds (user asked for changes) we offer "Update <slug>" instead of
+  // a fresh deploy. Keyed per session in localStorage so the memory survives
+  // page reloads. Cleared on take-down (handled by Admin page).
+  const LAST_SLUG_KEY = `ojas.last-deployed-slug:${sessionId}`;
+  const initialLastSlug = (() => {
+    try { return localStorage.getItem(LAST_SLUG_KEY) || ""; }
+    catch { return ""; }
+  })();
+  const [lastDeployedSlug, setLastDeployedSlug] = useState<string>(initialLastSlug);
+
   const [picking, setPicking] = useState(false);
   const [slugInput, setSlugInput] = useState(suggestedSlug);
   const [deploying, setDeploying] = useState(false);
@@ -1973,16 +1988,28 @@ function PreviewBanner({
   const [deployErr, setDeployErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  const submitDeploy = async () => {
+  // When a fresh build lands AFTER a prior deploy, the deployed URL out
+  // there is stale. Clear the "deployed" success state so the banner
+  // surfaces the Update button again. Triggered whenever url (preview
+  // path mtime) changes.
+  useEffect(() => {
+    setDeployedUrl(null);
+    setDeployedSlug(null);
+    setDeployErr(null);
+  }, [url]);
+
+  const doDeploy = async (overrideSlug?: string) => {
     if (!sessionId || deploying) return;
     setDeploying(true);
     setDeployErr(null);
     try {
       const res = await (await import("@/lib/api")).sessionApi.deploy(
-        sessionId, slugInput.trim() || undefined,
+        sessionId, overrideSlug ?? (slugInput.trim() || undefined),
       );
       setDeployedSlug(res.slug);
       setDeployedUrl(res.url);
+      setLastDeployedSlug(res.slug);
+      try { localStorage.setItem(LAST_SLUG_KEY, res.slug); } catch {}
       setPicking(false);
     } catch (e: any) {
       setDeployErr(e?.message ?? "deploy failed");
@@ -1992,13 +2019,31 @@ function PreviewBanner({
   };
 
   const copyDeployedUrl = async () => {
-    if (!deployedUrl) return;
+    const u = deployedUrl ?? (lastDeployedSlug
+      ? `${window.location.origin}/apps/${lastDeployedSlug}/` : null);
+    if (!u) return;
     try {
-      await navigator.clipboard.writeText(deployedUrl);
+      await navigator.clipboard.writeText(u);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {}
   };
+
+  // The big gating rule: Deploy/Update is offered ONLY when the turn has
+  // ended. While the agent is still streaming, the dist/ on disk may be a
+  // mid-build state (vite writes assets, then index.html, then sw.js — a
+  // partial copy at any moment is a broken app). Showing the button only
+  // after isStreaming flips to false guarantees TWO signals agree:
+  //   1. backend watcher: 'dist/index.html exists' (already emitted url)
+  //   2. agent: 'turn complete' (no more events coming)
+  const buildReady = !turnInProgress;
+
+  // What primary action to show:
+  //   - Already deployed this session AND a fresh build is ready → "Update <slug>"
+  //   - Never deployed yet OR took-down → "Deploy"
+  //   - Just deployed in this turn (deployedUrl set) → Copy + Open
+  const showUpdate = buildReady && !deployedUrl && lastDeployedSlug;
+  const showDeploy = buildReady && !deployedUrl && !lastDeployedSlug;
 
   return (
     <div className="border-b border-accent/25 bg-accent/10 px-4 py-2.5">
@@ -2012,13 +2057,25 @@ function PreviewBanner({
           </span>
           <div className="min-w-0">
             <div className="text-sm font-semibold text-text">
-              {deployedUrl ? "App deployed" : "Preview ready"}
+              {deployedUrl
+                ? "App deployed"
+                : (turnInProgress
+                    ? "Build in progress…"
+                    : (lastDeployedSlug
+                        ? "New build ready — Update to push it live"
+                        : "Preview ready"))}
             </div>
             <div
               className="truncate font-mono text-tx-xs text-muted"
-              title={deployedUrl ?? fullUrl}
+              title={deployedUrl
+                ?? (lastDeployedSlug
+                  ? `${window.location.origin}/apps/${lastDeployedSlug}/`
+                  : fullUrl)}
             >
-              {deployedUrl ?? fullUrl}
+              {deployedUrl
+                ?? (lastDeployedSlug
+                  ? `${window.location.origin}/apps/${lastDeployedSlug}/`
+                  : fullUrl)}
             </div>
           </div>
         </div>
@@ -2050,19 +2107,40 @@ function PreviewBanner({
                 target="_blank"
                 rel="noreferrer"
                 className="btn-ghost min-h-touch"
-                title="Open the built app in a new tab"
+                title="Open the live preview (this URL is tied to this session)"
               >
-                Open
+                Preview
               </a>
-              <button
-                type="button"
-                disabled={!sessionId || deploying}
-                onClick={() => setPicking(true)}
-                className="btn-primary min-h-touch"
-                title="Promote this build to a permanent installable URL at /apps/<slug>/. Survives session delete + backend restart."
-              >
-                🚀 Deploy
-              </button>
+              {showUpdate && (
+                <button
+                  type="button"
+                  disabled={!sessionId || deploying}
+                  onClick={() => doDeploy(lastDeployedSlug)}
+                  className="btn-primary min-h-touch"
+                  title={`Atomically swap the live app at /apps/${lastDeployedSlug}/ with this build`}
+                >
+                  {deploying ? "Updating…" : `🔄 Update ${lastDeployedSlug}`}
+                </button>
+              )}
+              {showDeploy && (
+                <button
+                  type="button"
+                  disabled={!sessionId || deploying}
+                  onClick={() => setPicking(true)}
+                  className="btn-primary min-h-touch"
+                  title="Promote this build to a permanent installable URL at /apps/<slug>/."
+                >
+                  🚀 Deploy
+                </button>
+              )}
+              {turnInProgress && (
+                <span
+                  className="text-tx-xs text-muted"
+                  title="Deploy is disabled until the agent finishes the current turn — partial builds can produce broken apps."
+                >
+                  Build in progress…
+                </span>
+              )}
             </>
           )}
           <button
@@ -2107,7 +2185,7 @@ function PreviewBanner({
               <button
                 type="button"
                 disabled={deploying}
-                onClick={submitDeploy}
+                onClick={() => doDeploy()}
                 className="btn-primary min-h-touch"
               >
                 {deploying ? "Deploying…" : "Deploy"}
@@ -2132,7 +2210,13 @@ function PreviewBanner({
         </div>
       )}
 
-      {!deployedUrl && isIOS && (
+      {showUpdate && deployErr && (
+        <div className="mx-auto mt-1.5 max-w-4xl rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+          {deployErr}
+        </div>
+      )}
+
+      {!deployedUrl && !showDeploy && !showUpdate && !turnInProgress && isIOS && (
         <div className="mx-auto mt-1.5 max-w-4xl text-tx-xs text-muted">
           iOS: after opening, tap the Share icon at the bottom, then
           “Add to Home Screen”.
