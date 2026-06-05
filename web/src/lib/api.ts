@@ -228,6 +228,49 @@ export const sessionsApi = {
       method: "PATCH",
       body: JSON.stringify({ new_name: newName }),
     }),
+  /** Like `rename` but also returns the X-Was-Suffixed / X-Actual-Name
+   *  headers so the UI can show a toast when the server auto-suffixed
+   *  the name to avoid a collision. */
+  renameWithSufStatus: async (
+    sessionId: string,
+    newName: string,
+  ): Promise<{
+    session: Session;
+    wasSuffixed: boolean;
+    actualName: string;
+  }> => {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ new_name: newName }),
+      },
+    );
+    if (res.status === 401) {
+      clearToken();
+      throw new ApiError(401, "unauthenticated");
+    }
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        detail = body.detail ?? detail;
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(res.status, detail);
+    }
+    const session = (await res.json()) as Session;
+    const wasSuffixed = res.headers.get("X-Was-Suffixed") === "true";
+    const actualName = res.headers.get("X-Actual-Name") ?? session.name;
+    return { session, wasSuffixed, actualName };
+  },
   remove: (sessionId: string) =>
     request<{ ok: true }>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",

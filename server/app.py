@@ -69,8 +69,8 @@ except ImportError:
     pass   # dotenv not installed — fall back to shell env only
 
 from fastapi import (
-    Depends, FastAPI, HTTPException, Header, Query, Request, WebSocket,
-    WebSocketDisconnect, status,
+    Depends, FastAPI, HTTPException, Header, Query, Request, Response,
+    WebSocket, WebSocketDisconnect, status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -889,28 +889,42 @@ def sessions_delete(session_id: str, user: dict = Depends(require_user)):
 @app.patch("/api/sessions/{session_id}", response_model=SessionResponse)
 def sessions_rename(
     session_id: str,
+    response: Response,
     req: SessionRenameRequest,
     user: dict = Depends(require_user),
 ):
-    """Rename a session. The new name must be unique within the session's
-    project (case-sensitive). On collision, returns 409 with the existing
-    session's id so the UI can offer to jump to it instead."""
+    """Rename a session. On collision, the new name is auto-suffixed with
+    "-2", "-3", etc. (so the user never has to manually disambiguate).
+
+    The response includes two non-standard headers so the UI can show a
+    toast telling the user what happened:
+      X-Actual-Name:  the final name that ended up in the DB (may differ
+                      from `new_name` if auto-suffixed)
+      X-Was-Suffixed: "true" if auto-suffix kicked in, "false" otherwise
+
+    The body is the same SessionResponse shape as a normal success — the
+    `name` field already contains the actual final name."""
     session = _session_or_404(session_id, user)
+    desired = req.new_name
     try:
-        updated = db.rename_session(session_id, req.new_name)
-    except db.SessionNameConflict as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "error": "name_conflict",
-                "message": str(e),
-                "existing_session_id": e.existing_id,
-                "existing_session_name": e.existing_name,
-            },
-        ) from e
+        # First try the exact name (cheap path: no collision).
+        updated = db.rename_session(session_id, desired)
+        response.headers["X-Actual-Name"] = updated["name"]
+        response.headers["X-Was-Suffixed"] = "false"
+        return SessionResponse(**updated)
+    except db.SessionNameConflict:
+        # Auto-suffix: pick the next free variant ("X" → "X-2" → "X-3" …).
+        final = db.allocate_unique_session_name(
+            project_id=session["project_id"],
+            desired=desired,
+            exclude_id=session_id,
+        )
+        updated = db.rename_session(session_id, final)
+        response.headers["X-Actual-Name"] = updated["name"]
+        response.headers["X-Was-Suffixed"] = "true"
+        return SessionResponse(**updated)
     except LookupError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
-    return SessionResponse(**updated)
 
 
 @app.get("/api/paths/browse")

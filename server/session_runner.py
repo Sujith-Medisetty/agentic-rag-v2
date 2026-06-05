@@ -303,6 +303,19 @@ async def run_turn(
         cost_usd           = turn_cost,
     )
 
+    # Background LLM-suggested rename. After a turn finishes, if the
+    # session still has a default-looking name (e.g. "Session 6/5/2026,
+    # 10:34:21 PM" — the placeholder the project view creates), ask the
+    # LLM for a short, descriptive title and PATCH it. Best-effort +
+    # fire-and-forget: never blocks the turn flow, never raises into
+    # the turn lifecycle, never visible to the user if the LLM fails.
+    if not turn_failed:
+        try:
+            import asyncio as _aio
+            _aio.create_task(_maybe_auto_rename(session_id))
+        except Exception:
+            pass
+
     # Failed turns skip auto-commit — there might be half-written files,
     # and the user wants to see the failure rather than have it silently
     # committed.
@@ -484,3 +497,133 @@ def _load_claude_md(workspace: str) -> str:
             except OSError:
                 pass
     return "\n\n".join(parts)
+
+
+# =============================================================================
+# LLM-suggested session rename
+# =============================================================================
+# After a turn finishes, if the session still has a default name (e.g. the
+# "Session 6/5/2026, 10:34:21 PM" placeholder the project view creates), we
+# ask the LLM for a 3-5 word descriptive title and rename. Best-effort —
+# never raises, never blocks the turn, never visible to the user if the
+# LLM fails or times out.
+
+_AUTO_RENAME_DEFAULT_PREFIX = "Session "  # the placeholder the project view seeds
+_AUTO_RENAME_MAX = 1                       # at most 1 auto-rename per session
+_AUTO_RENAME_HISTORY: set[str] = set()     # session_ids already auto-renamed
+
+import asyncio as _asyncio
+import re as _re
+
+
+def _looks_like_default_name(name: str) -> bool:
+    """True for the placeholder "Session <date>, <time>" the project view
+    creates. We only auto-rename those — never overwrite a name the user
+    explicitly set (even if it's also generic, e.g. "test")."""
+    if not name:
+        return True
+    n = name.strip()
+    if not n.startswith(_AUTO_RENAME_DEFAULT_PREFIX):
+        return False
+    # "Session 6/5/2026, 10:34:21 PM" or "Session Jan 1, 2024 12:00 AM"
+    rest = n[len(_AUTO_RENAME_DEFAULT_PREFIX):].strip()
+    # Accept anything that has a comma (date, time pattern) or a slash
+    # (date with slashes) — i.e. looks like a timestamp.
+    return ("," in rest) or ("/" in rest) or bool(_re.search(r"\d", rest))
+
+
+async def _maybe_auto_rename(session_id: str) -> None:
+    """If the session is still on a default name, ask the LLM for a
+    descriptive title and rename. Idempotent: runs at most once per
+    session (tracked in _AUTO_RENAME_HISTORY so we don't burn tokens
+    on every subsequent turn if the rename failed)."""
+    if session_id in _AUTO_RENAME_HISTORY:
+        return
+    _AUTO_RENAME_HISTORY.add(session_id)
+    try:
+        sess = db.get_session(session_id)
+        if sess is None:
+            return
+        if not _looks_like_default_name(sess.get("name", "")):
+            return
+        # Pull the first user prompt + the first assistant response.
+        msgs = db.list_messages(session_id)
+        if not msgs:
+            return
+        first_user = next((m for m in msgs if m["role"] == "user"), None)
+        if first_user is None:
+            return
+        first_assistant = next(
+            (m for m in msgs if m["role"] == "assistant" and m.get("content")),
+            None,
+        )
+        if first_assistant is None:
+            return
+        # Compose a compact prompt for the LLM.
+        prompt_user = first_user["content"][:1000]
+        prompt_asst = first_assistant["content"][:1000]
+        suggest_prompt = (
+            "Based on the following exchange, suggest a concise, descriptive "
+            "title for this chat session. Reply with ONLY the title — no "
+            "quotes, no prefix, no punctuation at the end. 3-6 words. Title "
+            "Case. Do not use generic words like 'Session' or 'Chat'.\n\n"
+            f"USER:\n{prompt_user}\n\n"
+            f"ASSISTANT:\n{prompt_asst}\n\n"
+            "TITLE:"
+        )
+        title = await _call_llm_for_title(suggest_prompt)
+        if not title:
+            return
+        # Sanitize: strip quotes, collapse whitespace, cap length.
+        title = title.strip().strip('"').strip("'").strip("`")
+        title = _re.sub(r"\s+", " ", title).strip()
+        title = title.strip(".,;:!?-—–")
+        if not title or len(title) > 80:
+            return
+        # Reject if the LLM gave us back the default placeholder.
+        if _looks_like_default_name(title):
+            return
+        # Apply. The PATCH endpoint auto-suffixes on conflict, so we
+        # don't have to worry about duplicates here.
+        from server import db as _db
+        try:
+            final = _db.allocate_unique_session_name(
+                project_id=sess["project_id"],
+                desired=title,
+                exclude_id=session_id,
+            )
+            _db.rename_session(session_id, final)
+        except Exception:
+            pass
+    except Exception:
+        # Swallow everything — this is best-effort and must never bleed
+        # into the turn flow or the user's UI.
+        pass
+
+
+async def _call_llm_for_title(prompt: str) -> str | None:
+    """One-shot LLM call to generate a session title. Uses the same
+    model the agent is configured with so titles match the agent's
+    "voice". Bounded latency: 6 seconds max — if the model is slow, we
+    skip the rename rather than make the user wait."""
+    try:
+        from agents.nodes import _get_llm
+        # Non-streaming, no thinking — we just need the final string fast.
+        llm = _get_llm(streaming=False, thinking=False)
+        from langchain_core.messages import HumanMessage
+        # 6-second ceiling: titles are 1-shot, 3-5 tokens; no need to
+        # block longer than that.
+        coro = llm.ainvoke([HumanMessage(content=prompt)])
+        msg = await _asyncio.wait_for(coro, timeout=6.0)
+        # `msg.content` is either a string or a list of content blocks.
+        if isinstance(msg.content, str):
+            return msg.content
+        if isinstance(msg.content, list):
+            for block in msg.content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return block.get("text", "")
+                if hasattr(block, "text"):
+                    return block.text
+        return str(msg.content)
+    except Exception:
+        return None

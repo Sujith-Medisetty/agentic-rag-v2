@@ -435,7 +435,8 @@ class SessionNameConflict(ValueError):
 def rename_session(session_id: str, new_name: str) -> dict:
     """Rename a session. Returns the updated row. Raises:
       • SessionNameConflict if another session in the SAME project already
-        has `new_name` (case-sensitive, exact match)
+        has `new_name` (case-sensitive, exact match) — caller can call
+        allocate_unique_session_name to get a free variant
       • LookupError if no such session_id
     Renaming to the same name as the current name is a no-op (allowed)."""
     with _connect() as cx:
@@ -472,6 +473,35 @@ def rename_session(session_id: str, new_name: str) -> dict:
             (session_id,),
         ).fetchone()
     return dict(r)
+
+
+def allocate_unique_session_name(project_id: str, desired: str, exclude_id: str | None = None) -> str:
+    """Return a session name that doesn't collide with any other session
+    in `project_id`. If `desired` is free, returns it unchanged.
+    Otherwise appends "-2", "-3", ... until a free name is found.
+    Used by the PATCH endpoint to auto-suffix on user/agent renames
+    so the user never has to manually disambiguate.
+
+    The numeric suffix is appended with a hyphen to keep the base name
+    readable: "Fix login bug" → "Fix login bug-2" rather than the more
+    cryptic "Fix login bug 2" or "Fix login bug2"."""
+    with _connect() as cx:
+        existing_names = {
+            r["name"]
+            for r in cx.execute(
+                f"SELECT name FROM sessions WHERE project_id = ?"
+                f"{' AND id != ?' if exclude_id else ''}",
+                (project_id, exclude_id) if exclude_id else (project_id,),
+            ).fetchall()
+        }
+    if desired not in existing_names:
+        return desired
+    n = 2
+    while True:
+        candidate = f"{desired}-{n}"
+        if candidate not in existing_names:
+            return candidate
+        n += 1
 
 
 def touch_session(session_id: str) -> None:

@@ -43,6 +43,15 @@ export default function Workspace() {
     existingId: string;
     existingName: string;
   } | null>(null);
+  // Toast for auto-suffix notifications ("renamed to X because Y was
+  // taken"). Auto-dismisses after 4s. Used by both user-driven and
+  // agent-driven renames.
+  const [toast, setToast] = useState<{ kind: "info" | "warn"; message: string } | null>(null);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   useEffect(() => {
     if (editingId && editInputRef.current) {
@@ -138,21 +147,18 @@ export default function Workspace() {
     }
     setEditingBusy(true);
     try {
-      const updated = await sessionsApi.rename(s.id, trimmed);
-      setSessions((cur) => cur.map((x) => (x.id === s.id ? updated : x)));
+      const { session, wasSuffixed, actualName } =
+        await sessionsApi.renameWithSufStatus(s.id, trimmed);
+      setSessions((cur) => cur.map((x) => (x.id === s.id ? session : x)));
+      if (wasSuffixed && actualName !== trimmed) {
+        setToast({
+          kind: "info",
+          message: `Renamed to "${actualName}" — "${trimmed}" was already taken.`,
+        });
+      }
       cancelEdit();
     } catch (e: any) {
-      if (e instanceof ApiError && e.status === 409) {
-        let detail: any = null;
-        try { detail = JSON.parse(e.message); } catch { detail = null; }
-        setConflict({
-          desired: trimmed,
-          existingId: detail?.existing_session_id ?? "",
-          existingName: detail?.existing_session_name ?? "the existing session",
-        });
-      } else {
-        setLoadErr(e?.message ?? "rename failed");
-      }
+      setLoadErr(e?.message ?? "rename failed");
     } finally {
       setEditingBusy(false);
     }
@@ -459,6 +465,19 @@ export default function Workspace() {
           existingId={conflict.existingId}
           onClose={() => setConflict(null)}
         />
+      )}
+
+      {/* Auto-suffix toast — informs the user the server picked X-2/X-3
+          because their desired name was already taken. */}
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-info/40 bg-info/10 px-4 py-2 text-sm text-text shadow-lg backdrop-blur"
+        >
+          <span aria-hidden="true" className="mr-2">ℹ️</span>
+          {toast.message}
+        </div>
       )}
     </div>
   );
