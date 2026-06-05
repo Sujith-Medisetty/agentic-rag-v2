@@ -4,9 +4,12 @@
 // 5-line auto-register, but doing it manually lets us:
 //   - Avoid throwing on dev (where the SW is disabled by devOptions)
 //   - Catch and log registration errors (Safari is fussy about scopes)
-//   - Hook the autoUpdate flow so a fresh build silently activates
+//   - Surface "update available" to the UI instead of silently reloading
+//     (so the user knows their new code is live instead of wondering why
+//     the page just refreshed)
 //
-// Called once from src/main.tsx.
+// Called once from src/main.tsx. The update-available UI lives in
+// Layout.tsx and listens for the "ojas:sw-update" CustomEvent on window.
 
 import { Workbox } from "workbox-window";
 
@@ -16,17 +19,25 @@ export function registerSW(): void {
 
   const wb = new Workbox("/sw.js", { scope: "/" });
 
-  // autoUpdate strategy: when a new SW reports `waiting`, tell it to skip
-  // waiting and activate immediately. The next navigation will pick up the
-  // fresh assets — no user-visible reload prompt for v1.
-  wb.addEventListener("waiting", () => {
+  // A new SW has installed and is waiting. Notify the UI so it can show
+  // a "refresh to update" toast. We do NOT auto-skip-waiting here — the
+  // user clicking the toast is the explicit signal.
+  wb.addEventListener("waiting", (event) => {
+    const installing = (event as any).sw;
+    window.dispatchEvent(
+      new CustomEvent("ojas:sw-update", { detail: { sw: installing } }),
+    );
+  });
+
+  // User accepted the update (clicked the toast). Tell the waiting SW to
+  // skip waiting so it activates now. The `controlling` listener below
+  // will then reload the page to run the new bundle.
+  window.addEventListener("ojas:sw-apply", () => {
     wb.messageSkipWaiting();
   });
 
+  // New SW took control — reload so the page runs the fresh bundle.
   wb.addEventListener("controlling", () => {
-    // New SW took control — reload so the page runs the fresh bundle.
-    // This fires at most once per deployment and only if the user was already
-    // on the page when the SW updated (rare). The reload is silent and instant.
     window.location.reload();
   });
 

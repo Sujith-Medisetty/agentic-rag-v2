@@ -1641,7 +1641,16 @@ def apps_serve(slug: str, file_path: str = ""):
     """Static-serve a deployed app at /apps/<slug>/. NO auth — the URL is
     intentionally shareable so users can install the PWA on any device.
     Slugs are unguessable enough in practice (the alphanumeric space + the
-    fact that an app only exists if the owner explicitly deployed it)."""
+    fact that an app only exists if the owner explicitly deployed it).
+
+    Cache-Control: we send `no-cache, must-revalidate` so the BROWSER
+    revalidates on every request (sends If-Modified-Since / If-None-Match
+    and gets a 304 if the file hasn't changed), but still returns the
+    latest file when the user re-deploys. Without this, browsers will
+    happily keep serving a stale index.html for 5-10 minutes after a
+    re-deploy, which is the "I deployed but the app looks the same"
+    symptom users hit. The ETags/Last-Modified headers from FileResponse
+    give us cheap 304s when the file hasn't changed."""
     from fastapi.responses import FileResponse
     app = db.get_deployed_app(slug)
     if app is None:
@@ -1669,7 +1678,16 @@ def apps_serve(slug: str, file_path: str = ""):
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "app index.html missing",
             )
-    return FileResponse(target)
+    # Hash-bundled assets under /assets/ are content-addressed so they're
+    # safe to cache forever (the file name changes when the content does).
+    # For everything else (index.html, favicon, source maps, user assets)
+    # we force revalidation.
+    cache_control = (
+        "public, max-age=31536000, immutable"
+        if "/assets/" in str(target)
+        else "no-cache, must-revalidate"
+    )
+    return FileResponse(target, headers={"Cache-Control": cache_control})
 
 
 # ============================================================================

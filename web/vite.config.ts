@@ -50,14 +50,30 @@ export default defineConfig({
         // Don't pre-cache the API; always go to the network for it. Cache
         // static assets and the SPA shell so first paint is instant offline.
         navigateFallback: "/index.html",
-        navigateFallbackDenylist: [/^\/api\//],
+        navigateFallbackDenylist: [/^\/api\//, /^\/apps\//],
         runtimeCaching: [
           {
-            // The SPA shell + JS/CSS chunks
+            // HTML documents — NetworkFirst with a short fallback. This is
+            // the key change for "I deployed but it looks the same": the
+            // SPA shell now goes to the network FIRST on every navigation,
+            // so a re-deploy of the Ojas UI shows up on the very next
+            // navigation. Fallback to cache only if the network fails
+            // (true offline). A 3s network timeout keeps the UI snappy.
+            urlPattern: ({ request }) => request.destination === "document",
+            handler: "NetworkFirst",
+            options: {
+              cacheName: "app-shell-html",
+              networkTimeoutSeconds: 3,
+            },
+          },
+          {
+            // JS/CSS chunks — StaleWhileRevalidate is fine here because
+            // the build hashes them in the filename (`index-DdRZH3ez.js`),
+            // so a content change always means a new URL = a fresh fetch.
             urlPattern: ({ request }) =>
-              ["document", "script", "style", "worker"].includes(request.destination),
+              ["script", "style", "worker"].includes(request.destination),
             handler: "StaleWhileRevalidate",
-            options: { cacheName: "app-shell" },
+            options: { cacheName: "app-shell-assets" },
           },
           {
             urlPattern: ({ request }) =>
@@ -69,9 +85,18 @@ export default defineConfig({
             },
           },
           {
-            // API requests — always try the network. Phase 4 might queue
-            // failed POSTs for background sync, but not yet.
+            // API requests — always try the network.
             urlPattern: ({ url }) => url.pathname.startsWith("/api/"),
+            handler: "NetworkOnly",
+          },
+          {
+            // Deployed sub-apps at /apps/<slug>/* — never cache. The
+            // server already sends `Cache-Control: no-cache, must-revalidate`
+            // on these, but tell the SW to skip them entirely so a stale
+            // entry from a previous deploy can't haunt us. The browser's
+            // HTTP cache is still authoritative (with no-cache it always
+            // revalidates), and the SW doesn't second-guess it.
+            urlPattern: ({ url }) => url.pathname.startsWith("/apps/"),
             handler: "NetworkOnly",
           },
         ],

@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
 import { authApi } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
@@ -8,6 +9,18 @@ import { useTheme } from "@/lib/theme";
 // tablet+ (max-w-5xl). All controls hit ≥44pt targets.
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { effective, toggle } = useTheme();
+
+  // "New version available" toast. The SW registration code in
+  // src/pwa/registerSW.ts dispatches `ojas:sw-update` when a new service
+  // worker is waiting to take over. We show a fixed toast at the bottom
+  // of the screen with a refresh button — clicking it dispatches
+  // `ojas:sw-apply` which the SW handler picks up and skipWaits.
+  const [swUpdate, setSwUpdate] = useState(false);
+  useEffect(() => {
+    const onUpdate = () => setSwUpdate(true);
+    window.addEventListener("ojas:sw-update", onUpdate);
+    return () => window.removeEventListener("ojas:sw-update", onUpdate);
+  }, []);
 
   const logout = async () => {
     try { await authApi.logout(); } catch { /* clear either way */ }
@@ -58,6 +71,41 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         </div>
       </header>
       <main>{children}</main>
+
+      {/* Service worker update toast. Shows at the bottom-center when a
+          new Ojas version is waiting to take over. User clicks the button
+          to apply (skipWaiting + reload). Auto-applied would surprise the
+          user mid-typing — better to make it explicit. */}
+      {swUpdate && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed inset-x-0 bottom-4 z-50 mx-auto flex w-fit max-w-[calc(100vw-2rem)] items-center gap-3 rounded-lg border border-info/40 bg-info/10 px-4 py-2.5 text-sm text-text shadow-lg backdrop-blur"
+        >
+          <span aria-hidden="true" className="text-base">✨</span>
+          <span className="font-medium">A new version of Ojas is ready.</span>
+          <button
+            type="button"
+            onClick={() => {
+              // Tell the SW to skipWaiting; the `controlling` listener in
+              // registerSW.ts will then reload the page.
+              window.dispatchEvent(new CustomEvent("ojas:sw-apply"));
+              setSwUpdate(false);
+            }}
+            className="ml-1 rounded-md bg-accent px-3 py-1 text-xs font-semibold text-bg hover:bg-accent/90"
+          >
+            Refresh
+          </button>
+          <button
+            type="button"
+            onClick={() => setSwUpdate(false)}
+            className="rounded-md px-2 py-1 text-xs text-muted hover:text-text"
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
     </div>
   );
 }
