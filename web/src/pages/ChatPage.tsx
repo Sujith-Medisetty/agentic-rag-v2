@@ -32,6 +32,7 @@ import { useTheme } from "@/lib/theme";
 import type {
   LiveEvent, TodoItem, AgentRecord, FileChange, GitInfo,
   CommitRecord, ToolEvent, TurnSummary, Turn, SessionTotals,
+  TimelineBlock,
 } from "@/lib/types";
 import PlanPanel from "@/components/PlanPanel";
 import TurnCard from "@/components/TurnCard";
