@@ -92,13 +92,16 @@ fi
 banner "Fetching Forge source"
 if [[ -d "${FORGE_DIR}/.git" ]]; then
     log "Updating existing checkout at ${FORGE_DIR}"
-    git -C "${FORGE_DIR}" fetch origin "${FORGE_BRANCH}"
-    git -C "${FORGE_DIR}" reset --hard "origin/${FORGE_BRANCH}"
+    # Run git as the owning user. Running it as root on a forge-owned repo
+    # trips git's safe.directory protection ("dubious ownership"). Doing it
+    # as forge avoids that AND keeps file modes consistent.
+    sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" fetch origin "${FORGE_BRANCH}"
+    sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" reset --hard "origin/${FORGE_BRANCH}"
 else
     log "Cloning ${FORGE_REPO} into ${FORGE_DIR}"
     git clone --branch "${FORGE_BRANCH}" "${FORGE_REPO}" "${FORGE_DIR}"
+    chown -R "${FORGE_USER}:${FORGE_USER}" "${FORGE_DIR}"
 fi
-chown -R "${FORGE_USER}:${FORGE_USER}" "${FORGE_DIR}"
 ok "Source ready at ${FORGE_DIR}"
 
 # ---- 4. Python venv + deps ------------------------------------------------
