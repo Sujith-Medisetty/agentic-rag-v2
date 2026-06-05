@@ -5,6 +5,7 @@ import Workspace from "@/pages/Workspace";
 import ChatPage from "@/pages/ChatPage";
 import ProjectList from "@/pages/ProjectList";
 import SessionList from "@/pages/SessionList";
+import Admin from "@/pages/Admin";
 import InstallPrompt from "@/components/InstallPrompt";
 import IosInstallHint from "@/components/IosInstallHint";
 
@@ -23,6 +24,11 @@ export default function App() {
           {/* Legacy project-list / session-list pages still reachable for
               users with multiple projects. The new sidebar can be expanded
               to surface these later. */}
+          {/* Root-only admin panel. The component itself enforces the role
+              check + redirects non-root users to /, so an accidental link
+              tap doesn't leak the page. */}
+          <Route path="/admin" element={<Layout><Admin /></Layout>} />
+
           <Route
             path="/projects"
             element={<Layout><ProjectList /></Layout>}

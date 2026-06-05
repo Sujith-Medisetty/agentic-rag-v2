@@ -7,6 +7,7 @@
 import { useEffect, useState } from "react";
 import { Outlet, useNavigate, useParams, Link } from "react-router-dom";
 import { projectsApi, sessionsApi, sessionApi, authApi, ApiError } from "@/lib/api";
+import type { AuthUser } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import type { Project, Session } from "@/lib/types";
 
@@ -15,6 +16,7 @@ export default function Workspace() {
   const { sessionId: activeSessionId } = useParams<{ sessionId?: string }>();
   const [project, setProject] = useState<Project | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [me, setMe] = useState<AuthUser | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
     // Open by default on desktop, closed on mobile (saves real estate).
@@ -23,14 +25,19 @@ export default function Workspace() {
   });
 
 
-  // Bootstrap: resolve default project + its sessions.
+  // Bootstrap: resolve default project + its sessions + the logged-in user.
+  // The /me lookup is what tells the sidebar whether to show the Admin link.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const p = await projectsApi.getDefault();
+        const [p, user] = await Promise.all([
+          projectsApi.getDefault(),
+          authApi.me().catch(() => null),
+        ]);
         if (cancelled) return;
         setProject(p);
+        setMe(user);
         const ss = await sessionsApi.list(p.id);
         if (cancelled) return;
         setSessions(ss);
@@ -198,9 +205,7 @@ export default function Workspace() {
           )}
         </div>
 
-        {/* Footer — workspace path + a clean Log out button. The theme
-            toggle is intentionally NOT here; one source of truth lives in
-            the app header (Layout) / chat header so there's no duplication. */}
+        {/* Footer — workspace path, optional Admin link for root, Log out. */}
         <div className="border-t border-border px-3 py-3">
           {project && (
             <div
@@ -209,6 +214,15 @@ export default function Workspace() {
             >
               {project.workspace_path}
             </div>
+          )}
+          {me?.role === "root" && (
+            <Link
+              to="/admin"
+              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-md border border-accent/30 bg-accent/10 px-3 py-1.5 text-sm font-medium text-accent transition-colors hover:border-accent/50 hover:bg-accent/15"
+            >
+              <ShieldIcon />
+              <span>Admin</span>
+            </Link>
           )}
           <button
             onClick={logout}
@@ -318,6 +332,14 @@ function LogoutIcon() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
          strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
       <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+    </svg>
+  );
+}
+function ShieldIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
     </svg>
   );
 }

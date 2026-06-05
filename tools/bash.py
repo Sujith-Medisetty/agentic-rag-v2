@@ -41,6 +41,10 @@ def execute_bash(input: BashInput) -> BashOutput:
 
     Uses `sh -lc` (login shell) so the command sees the user's PATH,
     aliases, and shell environment the same way an interactive run would.
+
+    The active session sandbox (if any) is consulted for `cwd` so commands
+    run inside the session's workspace by default — `cd /tmp && rm -rf /`
+    is no longer a footgun for a non-root session.
     """
     if input.run_in_background:
         return _run_background(input.command)
@@ -86,6 +90,9 @@ def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
             # blocking forever. Pairs with the timeout as belt-and-braces.
             stdin=subprocess.DEVNULL,
             env=os.environ.copy(),
+            # Anchor the cwd to the session's workspace if one is set. Root
+            # users still inherit the process default (full filesystem).
+            cwd=_sandbox_cwd(),
         )
     except subprocess.TimeoutExpired:
         return _timeout_output(command, effective_ms)
@@ -157,19 +164,69 @@ def _test_timeout_provenance(command: str, timeout_ms: int, is_test: bool) -> di
 
 
 def _run_background(command: str) -> BashOutput:
-    """Spawn command in background, return immediately with task id."""
+    """Spawn command in background, return immediately with task id. Also
+    registers the PID against the active session (if any) so session
+    delete + the admin endpoints can find / kill it later."""
     proc = subprocess.Popen(
         ["sh", "-lc", command],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=os.environ.copy(),
+        cwd=_sandbox_cwd(),
     )
+    # Best-effort process tracking so the root admin panel can see what's
+    # running and so session-delete kills its children.
+    try:
+        from tools.sandbox import active_session_id
+        sid = active_session_id()
+        if sid is not None:
+            from server import db
+            db.register_process(sid, proc.pid, command, port=_guess_port(command))
+    except Exception:
+        pass
     return BashOutput(
         stdout="",
         stderr="",
         background_task_id=str(proc.pid),
         no_output_expected=True,
     )
+
+
+def _sandbox_cwd() -> str | None:
+    """Resolve the active sandbox's workspace as the cwd for spawned
+    commands. Returns None when no sandbox is active (CLI / test) so
+    subprocess inherits the parent's cwd."""
+    try:
+        from tools.sandbox import active_sandbox
+        cfg = active_sandbox()
+        if cfg is None:
+            return None
+        return str(cfg.workspace)
+    except Exception:
+        return None
+
+
+def _guess_port(command: str) -> int | None:
+    """Cheap heuristic: scan the command string for `--port N`, `-p N`,
+    `:PORT`, or `PORT=N`. Used to surface preview/dev ports in the admin
+    UI without parsing real stdout. Returns None if no number found."""
+    import re
+    patterns = [
+        r"--port[= ](\d{2,5})",
+        r"\b-p[= ](\d{2,5})",
+        r"\bPORT[= ](\d{2,5})",
+        r":(\d{2,5})\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, command)
+        if m:
+            try:
+                p = int(m.group(1))
+                if 1 <= p <= 65535:
+                    return p
+            except ValueError:
+                pass
+    return None
 
 
 def _truncate_output(s: str) -> str:

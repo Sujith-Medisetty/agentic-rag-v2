@@ -1,0 +1,57 @@
+# Forge — Caddy reverse proxy.
+#
+# Replace `forge.example.com` with YOUR domain in TWO places before deploying.
+# Caddy auto-fetches a Let's Encrypt cert for it on first start; no certbot
+# needed. Make sure DNS for your domain points at this VM's public IP first,
+# else Caddy will retry forever and you won't get TLS.
+#
+# Routes:
+#   /api/*  → FastAPI on 127.0.0.1:8765
+#   /api/sessions/*/stream → same target, ws upgrade handled by reverse_proxy
+#   /preview/* → reserved for future per-session preview serving
+#   everything else → static SPA files from web/dist with SPA fallback
+#
+# Place this file at  /etc/caddy/Caddyfile  on the VM, then:
+#   sudo systemctl reload caddy
+
+forge.example.com {
+    # The frontend's built static files. The install script copies them here.
+    root * /opt/forge/web/dist
+    encode gzip
+
+    # API + WebSocket — proxy everything under /api/ to FastAPI. The
+    # WebSocket upgrade headers are handled automatically by Caddy's
+    # reverse_proxy directive.
+    @api path /api/* /api
+    handle @api {
+        reverse_proxy 127.0.0.1:8765
+    }
+
+    # Reserved for the future preview-serving feature (Item 8). Until that
+    # ships these requests 404 — uncomment the proxy line when implemented.
+    # handle /preview/* {
+    #     reverse_proxy 127.0.0.1:8765
+    # }
+
+    # SPA fallback — every non-file route returns index.html so React
+    # Router can take over client-side. file_server serves the asset if
+    # it exists; try_files falls back to index.html for routes like /s/xyz.
+    handle {
+        try_files {path} /index.html
+        file_server
+    }
+
+    # Sensible defaults. Adjust if you want stricter CSP / etc.
+    header {
+        # HSTS — once a browser sees this, it sticks with HTTPS forever.
+        # Comment out if you're still testing on http://.
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Aggressive caching for hashed asset bundles. The SPA shell
+        # (index.html) is NOT cached so updates roll out immediately.
+        Cache-Control "public, max-age=31536000, immutable"
+    }
+    @html path *.html
+    header @html Cache-Control "no-cache"
+}

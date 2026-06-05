@@ -1,20 +1,24 @@
 """
-Single-user passcode + signed device tokens.
+Multi-user email + password auth with a root user materialised from .env.
 
 Flow:
-  1. First boot — server has no passcode → /api/auth/status returns
-     {needs_setup: true}. Client posts a new passcode to /api/auth/setup;
-     we hash it (scrypt) and write ~/.agentic-rag/auth.json with the hash
-     + a random server secret.
-  2. Subsequent logins — client posts passcode to /api/auth/login; we
-     verify against the stored hash and return a signed token
-     (itsdangerous URLSafeSerializer) bound to the server secret. The
-     token's hash is also stored in auth_tokens so it can be revoked.
-  3. Each protected request sends `Authorization: Bearer <token>`. We
-     verify the signature AND check the hash is still in the DB.
+  1. First boot — server has no users yet → /api/auth/status returns
+     {needs_setup: true, has_root: bool}. If FORGE_ROOT_EMAIL / PASSWORD are
+     set in .env, the very first /api/auth/login with those credentials
+     materialises the root user in the DB and returns a token. Otherwise the
+     client posts to /api/auth/signup to create a first regular user.
 
-Single-user: log in on each device you want access from, revoke
-individual tokens from the UI when needed.
+  2. /api/auth/login posts {email, password}; we verify the password against
+     the user's stored scrypt hash and return a signed token bound to the
+     server secret. The token's hash is stored in auth_tokens alongside the
+     user_id so it can be revoked AND the request handler can look up which
+     user is calling.
+
+  3. Each protected request sends `Authorization: Bearer <token>`. We verify
+     the signature, look up the token's user_id, fetch the user (with role),
+     and pass that to the handler.
+
+Server secret + scrypt hashing same as before — only the user model changes.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from server import db
 _AUTH_FILE = Path.home() / ".agentic-rag" / "auth.json"
 _TOKEN_SALT = "agentic-rag.device-token.v1"
 
-# scrypt cost — interactive (~100ms on a modern Mac), plenty for a passcode
+# scrypt cost — interactive (~100ms on a modern Mac), plenty for a password.
 _SCRYPT_N = 2 ** 14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
@@ -43,58 +47,100 @@ _SCRYPT_DKLEN = 32
 
 
 @dataclass
-class AuthConfig:
-    passcode_hash: str   # hex
-    passcode_salt: str   # hex
-    server_secret: str   # hex — used by itsdangerous
+class ServerSecret:
+    secret: str
 
     def to_json(self) -> str:
-        return json.dumps({
-            "passcode_hash": self.passcode_hash,
-            "passcode_salt": self.passcode_salt,
-            "server_secret": self.server_secret,
-        }, indent=2)
+        return json.dumps({"server_secret": self.secret}, indent=2)
 
     @classmethod
-    def from_json(cls, raw: str) -> "AuthConfig":
+    def from_json(cls, raw: str) -> "ServerSecret":
         d = json.loads(raw)
-        return cls(
-            passcode_hash=d["passcode_hash"],
-            passcode_salt=d["passcode_salt"],
-            server_secret=d["server_secret"],
-        )
+        return cls(secret=d["server_secret"])
 
 
 # ---------------------------------------------------------------------------
-# Passcode hashing
+# Server secret — used for itsdangerous signing. Created on first need.
 # ---------------------------------------------------------------------------
 
-def _hash_passcode(passcode: str, salt: bytes) -> bytes:
+def _load_or_create_secret() -> ServerSecret:
+    if _AUTH_FILE.exists():
+        try:
+            return ServerSecret.from_json(_AUTH_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+    s = ServerSecret(secret=secrets.token_hex(32))
+    _AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _AUTH_FILE.write_text(s.to_json(), encoding="utf-8")
+    try:
+        os.chmod(_AUTH_FILE, 0o600)
+    except OSError:
+        pass
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Password hashing
+# ---------------------------------------------------------------------------
+
+def _hash_password(password: str, salt: bytes) -> bytes:
     return hashlib.scrypt(
-        passcode.encode("utf-8"),
+        password.encode("utf-8"),
         salt=salt,
         n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
         dklen=_SCRYPT_DKLEN,
     )
 
 
-def _load_config() -> AuthConfig | None:
-    if not _AUTH_FILE.exists():
-        return None
-    try:
-        return AuthConfig.from_json(_AUTH_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, KeyError):
-        return None
+def _verify_password(password: str, stored_hash_hex: str, stored_salt_hex: str) -> bool:
+    salt = bytes.fromhex(stored_salt_hex)
+    actual = _hash_password(password, salt)
+    expected = bytes.fromhex(stored_hash_hex)
+    return hmac.compare_digest(actual, expected)
 
 
-def _save_config(cfg: AuthConfig) -> None:
-    _AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _AUTH_FILE.write_text(cfg.to_json(), encoding="utf-8")
-    # Best-effort lock-down — owner read/write only.
-    try:
-        os.chmod(_AUTH_FILE, 0o600)
-    except OSError:
-        pass
+# ---------------------------------------------------------------------------
+# Root user from .env
+# ---------------------------------------------------------------------------
+
+def _root_credentials() -> tuple[str, str] | None:
+    """Return (email, password) from FORGE_ROOT_EMAIL / FORGE_ROOT_PASSWORD
+    env vars, or None if either is missing. Password may be plaintext or a
+    pre-hashed value via FORGE_ROOT_PASSWORD_HASH (not implemented yet —
+    plaintext only for now)."""
+    email = os.getenv("FORGE_ROOT_EMAIL", "").strip().lower()
+    password = os.getenv("FORGE_ROOT_PASSWORD", "")
+    if not email or not password:
+        return None
+    return email, password
+
+
+def _ensure_root_user() -> dict | None:
+    """If FORGE_ROOT_* are set AND no row exists for that email yet, create
+    the root user. Returns the user dict, or None if no root creds are
+    configured."""
+    creds = _root_credentials()
+    if creds is None:
+        return None
+    email, password = creds
+    existing = db.get_user_by_email(email)
+    if existing is not None:
+        return existing
+    salt = secrets.token_bytes(16)
+    hashed = _hash_password(password, salt)
+    return db.create_user(
+        email=email,
+        password_hash=hashed.hex(),
+        password_salt=salt.hex(),
+        role="root",
+    )
+
+
+def signup_allowed() -> bool:
+    """Whether non-root users can create accounts. Defaults to True; set
+    FORGE_ALLOW_SIGNUP=false in .env to lock it down."""
+    raw = os.getenv("FORGE_ALLOW_SIGNUP", "true").strip().lower()
+    return raw not in ("false", "0", "no", "off")
 
 
 # ---------------------------------------------------------------------------
@@ -102,77 +148,110 @@ def _save_config(cfg: AuthConfig) -> None:
 # ---------------------------------------------------------------------------
 
 def needs_setup() -> bool:
-    """True when no passcode has been set yet (first boot)."""
-    return _load_config() is None
+    """True when no users exist yet (first boot). The auth_status endpoint
+    surfaces this so the UI can route to a signup screen / show the root
+    credentials hint."""
+    # If root creds are configured but root user hasn't been created yet, we
+    # still consider the system "set up" — the login flow will materialise
+    # root on first login attempt with the configured email/password.
+    if _root_credentials() is not None:
+        return False
+    # No root configured; need at least one regular user.
+    return len(db.list_users()) == 0
 
 
-def setup_passcode(passcode: str) -> None:
-    """Initial passcode set. Refuses if one already exists."""
-    if not passcode or len(passcode) < 4:
-        raise ValueError("passcode must be at least 4 characters")
-    if _load_config() is not None:
-        raise ValueError("passcode already set; use change_passcode to update")
+def has_root_configured() -> bool:
+    """True when FORGE_ROOT_EMAIL + PASSWORD are present in env."""
+    return _root_credentials() is not None
+
+
+def signup(email: str, password: str) -> dict:
+    """Create a regular user. Refuses if signup is disabled OR email taken."""
+    if not signup_allowed():
+        # Allow the FIRST user even when signup is disabled — there has to be
+        # a way to bootstrap. Once any user exists, the gate kicks in.
+        if len(db.list_users()) > 0:
+            raise PermissionError("signup is disabled on this server")
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise ValueError("email is required")
+    if not password or len(password) < 6:
+        raise ValueError("password must be at least 6 characters")
     salt = secrets.token_bytes(16)
-    hashed = _hash_passcode(passcode, salt)
-    _save_config(AuthConfig(
-        passcode_hash=hashed.hex(),
-        passcode_salt=salt.hex(),
-        server_secret=secrets.token_hex(32),
-    ))
+    hashed = _hash_password(password, salt)
+    return db.create_user(
+        email=email,
+        password_hash=hashed.hex(),
+        password_salt=salt.hex(),
+        role="user",
+    )
 
 
-def change_passcode(old: str, new: str) -> None:
-    cfg = _load_config()
-    if cfg is None:
-        raise ValueError("no passcode set; call setup_passcode first")
-    if not _verify_passcode(old, cfg):
-        raise PermissionError("current passcode is wrong")
-    if not new or len(new) < 4:
-        raise ValueError("new passcode must be at least 4 characters")
-    salt = secrets.token_bytes(16)
-    hashed = _hash_passcode(new, salt)
-    _save_config(AuthConfig(
-        passcode_hash=hashed.hex(),
-        passcode_salt=salt.hex(),
-        # Rotate server secret so existing tokens are invalidated.
-        server_secret=secrets.token_hex(32),
-    ))
+def login(email: str, password: str) -> tuple[dict, str]:
+    """Verify credentials and return (user, signed_token). Raises
+    PermissionError on bad credentials."""
+    email = (email or "").strip().lower()
+    if not email or not password:
+        raise PermissionError("email + password required")
+
+    # Special case: if env-configured root creds match, ensure the row
+    # exists and proceed as that user. This is how the very first root
+    # login bootstraps the user record.
+    root_creds = _root_credentials()
+    if root_creds is not None:
+        root_email, root_password = root_creds
+        if email == root_email and hmac.compare_digest(password, root_password):
+            user = _ensure_root_user()
+            if user is None:
+                raise PermissionError("root user creation failed")
+            return user, _issue_token(user["id"], device_label="root")
+
+    # Regular DB lookup.
+    user = db.get_user_by_email(email)
+    if user is None:
+        raise PermissionError("wrong email or password")
+    if not _verify_password(password, user["password_hash"], user["password_salt"]):
+        raise PermissionError("wrong email or password")
+    return user, _issue_token(user["id"], device_label=email)
 
 
-def _verify_passcode(passcode: str, cfg: AuthConfig) -> bool:
-    salt = bytes.fromhex(cfg.passcode_salt)
-    actual = _hash_passcode(passcode, salt)
-    expected = bytes.fromhex(cfg.passcode_hash)
-    return hmac.compare_digest(actual, expected)
-
-
-def issue_token(passcode: str, device_label: str = "unknown") -> str:
-    """Verify the passcode and return a signed token. Stores its hash so the
-    token can be revoked later from the UI."""
-    cfg = _load_config()
-    if cfg is None:
-        raise ValueError("no passcode set; call setup_passcode first")
-    if not _verify_passcode(passcode, cfg):
-        raise PermissionError("wrong passcode")
-    serializer = URLSafeSerializer(cfg.server_secret, salt=_TOKEN_SALT)
+def _issue_token(user_id: str, device_label: str = "unknown") -> str:
+    cfg = _load_or_create_secret()
+    serializer = URLSafeSerializer(cfg.secret, salt=_TOKEN_SALT)
     raw = secrets.token_urlsafe(32)
-    signed = serializer.dumps({"r": raw, "d": device_label[:64]})
-    db.store_token(_hash_token(signed), device_label[:64])
+    signed = serializer.dumps({"r": raw, "u": user_id})
+    db.store_token(_hash_token(signed), device_label[:64], user_id=user_id)
     return signed
 
 
 def verify_token(token: str) -> bool:
-    """Verify a bearer token. Two gates: signature valid (binds to server_secret)
-    AND token hash is still in the DB (revocation)."""
-    cfg = _load_config()
-    if cfg is None:
-        return False
-    serializer = URLSafeSerializer(cfg.server_secret, salt=_TOKEN_SALT)
+    """Backward-compatible bool check used by the WebSocket envelope path."""
+    return _user_from_token(token) is not None
+
+
+def user_from_token(token: str) -> dict | None:
+    """Return the user dict (with role) the token belongs to, or None if
+    the token is invalid / revoked. This is the new canonical lookup used
+    by HTTP handlers that need to know who's calling."""
+    return _user_from_token(token)
+
+
+def _user_from_token(token: str) -> dict | None:
+    if not token:
+        return None
+    cfg = _load_or_create_secret()
+    serializer = URLSafeSerializer(cfg.secret, salt=_TOKEN_SALT)
     try:
         serializer.loads(token)
     except BadSignature:
-        return False
-    return db.is_token_valid(_hash_token(token))
+        return None
+    token_hash = _hash_token(token)
+    if not db.is_token_valid(token_hash):
+        return None
+    user_id = db.get_token_user_id(token_hash)
+    if not user_id:
+        return None
+    return db.get_user(user_id)
 
 
 def revoke_token(token: str) -> None:

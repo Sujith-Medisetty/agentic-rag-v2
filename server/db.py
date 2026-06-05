@@ -33,26 +33,46 @@ def server_db_path() -> Path:
 
 
 _SCHEMA = """
+-- Multi-user identity. Root user (FORGE_ROOT_EMAIL from .env) is materialised
+-- on first login; other users go through /api/auth/signup.
+CREATE TABLE IF NOT EXISTS users (
+    id             TEXT    PRIMARY KEY,
+    email          TEXT    NOT NULL UNIQUE,
+    password_hash  TEXT    NOT NULL,
+    password_salt  TEXT    NOT NULL,
+    role           TEXT    NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'root')),
+    created_at     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS projects (
     id                    TEXT    PRIMARY KEY,
-    name                  TEXT    NOT NULL UNIQUE,
+    user_id               TEXT             REFERENCES users(id) ON DELETE CASCADE,
+    name                  TEXT    NOT NULL,
     workspace_path        TEXT    NOT NULL,
     created_at            INTEGER NOT NULL,
-    -- Phase 4 settings: auto-commit ON, auto-push OFF, session-branch strategy
     auto_commit_enabled   INTEGER NOT NULL DEFAULT 1,
     auto_push_enabled     INTEGER NOT NULL DEFAULT 0,
-    branch_strategy       TEXT    NOT NULL DEFAULT 'session'
+    branch_strategy       TEXT    NOT NULL DEFAULT 'session',
+    -- Project name is unique PER USER (so two users can both have a project
+    -- named "Forge" without colliding). Old uniqueness was global.
+    UNIQUE(user_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id              TEXT    PRIMARY KEY,
-    project_id      TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    name            TEXT    NOT NULL,
-    last_active_at  INTEGER NOT NULL,
-    created_at      INTEGER NOT NULL
+    id                TEXT    PRIMARY KEY,
+    project_id        TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    user_id           TEXT             REFERENCES users(id) ON DELETE CASCADE,
+    name              TEXT    NOT NULL,
+    -- Subdirectory under the project workspace where THIS session's files
+    -- live. Lets session-delete safely rmtree just this session's tree
+    -- without touching other sessions' builds.
+    workspace_subdir  TEXT,
+    last_active_at    INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_project
     ON sessions(project_id, last_active_at DESC);
+-- idx_sessions_user is created after the user_id column migration runs.
 
 CREATE TABLE IF NOT EXISTS messages (
     id          TEXT    PRIMARY KEY,
@@ -74,8 +94,22 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_session
     ON events(session_id, created_at);
 
+-- Long-running processes spawned by the agent (npm run dev, vite preview,
+-- etc.). Tracked so session/project deletion can SIGTERM them, and so the
+-- root admin endpoints can list what's currently running on the box.
+CREATE TABLE IF NOT EXISTS session_processes (
+    pid          INTEGER PRIMARY KEY,
+    session_id   TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    command      TEXT    NOT NULL,
+    port         INTEGER,
+    started_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_processes_session
+    ON session_processes(session_id);
+
 CREATE TABLE IF NOT EXISTS auth_tokens (
     token_hash    TEXT    PRIMARY KEY,
+    user_id       TEXT             REFERENCES users(id) ON DELETE CASCADE,
     label         TEXT    NOT NULL,
     created_at    INTEGER NOT NULL,
     last_used_at  INTEGER
@@ -85,25 +119,54 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
 
 def init_db() -> None:
     """Idempotent — safe to call on every backend boot. Also runs forward
-    migrations for any settings columns added after the initial release."""
+    migrations for columns added after the initial release."""
     with _connect() as cx:
         cx.executescript(_SCHEMA)
         _migrate_projects(cx)
+        _migrate_sessions(cx)
+        _migrate_auth_tokens(cx)
+        # Indexes that reference columns added in migrations must be created
+        # AFTER those columns exist on legacy DBs.
+        cx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user "
+            "ON sessions(user_id, last_active_at DESC)"
+        )
 
 
 def _migrate_projects(cx: sqlite3.Connection) -> None:
-    """Add new columns to an EXISTING projects table created before Phase 4.
-    `ALTER TABLE ADD COLUMN` is the safe + portable way to do this; we check
-    the table's current shape first to keep the call idempotent."""
+    """Add new columns to an EXISTING projects table from earlier releases."""
     cols = {row["name"] for row in cx.execute("PRAGMA table_info(projects)")}
     additions = [
         ("auto_commit_enabled", "INTEGER NOT NULL DEFAULT 1"),
         ("auto_push_enabled",   "INTEGER NOT NULL DEFAULT 0"),
         ("branch_strategy",     "TEXT NOT NULL DEFAULT 'session'"),
+        ("user_id",             "TEXT REFERENCES users(id) ON DELETE CASCADE"),
     ]
     for name, decl in additions:
         if name not in cols:
             cx.execute(f"ALTER TABLE projects ADD COLUMN {name} {decl}")
+
+
+def _migrate_sessions(cx: sqlite3.Connection) -> None:
+    """Add per-session `user_id` + `workspace_subdir` columns when upgrading."""
+    cols = {row["name"] for row in cx.execute("PRAGMA table_info(sessions)")}
+    additions = [
+        ("user_id",          "TEXT REFERENCES users(id) ON DELETE CASCADE"),
+        ("workspace_subdir", "TEXT"),
+    ]
+    for name, decl in additions:
+        if name not in cols:
+            cx.execute(f"ALTER TABLE sessions ADD COLUMN {name} {decl}")
+
+
+def _migrate_auth_tokens(cx: sqlite3.Connection) -> None:
+    """Add `user_id` to auth_tokens so we can scope tokens per-user."""
+    cols = {row["name"] for row in cx.execute("PRAGMA table_info(auth_tokens)")}
+    if "user_id" not in cols:
+        cx.execute(
+            "ALTER TABLE auth_tokens ADD COLUMN user_id TEXT "
+            "REFERENCES users(id) ON DELETE CASCADE"
+        )
 
 
 @contextmanager
@@ -133,7 +196,7 @@ def _row(r: sqlite3.Row | None) -> dict | None:
 # ============================================================================
 
 _PROJECT_COLS = (
-    "id, name, workspace_path, created_at, "
+    "id, user_id, name, workspace_path, created_at, "
     "auto_commit_enabled, auto_push_enabled, branch_strategy"
 )
 
@@ -151,21 +214,22 @@ def _row_project(r: sqlite3.Row | None) -> dict | None:
     return d
 
 
-def create_project(name: str, workspace_path: str) -> dict:
-    """Create a project. Raises ValueError if the name already exists."""
+def create_project(name: str, workspace_path: str, user_id: str | None = None) -> dict:
+    """Create a project owned by `user_id`. Raises ValueError if the user
+    already has a project with that name."""
     pid = uuid.uuid4().hex
     now = _now()
     workspace_path = str(Path(workspace_path).expanduser().resolve())
     try:
         with _connect() as cx:
             cx.execute(
-                "INSERT INTO projects(id, name, workspace_path, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (pid, name, workspace_path, now),
+                "INSERT INTO projects(id, user_id, name, workspace_path, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (pid, user_id, name, workspace_path, now),
             )
     except sqlite3.IntegrityError as e:
         raise ValueError(f"project name '{name}' already exists") from e
-    return get_project(pid)   # round-trip so callers see the defaults filled in
+    return get_project(pid)
 
 
 def delete_project(project_id: str) -> bool:
@@ -186,11 +250,21 @@ def delete_session(session_id: str) -> bool:
         return cur.rowcount > 0
 
 
-def list_projects() -> list[dict]:
+def list_projects(user_id: str | None = None) -> list[dict]:
+    """List projects. If `user_id` is given, only that user's projects;
+    otherwise (root scope) list everything."""
     with _connect() as cx:
-        rows = cx.execute(
-            f"SELECT {_PROJECT_COLS} FROM projects ORDER BY created_at DESC"
-        ).fetchall()
+        if user_id is not None:
+            rows = cx.execute(
+                f"SELECT {_PROJECT_COLS} FROM projects "
+                f"WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = cx.execute(
+                f"SELECT {_PROJECT_COLS} FROM projects "
+                f"ORDER BY created_at DESC"
+            ).fetchall()
     return [_row_project(r) for r in rows]
 
 
@@ -239,17 +313,30 @@ def update_project_settings(
 # Sessions
 # ============================================================================
 
-def create_session(project_id: str, name: str) -> dict:
+_SESSION_COLS = (
+    "id, project_id, user_id, name, workspace_subdir, "
+    "last_active_at, created_at"
+)
+
+
+def create_session(
+    project_id: str,
+    name: str,
+    user_id: str | None = None,
+    workspace_subdir: str | None = None,
+) -> dict:
     sid = uuid.uuid4().hex
     now = _now()
     with _connect() as cx:
         cx.execute(
-            "INSERT INTO sessions(id, project_id, name, last_active_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (sid, project_id, name, now, now),
+            "INSERT INTO sessions"
+            "(id, project_id, user_id, name, workspace_subdir, last_active_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (sid, project_id, user_id, name, workspace_subdir, now, now),
         )
     return {
-        "id": sid, "project_id": project_id, "name": name,
+        "id": sid, "project_id": project_id, "user_id": user_id,
+        "name": name, "workspace_subdir": workspace_subdir,
         "last_active_at": now, "created_at": now,
     }
 
@@ -257,9 +344,20 @@ def create_session(project_id: str, name: str) -> dict:
 def list_sessions(project_id: str) -> list[dict]:
     with _connect() as cx:
         rows = cx.execute(
-            "SELECT id, project_id, name, last_active_at, created_at "
-            "FROM sessions WHERE project_id = ? ORDER BY last_active_at DESC",
+            f"SELECT {_SESSION_COLS} FROM sessions "
+            f"WHERE project_id = ? ORDER BY last_active_at DESC",
             (project_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_sessions_for_user(user_id: str) -> list[dict]:
+    """All sessions belonging to one user, across all their projects."""
+    with _connect() as cx:
+        rows = cx.execute(
+            f"SELECT {_SESSION_COLS} FROM sessions "
+            f"WHERE user_id = ? ORDER BY last_active_at DESC",
+            (user_id,),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -267,8 +365,7 @@ def list_sessions(project_id: str) -> list[dict]:
 def get_session(session_id: str) -> dict | None:
     with _connect() as cx:
         r = cx.execute(
-            "SELECT id, project_id, name, last_active_at, created_at "
-            "FROM sessions WHERE id = ?",
+            f"SELECT {_SESSION_COLS} FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
     return _row(r)
@@ -386,14 +483,24 @@ def list_events(
 # Auth tokens (used by server/auth.py)
 # ============================================================================
 
-def store_token(token_hash: str, label: str) -> None:
+def store_token(token_hash: str, label: str, user_id: str | None = None) -> None:
     with _connect() as cx:
         cx.execute(
             "INSERT OR REPLACE INTO auth_tokens"
-            "(token_hash, label, created_at, last_used_at) "
-            "VALUES (?, ?, ?, NULL)",
-            (token_hash, label, _now()),
+            "(token_hash, user_id, label, created_at, last_used_at) "
+            "VALUES (?, ?, ?, ?, NULL)",
+            (token_hash, user_id, label, _now()),
         )
+
+
+def get_token_user_id(token_hash: str) -> str | None:
+    """Return the user_id that owns this token, or None if not found."""
+    with _connect() as cx:
+        r = cx.execute(
+            "SELECT user_id FROM auth_tokens WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+    return r["user_id"] if r is not None else None
 
 
 def is_token_valid(token_hash: str) -> bool:
@@ -416,3 +523,101 @@ def revoke_token(token_hash: str) -> None:
         cx.execute(
             "DELETE FROM auth_tokens WHERE token_hash = ?", (token_hash,),
         )
+
+
+# ============================================================================
+# Users
+# ============================================================================
+
+_USER_COLS = "id, email, password_hash, password_salt, role, created_at"
+
+
+def create_user(
+    email: str, password_hash: str, password_salt: str, role: str = "user",
+) -> dict:
+    """Create a new user. Raises ValueError if the email is already in use."""
+    uid = uuid.uuid4().hex
+    now = _now()
+    try:
+        with _connect() as cx:
+            cx.execute(
+                "INSERT INTO users(id, email, password_hash, password_salt, "
+                "role, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (uid, email.lower(), password_hash, password_salt, role, now),
+            )
+    except sqlite3.IntegrityError as e:
+        raise ValueError(f"email '{email}' already registered") from e
+    return get_user(uid)
+
+
+def get_user(user_id: str) -> dict | None:
+    with _connect() as cx:
+        r = cx.execute(
+            f"SELECT {_USER_COLS} FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    return _row(r)
+
+
+def get_user_by_email(email: str) -> dict | None:
+    with _connect() as cx:
+        r = cx.execute(
+            f"SELECT {_USER_COLS} FROM users WHERE email = ?",
+            (email.lower(),),
+        ).fetchone()
+    return _row(r)
+
+
+def list_users() -> list[dict]:
+    """Root-only — returns every user. Password hashes included; callers must
+    strip them before exposing over HTTP."""
+    with _connect() as cx:
+        rows = cx.execute(
+            f"SELECT {_USER_COLS} FROM users ORDER BY created_at ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ============================================================================
+# Session processes — long-running PIDs spawned by the agent (npm run dev, etc).
+# Tracked so deletes can SIGTERM them and admin endpoints can list them.
+# ============================================================================
+
+def register_process(
+    session_id: str, pid: int, command: str, port: int | None = None,
+) -> None:
+    """Idempotent on PID — if a row exists, update it. Different sessions
+    can't reuse a PID at the same time anyway."""
+    with _connect() as cx:
+        cx.execute(
+            "INSERT OR REPLACE INTO session_processes"
+            "(pid, session_id, command, port, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (pid, session_id, command, port, _now()),
+        )
+
+
+def unregister_process(pid: int) -> None:
+    with _connect() as cx:
+        cx.execute("DELETE FROM session_processes WHERE pid = ?", (pid,))
+
+
+def list_processes_for_session(session_id: str) -> list[dict]:
+    with _connect() as cx:
+        rows = cx.execute(
+            "SELECT pid, session_id, command, port, started_at "
+            "FROM session_processes WHERE session_id = ? "
+            "ORDER BY started_at ASC",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_all_processes() -> list[dict]:
+    """Root-only — every tracked spawned process across every session."""
+    with _connect() as cx:
+        rows = cx.execute(
+            "SELECT pid, session_id, command, port, started_at "
+            "FROM session_processes ORDER BY started_at ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]

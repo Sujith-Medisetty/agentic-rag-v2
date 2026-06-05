@@ -48,24 +48,38 @@ async function request<T>(
 
 // ---- Auth ----------------------------------------------------------------
 
-export interface AuthStatus { needs_setup: boolean }
-export interface AuthToken  { token: string }
+export interface AuthStatus {
+  needs_setup: boolean;
+  has_root?: boolean;
+  signup_allowed?: boolean;
+}
+export interface AuthUser {
+  id: string;
+  email: string;
+  role: "user" | "root";
+  created_at: number;
+}
+export interface AuthToken {
+  token: string;
+  user: AuthUser;
+}
 
 export const authApi = {
   status: () =>
     request<AuthStatus>("/api/auth/status", { skipAuth: true }),
-  setup: (passcode: string) =>
-    request<AuthToken>("/api/auth/setup", {
+  signup: (email: string, password: string) =>
+    request<AuthToken>("/api/auth/signup", {
       method: "POST",
-      body: JSON.stringify({ passcode }),
+      body: JSON.stringify({ email, password }),
       skipAuth: true,
     }),
-  login: (passcode: string, device_label?: string) =>
+  login: (email: string, password: string, device_label?: string) =>
     request<AuthToken>("/api/auth/login", {
       method: "POST",
-      body: JSON.stringify({ passcode, device_label }),
+      body: JSON.stringify({ email, password, device_label }),
       skipAuth: true,
     }),
+  me: () => request<AuthUser>("/api/auth/me"),
   logout: () =>
     request<{ ok: true }>("/api/auth/logout", { method: "POST" }),
 };
@@ -93,6 +107,23 @@ export const projectsApi = {
     request<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
+};
+
+// ---- Admin (root only) --------------------------------------------------
+
+export interface AdminProcess {
+  pid: number;
+  session_id: string;
+  command: string;
+  port: number | null;
+  started_at: number;
+}
+
+export const adminApi = {
+  processes: () => request<AdminProcess[]>("/api/admin/processes"),
+  killProcess: (pid: number) =>
+    request<{ ok: true }>(`/api/admin/processes/${pid}`, { method: "DELETE" }),
+  users: () => request<AuthUser[]>("/api/admin/users"),
 };
 
 export const pathsApi = {

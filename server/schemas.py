@@ -7,17 +7,37 @@ from pydantic import BaseModel, Field
 # ---- Auth -----------------------------------------------------------------
 
 class AuthStatusResponse(BaseModel):
+ # True when no users exist yet AND no root creds are configured. The UI
+ # uses this to show a signup screen on first boot.
  needs_setup: bool
+ # True when FORGE_ROOT_EMAIL / PASSWORD are configured in env. Lets the
+ # UI hint "use your root credentials" on the login page.
+ has_root: bool = False
+ # True when the server allows new signups via /api/auth/signup.
+ signup_allowed: bool = True
 
 class SetupRequest(BaseModel):
- passcode: str = Field(min_length=4, description="At least 4 characters")
+ # Legacy passcode-style setup; kept for backward compat but not used.
+ passcode: str = Field(min_length=4, description="Legacy field")
+
+class SignupRequest(BaseModel):
+ email: str
+ password: str = Field(min_length=6, description="At least 6 characters")
 
 class LoginRequest(BaseModel):
- passcode: str
+ email: str
+ password: str
  device_label: str | None = Field(None, description="Friendly label e.g. 'Sujith iPhone'")
+
+class UserResponse(BaseModel):
+ id: str
+ email: str
+ role: str
+ created_at: int
 
 class LoginResponse(BaseModel):
  token: str
+ user: UserResponse
 
 # ---- Projects -------------------------------------------------------------
 
@@ -55,6 +75,20 @@ class SessionResponse(BaseModel):
  name: str
  last_active_at: int
  created_at: int
+ # The per-session subdirectory under the project workspace where the
+ # agent writes files for this session. None on legacy rows created
+ # before the subdir column.
+ workspace_subdir: str | None = None
+ # The owner of this session. None on legacy rows; new sessions always
+ # have it set.
+ user_id: str | None = None
+
+class ProcessResponse(BaseModel):
+ pid: int
+ session_id: str
+ command: str
+ port: int | None = None
+ started_at: int
 
 # ---- Messages -------------------------------------------------------------
 

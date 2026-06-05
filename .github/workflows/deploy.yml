@@ -1,0 +1,54 @@
+# Auto-deploy Forge to the VM whenever you push to master.
+#
+# Setup (one-time):
+#   1. On the VM, generate a deploy key:
+#        sudo -u root ssh-keygen -t ed25519 -f /root/.ssh/forge-deploy -N ''
+#        cat /root/.ssh/forge-deploy.pub >> /root/.ssh/authorized_keys
+#        cat /root/.ssh/forge-deploy        # copy the PRIVATE key
+#
+#   2. In GitHub → your repo → Settings → Secrets and variables → Actions →
+#      "New repository secret":
+#        VM_HOST             your.vm.public.ip   (or forge.yourdomain.com)
+#        VM_USER             root
+#        VM_SSH_PRIVATE_KEY  <paste the private key>
+#
+#   3. Push to master. The next push triggers a deploy.
+#
+# What the workflow does:
+#   - SSHes into the VM
+#   - Runs /opt/forge/deploy/update.sh as root
+#   - That script: git pull → pip install → npm build → systemctl restart
+#   - Total wall time: ~30 seconds for a typical deploy
+
+name: Deploy to VM
+
+on:
+  push:
+    branches: [master]
+  # Manual trigger too, in case you want to redeploy without a code change.
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # If two pushes land back-to-back, cancel the older deploy so we don't
+    # race on the VM. The newer one wins.
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Run update.sh on the VM
+        # appleboy/ssh-action is a well-maintained, single-purpose action
+        # that just opens an SSH connection and runs a script. No surprises.
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key:      ${{ secrets.VM_SSH_PRIVATE_KEY }}
+          port:     22
+          # `script_stop: true` aborts on first failed command so we see the
+          # actual error instead of a cascade of "command not found".
+          script_stop: true
+          script: |
+            bash /opt/forge/deploy/update.sh

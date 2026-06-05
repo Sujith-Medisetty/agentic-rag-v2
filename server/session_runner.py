@@ -153,6 +153,23 @@ async def run_turn(
         os.environ["CLAWD_AGENT_STORE"] = str(session_root / "clawd-agents")
         os.environ["CLAWD_TODO_STORE"]  = str(session_root / "clawd-todos.json")
 
+        # Activate the workspace jail for this turn. Look up the session's
+        # user role so root bypasses the jail. The sandbox is per-ContextVar,
+        # so the executor thread sees it because we wrap _drive in
+        # `ctx.run(...)` below.
+        from tools.sandbox import set_session_sandbox
+        from server import db
+        is_root = False
+        try:
+            sess_row = db.get_session(session_id)
+            if sess_row and sess_row.get("user_id"):
+                u = db.get_user(sess_row["user_id"])
+                if u and u.get("role") == "root":
+                    is_root = True
+        except Exception:
+            pass
+        set_session_sandbox(workspace, is_root, session_id)
+
         reset_run_budget(
             max_iters=max_iterations,
             max_tokens=0,         # token/time budgets are off by default in web mode

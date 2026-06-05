@@ -1,32 +1,34 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { authApi } from "@/lib/api";
 import { setToken } from "@/lib/auth";
 
-const defaultLabel = () => {
-  const ua = navigator.userAgent;
-  if (/iPhone|iPad/i.test(ua)) return "iOS";
-  if (/Android/i.test(ua)) return "Android";
-  if (/Macintosh/i.test(ua)) return "Mac";
-  if (/Windows/i.test(ua)) return "Windows";
-  return "browser";
-};
-
 export default function Login({ onDone }: { onDone: () => void }) {
-  const [pass, setPass] = useState("");
-  const [label, setLabel] = useState(defaultLabel());
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [mode, setMode] = useState<"login" | "signup">("login");
+  const [signupAllowed, setSignupAllowed] = useState<boolean>(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // Decide whether to show "Sign up" tab based on the server's policy.
+  useEffect(() => {
+    authApi.status()
+      .then((s) => setSignupAllowed(!!s.signup_allowed))
+      .catch(() => setSignupAllowed(true));
+  }, []);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr(null);
     setBusy(true);
     try {
-      const { token } = await authApi.login(pass, label);
-      setToken(token);
+      const res = mode === "login"
+        ? await authApi.login(email, password)
+        : await authApi.signup(email, password);
+      setToken(res.token);
       onDone();
     } catch (e: any) {
-      setErr(e?.message ?? "wrong passcode");
+      setErr(e?.message ?? (mode === "login" ? "wrong email or password" : "signup failed"));
     } finally {
       setBusy(false);
     }
@@ -42,30 +44,66 @@ export default function Login({ onDone }: { onDone: () => void }) {
           <div className="flex items-center gap-2">
             <span
               aria-hidden
-              className="inline-block h-2.5 w-2.5 rounded-full bg-accent-gradient shadow-glow-accent"
+              className="inline-block h-2.5 w-2.5 rounded-full bg-accent-gradient"
+              style={{ boxShadow: "0 0 0 4px hsl(var(--accent) / 0.18)" }}
             />
             <span className="brand-mark text-sm font-semibold tracking-tight">
-              agentic&#8209;rag
+              Forge
             </span>
           </div>
-          <h1 className="text-xl font-semibold tracking-tight">Welcome back</h1>
-          <p className="text-xs text-muted">Enter your passcode to continue.</p>
+          <h1 className="text-xl font-semibold tracking-tight">
+            {mode === "login" ? "Welcome back" : "Create an account"}
+          </h1>
+          <p className="text-xs text-muted">
+            {mode === "login"
+              ? "Enter your email and password to continue."
+              : "Sign up with an email and password."}
+          </p>
         </div>
 
+        {/* Tabs — only show signup tab if the server allows it. */}
+        {signupAllowed && (
+          <div className="flex rounded-lg border border-border bg-elevated p-0.5">
+            <button
+              type="button"
+              onClick={() => { setMode("login"); setErr(null); }}
+              className={`flex-1 rounded-md px-3 py-1 text-sm transition-colors ${
+                mode === "login" ? "bg-surface text-text shadow-soft" : "text-muted"
+              }`}
+            >
+              Log in
+            </button>
+            <button
+              type="button"
+              onClick={() => { setMode("signup"); setErr(null); }}
+              className={`flex-1 rounded-md px-3 py-1 text-sm transition-colors ${
+                mode === "signup" ? "bg-surface text-text shadow-soft" : "text-muted"
+              }`}
+            >
+              Sign up
+            </button>
+          </div>
+        )}
+
         <input
-          type="password"
+          type="email"
           autoFocus
-          value={pass}
-          onChange={(e) => setPass(e.target.value)}
-          placeholder="Passcode"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="you@example.com"
+          autoComplete="email"
           className="field"
+          required
         />
         <input
-          type="text"
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          placeholder="Device name (optional)"
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="Password"
+          autoComplete={mode === "login" ? "current-password" : "new-password"}
+          minLength={mode === "signup" ? 6 : 1}
           className="field"
+          required
         />
         {err && (
           <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
@@ -74,10 +112,12 @@ export default function Login({ onDone }: { onDone: () => void }) {
         )}
         <button
           type="submit"
-          disabled={busy}
+          disabled={busy || !email || !password}
           className="btn-primary min-h-touch w-full"
         >
-          {busy ? "Signing in…" : "Sign in"}
+          {busy
+            ? (mode === "login" ? "Signing in…" : "Creating account…")
+            : (mode === "login" ? "Sign in" : "Sign up")}
         </button>
       </form>
     </div>

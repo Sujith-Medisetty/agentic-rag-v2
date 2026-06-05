@@ -298,6 +298,13 @@ def write_file(path: str, content: str) -> str:
     err = _check_permission("write_file", {"path": path})
     if err:
         return f"BLOCKED: {err}"
+    # Workspace jail — non-root users can only write inside the session's
+    # workspace. Root bypasses the check.
+    from tools.sandbox import check_write_path, SandboxViolation
+    try:
+        check_write_path(path)
+    except SandboxViolation as sv:
+        return f"BLOCKED: {sv}"
     # Syntax-check Python files BEFORE writing — a broken .py file on disk
     # will crash the uvicorn auto-reloader the moment it lands, taking the
     # whole backend down until the file is fixed (we hit this in the wild —
@@ -341,6 +348,11 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
     err = _check_permission("edit_file", inp)
     if err:
         return f"BLOCKED: {err}"
+    from tools.sandbox import check_write_path, SandboxViolation
+    try:
+        check_write_path(path)
+    except SandboxViolation as sv:
+        return f"BLOCKED: {sv}"
     try:
         result = _edit_file_impl(path, old_string, new_string, replace_all)
         reps = result.originalFile.count(old_string) if replace_all else 1

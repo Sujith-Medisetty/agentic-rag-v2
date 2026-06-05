@@ -1,0 +1,59 @@
+# Forge backend — systemd unit.
+#
+# Place at  /etc/systemd/system/forge-backend.service  then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable forge-backend
+#   sudo systemctl start forge-backend
+#   sudo systemctl status forge-backend
+#
+# Logs:  journalctl -u forge-backend -f
+
+[Unit]
+Description=Forge — local agentic coding assistant (FastAPI)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=forge
+Group=forge
+WorkingDirectory=/opt/forge
+
+# Load .env BEFORE uvicorn starts so all the secrets are available. The file
+# must be readable by the forge user (chmod 600 + chown forge:forge).
+EnvironmentFile=/opt/forge/.env
+
+# Use the venv's uvicorn so we don't depend on system Python paths.
+ExecStart=/opt/forge/.venv/bin/uvicorn server.app:app \
+    --host 127.0.0.1 \
+    --port 8765 \
+    --log-level info \
+    --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1
+
+# Restart on crash with a small back-off so a tight crash loop doesn't
+# spin up the box.
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Standard logging to journald — `journalctl -u forge-backend` to read.
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — runtime sandbox so a compromised backend can't trivially
+# escape and rm -rf /. Commented lines you can opt into for stricter
+# setups; the defaults below are safe for a personal VM.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+# Forge writes to /home/forge/.agentic-rag and /home/forge/forge — those
+# need to stay writable; allow them explicitly.
+ReadWritePaths=/home/forge
+
+# File descriptor limit — plenty for many concurrent WebSocket clients.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
