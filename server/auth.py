@@ -187,6 +187,40 @@ def signup(email: str, password: str) -> dict:
     )
 
 
+def reset_password(user_id: str, new_password: str) -> None:
+    """Admin-only: overwrite the user's password hash + salt. Used to
+    reset a forgotten password. New password is validated with the same
+    rules as signup (>= 6 chars)."""
+    if not new_password or len(new_password) < 6:
+        raise ValueError("password must be at least 6 characters")
+    salt = secrets.token_bytes(16)
+    hashed = _hash_password(new_password, salt)
+    if not db.update_user_password(
+        user_id=user_id,
+        password_hash=hashed.hex(),
+        password_salt=salt.hex(),
+    ):
+        raise LookupError(f"user {user_id} not found")
+    # Invalidate all existing sessions for this user — they have to log
+    # in again with the new password.
+    db.revoke_all_user_tokens(user_id)
+
+
+def delete_user(user_id: str) -> None:
+    """Admin-only: hard-delete a user row + all their auth tokens. Foreign
+    keys (auth_tokens, projects, sessions) CASCADE per the schema;
+    deployed_apps.owner_user_id SET NULLs (the admin endpoint fully
+    tears down the apps BEFORE calling this, so nothing is orphaned).
+    Caller must enforce the 'never delete the last root' rule before
+    calling this."""
+    # Drop auth tokens first — DB schema has ON DELETE CASCADE on
+    # auth_tokens.user_id, so the DELETE on users will do it, but being
+    # explicit makes the intent obvious in code.
+    db.revoke_all_user_tokens(user_id)
+    if not db.delete_user(user_id):
+        raise LookupError(f"user {user_id} not found")
+
+
 def login(email: str, password: str) -> tuple[dict, str]:
     """Verify credentials and return (user, signed_token). Raises
     PermissionError on bad credentials."""

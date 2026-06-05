@@ -107,6 +107,32 @@ CREATE TABLE IF NOT EXISTS session_processes (
 CREATE INDEX IF NOT EXISTS idx_session_processes_session
     ON session_processes(session_id);
 
+-- Ojas-owned service processes + port endpoints (main backend, caddy
+-- reverse proxy, MCP servers, deployed-app static URLs, future apps).
+-- Distinct from session_processes: these are NOT tied to a chat session,
+-- they outlive any individual session and persist across restarts (the
+-- backend re-registers itself on boot). source tells the admin UI where
+-- the row came from: 'ojas-main', 'ojas-proxy', 'ojas-deployed',
+-- 'ojas-mcp', 'ojas-external'. pid may be NULL for port-only entries
+-- (e.g. a deployed app's static URL has no dedicated process — it's
+-- served by caddy on an existing port).
+CREATE TABLE IF NOT EXISTS ojas_services (
+    id           TEXT    PRIMARY KEY,
+    source       TEXT    NOT NULL,
+    pid          INTEGER,
+    label        TEXT    NOT NULL,
+    command      TEXT,
+    port         INTEGER,
+    bind_addr    TEXT,
+    url          TEXT,
+    started_at   INTEGER NOT NULL,
+    meta_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ojas_services_source
+    ON ojas_services(source);
+CREATE INDEX IF NOT EXISTS idx_ojas_services_port
+    ON ojas_services(port);
+
 CREATE TABLE IF NOT EXISTS auth_tokens (
     token_hash    TEXT    PRIMARY KEY,
     user_id       TEXT             REFERENCES users(id) ON DELETE CASCADE,
@@ -392,6 +418,62 @@ def get_session(session_id: str) -> dict | None:
     return _row(r)
 
 
+class SessionNameConflict(ValueError):
+    """Raised by rename_session when the desired new_name is already taken
+    by another session in the same project (case-sensitive). The endpoint
+    surfaces this as a 409 with the existing session's id so the UI can
+    jump to it. Subclasses ValueError so old `except ValueError` callers
+    still catch it; adds .existing_id and .existing_name attributes for
+    the new structured-handling path."""
+
+    def __init__(self, message: str, existing_id: str, existing_name: str):
+        super().__init__(message)
+        self.existing_id = existing_id
+        self.existing_name = existing_name
+
+
+def rename_session(session_id: str, new_name: str) -> dict:
+    """Rename a session. Returns the updated row. Raises:
+      • SessionNameConflict if another session in the SAME project already
+        has `new_name` (case-sensitive, exact match)
+      • LookupError if no such session_id
+    Renaming to the same name as the current name is a no-op (allowed)."""
+    with _connect() as cx:
+        existing = cx.execute(
+            f"SELECT {_SESSION_COLS} FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if existing is None:
+            raise LookupError(f"session {session_id} not found")
+        existing_d = dict(existing)
+        # No-op if renaming to the same name.
+        if existing_d["name"] == new_name:
+            return existing_d
+        # Check for collision in the same project (case-sensitive).
+        collision = cx.execute(
+            f"SELECT {_SESSION_COLS} FROM sessions "
+            f"WHERE project_id = ? AND name = ? AND id != ?",
+            (existing_d["project_id"], new_name, session_id),
+        ).fetchone()
+        if collision is not None:
+            cd = dict(collision)
+            raise SessionNameConflict(
+                f"a session named {new_name!r} already exists in this project",
+                existing_id=cd["id"],
+                existing_name=cd["name"],
+            )
+        cx.execute(
+            "UPDATE sessions SET name = ? WHERE id = ?",
+            (new_name, session_id),
+        )
+        # Re-read for the caller.
+        r = cx.execute(
+            f"SELECT {_SESSION_COLS} FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return dict(r)
+
+
 def touch_session(session_id: str) -> None:
     """Update last_active_at so the session list sorts naturally."""
     with _connect() as cx:
@@ -599,6 +681,49 @@ def list_users() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def update_user_password(
+    user_id: str, password_hash: str, password_salt: str,
+) -> bool:
+    """Overwrite the password hash + salt. Returns False if no such user.
+    Caller is expected to also invalidate existing auth tokens."""
+    with _connect() as cx:
+        cur = cx.execute(
+            "UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?",
+            (password_hash, password_salt, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def delete_user(user_id: str) -> bool:
+    """Hard-delete a user. ON DELETE CASCADE on auth_tokens / projects
+    handles those; ON DELETE SET NULL on deployed_apps.owner_user_id
+    preserves the deployed app but orphans it. Returns False if no
+    such user."""
+    with _connect() as cx:
+        cur = cx.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return cur.rowcount > 0
+
+
+def revoke_all_user_tokens(user_id: str) -> int:
+    """Drop every auth_token for a user — used after a password reset or
+    delete. Returns the number of tokens removed."""
+    with _connect() as cx:
+        cur = cx.execute(
+            "DELETE FROM auth_tokens WHERE user_id = ?", (user_id,),
+        )
+        return cur.rowcount
+
+
+def count_root_users() -> int:
+    """How many users have role='root'. Used to enforce the
+    'never delete the last root' invariant."""
+    with _connect() as cx:
+        r = cx.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE role = 'root'"
+        ).fetchone()
+        return int(r["c"])
+
+
 # ============================================================================
 # Session processes — long-running PIDs spawned by the agent (npm run dev, etc).
 # Tracked so deletes can SIGTERM them and admin endpoints can list them.
@@ -642,6 +767,85 @@ def list_all_processes() -> list[dict]:
             "FROM session_processes ORDER BY started_at ASC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ============================================================================
+# Ojas services — main backend, caddy, deployed apps, MCP servers, etc.
+#
+# Two flavours of row:
+#   - process row:  pid IS NOT NULL  — a live OS process owned by Ojas
+#   - port row:     pid IS NULL      — a port/URL the backend knows about
+#                                    (e.g. a deployed app served via caddy)
+#
+# `id` is caller-chosen so re-registration is idempotent (e.g. the main
+# backend always uses id='ojas-main', so a restart overwrites in place).
+# ============================================================================
+
+def upsert_ojas_service(
+    id: str,
+    source: str,
+    label: str,
+    pid: int | None = None,
+    command: str | None = None,
+    port: int | None = None,
+    bind_addr: str | None = None,
+    url: str | None = None,
+    meta: dict | None = None,
+) -> None:
+    """Idempotent register-or-replace by primary key. Use a stable `id`
+    (e.g. 'ojas-main', 'ojas-caddy', f'deployed:{slug}') so restarts update
+    the row in place instead of accumulating stale entries."""
+    with _connect() as cx:
+        cx.execute(
+            "INSERT OR REPLACE INTO ojas_services"
+            "(id, source, pid, label, command, port, bind_addr, url, started_at, meta_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                id, source, pid, label, command, port, bind_addr, url,
+                _now(),
+                json.dumps(meta) if meta is not None else None,
+            ),
+        )
+
+
+def delete_ojas_service(id: str) -> None:
+    with _connect() as cx:
+        cx.execute("DELETE FROM ojas_services WHERE id = ?", (id,))
+
+
+def list_ojas_services() -> list[dict]:
+    """All Ojas-owned service rows — both live-process and port-only entries.
+    Returned shape is dict with string-parsed meta so the API layer can
+    just JSON it."""
+    with _connect() as cx:
+        rows = cx.execute(
+            "SELECT id, source, pid, label, command, port, bind_addr, url, "
+            "       started_at, meta_json "
+            "FROM ojas_services ORDER BY source ASC, port ASC NULLS LAST, label ASC"
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        if d.get("meta_json"):
+            try:
+                d["meta"] = json.loads(d.pop("meta_json"))
+            except (ValueError, TypeError):
+                d["meta"] = None
+        else:
+            d.pop("meta_json", None)
+            d["meta"] = None
+        out.append(d)
+    return out
+
+
+def clear_ojas_services_with_pid() -> int:
+    """Drop every ojas_services row that has a pid (live-process rows).
+    Port-only rows (deployed apps, known URLs) are kept. Called at backend
+    boot before re-registering the current process tree, so we don't
+    leave pointers to PIDs that no longer exist."""
+    with _connect() as cx:
+        cur = cx.execute("DELETE FROM ojas_services WHERE pid IS NOT NULL")
+        return cur.rowcount
 
 
 # ============================================================================

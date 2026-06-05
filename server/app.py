@@ -48,6 +48,9 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -77,10 +80,10 @@ from server.reporter import WebReporter, get_bus
 from server.schemas import (
     AuthStatusResponse, DeployRequest, DeployResponse, DeployedAppResponse,
     EventResponse, GitInfoResponse, LoginRequest,
-    LoginResponse, MessagePostRequest, MessageResponse, ProcessResponse,
-    ProjectCreateRequest, ProjectResponse, ProjectSettingsRequest,
-    PushResponse, SessionCreateRequest, SessionResponse, SetupRequest,
-    SignupRequest, UserResponse,
+    LoginResponse, MessagePostRequest, MessageResponse, OjasServiceResponse,
+    ProcessResponse, ProjectCreateRequest, ProjectResponse, ProjectSettingsRequest,
+    PushResponse, SessionCreateRequest, SessionRenameRequest, SessionResponse,
+    SetupRequest, SignupRequest, UserResponse, AdminResetPasswordRequest,
 )
 from server.session_runner import run_turn
 
@@ -93,7 +96,257 @@ from server.session_runner import run_turn
 async def lifespan(app: FastAPI):
     db.init_db()
     await _configure_runtime_singletons()
+    _register_ojas_services()
     yield
+
+
+def _register_ojas_services() -> None:
+    """Idempotently register the Ojas-owned runtime services (main backend,
+    caddy reverse proxy) in `ojas_services` so the admin panel can show
+    them. Called once on backend boot. Port-only rows for deployed apps
+    are also created/refreshed here so the panel always reflects the
+    truth on disk under /opt/ojas-apps/."""
+    # 1) Drop any stale PID rows from a previous boot. Deployed-app port
+    #    rows (pid IS NULL) are kept — they're tied to on-disk files, not
+    #    a process. We'll re-add the still-running ones below.
+    db.clear_ojas_services_with_pid()
+
+    # 2) Main uvicorn process. PID of this process is the uvicorn worker
+    #    (the parent is whatever launched us — uvicorn / python -m / etc.).
+    main_pid = os.getpid()
+    bind_addr = "127.0.0.1"
+    # Try to read the actual --port from the parent cmdline (works for the
+    # common `uvicorn server.app:app --host ... --port N` invocation).
+    port = 8765
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as fh:
+            parent_cmdline = fh.read().decode("utf-8", "replace").replace("\x00", " ").strip()
+        m = re.search(r"--port[=\s]+(\d+)", parent_cmdline)
+        if m:
+            port = int(m.group(1))
+    except (OSError, ValueError):
+        pass
+    db.upsert_ojas_service(
+        id="ojas-main",
+        source="ojas-main",
+        pid=main_pid,
+        label="Ojas backend (FastAPI + uvicorn)",
+        command=f"uvicorn server.app:app (pid {main_pid})",
+        port=port,
+        bind_addr=bind_addr,
+        url=f"http://{bind_addr}:{port}/api/health",
+    )
+
+    # Resolve the public hostname once for URL construction below.
+    public_domain = _resolve_public_domain()
+
+    # 3) Caddy reverse proxy (if installed). Caddy terminates 80/443 and
+    #    forwards to this backend. Detect via PATH lookup; if missing,
+    #    skip — a developer running `uvicorn` directly won't have it.
+    caddy_path = shutil.which("caddy")
+    if caddy_path:
+        # Find caddy's pid + a list of ports it's actually bound to.
+        try:
+            out = subprocess.run(
+                ["pgrep", "-x", "caddy"], capture_output=True, text=True, timeout=2,
+            ).stdout.strip().split()
+        except (OSError, subprocess.SubprocessError):
+            out = []
+        caddy_pids = [int(p) for p in out if p.isdigit()]
+        # ss from a non-root user redacts foreign pids, so we can't
+        # always attribute caddy's listening ports back to its pid. Fall
+        # back to: (a) caddy's well-known default ports (80, 443, 2019),
+        # intersected with (b) the set of LISTEN ports we can read from
+        # world-readable /proc/net/tcp{,6}. Caddy operators can override
+        # via the OJAS_CADDY_PORTS env var (comma-separated).
+        caddy_ports = _listening_ports_for_pids(caddy_pids) if caddy_pids else []
+        if not caddy_ports:
+            override = os.getenv("OJAS_CADDY_PORTS", "").strip()
+            if override:
+                candidates = [int(x) for x in override.split(",") if x.strip().isdigit()]
+            else:
+                candidates = [80, 443, 2019]
+            listening_now = {p for (p, _, _) in _listening_ports_system_wide()}
+            caddy_ports = sorted(p for p in candidates if p in listening_now)
+        if caddy_pids:
+            scheme = "https" if 443 in caddy_ports else ("http" if 80 in caddy_ports else None)
+            caddy_url: str | None = None
+            if scheme and public_domain:
+                caddy_url = f"{scheme}://{public_domain}/"
+            elif scheme:
+                caddy_url = f"{scheme}://localhost/"
+            db.upsert_ojas_service(
+                id="ojas-caddy",
+                source="ojas-proxy",
+                pid=caddy_pids[0],
+                label="Caddy reverse proxy",
+                command=f"{caddy_path} (pids {','.join(map(str, caddy_pids))})",
+                port=caddy_ports[0] if caddy_ports else None,
+                bind_addr="0.0.0.0",
+                url=caddy_url,
+                meta={
+                    "pids": caddy_pids,
+                    "ports": caddy_ports,
+                    "public_domain": public_domain,
+                },
+            )
+        # Cache the discovered ports in the ojas-external reconcile step
+        # too, so the /api/admin/services call returns them.
+
+    # 3b) Ojas web UI — the React/Vite build at /opt/ojas/web/dist. NOT a
+    #     separate process: the static files are served by caddy's
+    #     file_server directive (see deploy/Caddyfile). Registered as a
+    #     port-only row pointing at the caddy URL so the admin panel
+    #     shows it as a first-class Ojas service.
+    webui_dist = Path("/opt/ojas/web/dist")
+    if webui_dist.exists() and webui_dist.is_dir():
+        index_html = webui_dist / "index.html"
+        if index_html.exists():
+            stat = index_html.stat()
+            scheme = "https" if (caddy_path and 443 in (caddy_ports or [])) else (
+                "http" if (caddy_path and 80 in (caddy_ports or [])) else None
+            )
+            webui_url: str | None = None
+            if scheme and public_domain:
+                webui_url = f"{scheme}://{public_domain}/"
+            elif scheme:
+                webui_url = f"{scheme}://localhost/"
+            db.upsert_ojas_service(
+                id="ojas-webui",
+                source="ojas-main",
+                pid=None,
+                label="Ojas web UI (React build, served by Caddy)",
+                command=None,
+                port=443 if (caddy_path and 443 in (caddy_ports or [])) else (
+                    80 if (caddy_path and 80 in (caddy_ports or [])) else None
+                ),
+                bind_addr="0.0.0.0" if caddy_path else None,
+                url=webui_url,
+                meta={
+                    "build_path": str(webui_dist),
+                    "served_by": "ojas-caddy" if caddy_path else None,
+                    "build_mtime": int(stat.st_mtime),
+                    "build_size_kb": round(stat.st_size / 1024, 1),
+                    "public_domain": public_domain,
+                },
+            )
+
+    # 4) Deployed apps — port-only rows. Each deployed app is static
+    #    files served at /apps/<slug>/ via caddy (or by this backend in
+    #    dev mode). Re-register every row on disk so the panel stays
+    #    accurate even if the backend was restarted.
+    OJAS_APPS_ROOT.mkdir(parents=True, exist_ok=True)
+    for app_row in db.list_deployed_apps(owner_user_id=None):
+        slug = app_row["slug"]
+        # Build a clickable public URL using the resolved public domain.
+        # Falls back to the bare path if we can't determine the domain.
+        deployed_url: str | None = None
+        if public_domain:
+            deployed_url = f"https://{public_domain}/apps/{slug}/"
+        else:
+            deployed_url = f"/apps/{slug}/"
+        db.upsert_ojas_service(
+            id=f"deployed:{slug}",
+            source="ojas-deployed",
+            pid=None,
+            label=f"Deployed app: {app_row['name']}",
+            command=None,
+            port=None,
+            bind_addr=None,
+            url=deployed_url,
+            meta={
+                "slug": slug,
+                "app_dir": app_row.get("app_dir"),
+                "owner_user_id": app_row.get("owner_user_id"),
+                "source_session_id": app_row.get("source_session_id"),
+                "public_domain": public_domain,
+            },
+        )
+
+
+def _listening_ports_for_pids(pids: list[int]) -> list[int]:
+    """Return the sorted list of ports any process in `pids` is currently
+    listening on. Tries, in order:
+      1. `ss -ltnp -H` (works fully when the process is owned by us;
+         partial — no pid info — for foreign-user processes)
+      2. /proc/<pid>/fd + /proc/net/tcp inode walk (works fully only for
+         same-user pids)
+    For a non-root service like the Ojas backend (running as the `ojas`
+    user), this only attributes ports to the main uvicorn. Foreign-user
+    listeners (caddy, future services) fall through to a known-port
+    hint table in _register_ojas_services()."""
+    if not pids:
+        return []
+    pid_set = {str(p) for p in pids}
+    ss = shutil.which("ss")
+    if ss:
+        try:
+            res = subprocess.run(
+                ["ss", "-ltnp", "-H"],
+                capture_output=True, text=True, timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            res = None
+        if res is not None and res.returncode == 0:
+            ports: set[int] = set()
+            for line in res.stdout.splitlines():
+                # Lines look like:
+                #   LISTEN 0 4096 *:80 *:* users:(("caddy",pid=23816,fd=4))
+                if "pid=" not in line:
+                    continue
+                if not any(f"pid={p}," in line or f"pid={p})" in line for p in pid_set):
+                    continue
+                try:
+                    local = line.split()[3]
+                    port = int(local.rsplit(":", 1)[-1])
+                    ports.add(port)
+                except (IndexError, ValueError):
+                    continue
+            if ports:
+                return sorted(ports)
+    # Fallback — /proc scan. Works for the main backend (same user); fails
+    # for foreign-user processes like caddy running as the `caddy` user.
+    inodes_for_pid: set[str] = set()
+    try:
+        for pid in pids:
+            try:
+                for fd in os.listdir(f"/proc/{pid}/fd"):
+                    try:
+                        link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                    except OSError:
+                        continue
+                    if link.startswith("socket:["):
+                        inodes_for_pid.add(link[len("socket:["):-1])
+            except (OSError, FileNotFoundError):
+                continue
+    except Exception:
+        return []
+    if not inodes_for_pid:
+        return []
+    ports = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r") as fh:
+                fh.readline()  # header
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    local = parts[1]
+                    state = parts[3]
+                    inode = parts[9]
+                    if state != "0A":  # 0A = LISTEN
+                        continue
+                    if inode not in inodes_for_pid:
+                        continue
+                    try:
+                        port = int(local.split(":", 1)[1], 16)
+                    except (ValueError, IndexError):
+                        continue
+                    ports.add(port)
+        except OSError:
+            continue
+    return sorted(ports)
 
 
 async def _configure_runtime_singletons() -> None:
@@ -582,6 +835,24 @@ def _purge_session_everything(session: dict) -> None:
     _purge_session_bus(sid)
 
 
+def _purge_user_everything(user_id: str) -> None:
+    """One-stop cleanup for everything owned by a user, OUTSIDE what
+    SQLite CASCADE will handle. Walks every project the user owns, then
+    every session in each project, and reuses _purge_session_everything
+    to SIGTERM the agent's spawned processes + rm workspace subdirs +
+    drop langgraph checkpoints + clear the per-session event bus.
+
+    Deployed apps are NOT touched here — they have ON DELETE SET NULL on
+    owner_user_id, so the DB row survives with owner_user_id=NULL. The
+    on-disk files at /opt/ojas-apps/<slug>/ also stay; the apps remain
+    live at https://<host>/apps/<slug>/ but become 'orphan' (visible
+    to root only). If you want to wipe them too, call
+    deployed_apps_delete for each before deleting the user."""
+    for project in db.list_projects(user_id=user_id):
+        for session in db.list_sessions(project["id"]):
+            _purge_session_everything(session)
+
+
 @app.delete("/api/projects/{project_id}")
 def projects_delete(project_id: str, user: dict = Depends(require_user)):
     """Delete a project AND every cascade target. The workspace files on
@@ -613,6 +884,33 @@ def sessions_delete(session_id: str, user: dict = Depends(require_user)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
     _purge_session_everything(session)
     return {"ok": True}
+
+
+@app.patch("/api/sessions/{session_id}", response_model=SessionResponse)
+def sessions_rename(
+    session_id: str,
+    req: SessionRenameRequest,
+    user: dict = Depends(require_user),
+):
+    """Rename a session. The new name must be unique within the session's
+    project (case-sensitive). On collision, returns 409 with the existing
+    session's id so the UI can offer to jump to it instead."""
+    session = _session_or_404(session_id, user)
+    try:
+        updated = db.rename_session(session_id, req.new_name)
+    except db.SessionNameConflict as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "name_conflict",
+                "message": str(e),
+                "existing_session_id": e.existing_id,
+                "existing_session_name": e.existing_name,
+            },
+        ) from e
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
+    return SessionResponse(**updated)
 
 
 @app.get("/api/paths/browse")
@@ -1125,6 +1423,39 @@ def preview_serve(session_id: str, file_path: str = ""):
 
 OJAS_APPS_ROOT = Path("/opt/ojas-apps")
 
+# Public domain Ojas is served at. Read from the env (OJAS_DOMAIN) if set,
+# else parsed from the Caddyfile, else fall back to the request's Host
+# header at runtime. Used to build clickable URLs in the admin panel +
+# /api/deployed-apps responses.
+OJAS_DOMAIN: str | None = None
+OJAS_DOMAIN_OVERRIDE: str | None = os.getenv("OJAS_DOMAIN", "").strip() or None
+
+
+def _resolve_public_domain() -> str | None:
+    """Find the public hostname the user reaches Ojas at. Order:
+    1. OJAS_DOMAIN env var (explicit, set by install.sh)
+    2. First vhost line in the active Caddyfile (e.g. 'ojas.example.com {')
+    3. None (caller falls back to request host / localhost)
+    """
+    if OJAS_DOMAIN_OVERRIDE:
+        return OJAS_DOMAIN_OVERRIDE
+    for caddy_path in ("/etc/caddy/Caddyfile", "/opt/ojas/deploy/Caddyfile"):
+        try:
+            with open(caddy_path) as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    # Vhost lines end with '{' (or are a bare host).
+                    if s.endswith("{") or (":" in s and " " not in s and "/" not in s):
+                        host = s.rstrip("{").strip()
+                        # Skip directives like 'log' or 'import'
+                        if host and "." in host and not host.startswith("/"):
+                            return host
+        except OSError:
+            continue
+    return None
+
 
 def _deployed_app_or_404(slug: str, user: dict) -> dict:
     """Lookup + ownership check. Returns the row dict, or raises 404 if the
@@ -1217,6 +1548,32 @@ def sessions_deploy(
     # Caddy (forwarded headers handled by the uvicorn --proxy-headers flag).
     scheme = request.url.scheme
     host = request.headers.get("host", request.url.netloc)
+    # 6. Register the new app in ojas_services so the admin panel sees it
+    #    immediately (no need to wait for a backend restart). Prefer the
+    #    resolved public domain for the clickable URL so the admin panel
+    #    always shows the canonical link, not a localhost.
+    resolved = _resolve_public_domain() or host
+    if resolved and not resolved.startswith("http"):
+        deployed_service_url = f"{scheme}://{resolved}/apps/{slug}/"
+    else:
+        deployed_service_url = f"/apps/{slug}/"
+    db.upsert_ojas_service(
+        id=f"deployed:{slug}",
+        source="ojas-deployed",
+        pid=None,
+        label=f"Deployed app: {app_row['name']}",
+        command=None,
+        port=None,
+        bind_addr=None,
+        url=deployed_service_url,
+        meta={
+            "slug": slug,
+            "app_dir": app_row.get("app_dir"),
+            "owner_user_id": app_row.get("owner_user_id"),
+            "source_session_id": app_row.get("source_session_id"),
+            "public_domain": _resolve_public_domain(),
+        },
+    )
     return DeployResponse(
         slug=slug,
         url=f"{scheme}://{host}/apps/{slug}/",
@@ -1250,11 +1607,13 @@ def deployed_apps_delete(slug: str, user: dict = Depends(require_user)):
             # surface the error but still drop the row so the user can
             # retry the deploy without slug collision.
             db.delete_deployed_app(slug)
+            db.delete_ojas_service(f"deployed:{slug}")
             raise HTTPException(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
                 f"deleted DB row but file removal failed: {e}",
             )
     db.delete_deployed_app(slug)
+    db.delete_ojas_service(f"deployed:{slug}")
     return {"ok": True}
 
 
@@ -1308,23 +1667,108 @@ def admin_processes_list(_root: dict = Depends(require_root)):
     """Every tracked spawned process across every session on this VM. Each
     row carries the session_id so the admin can navigate to it from the UI.
     Includes ports — useful for spotting "which port is that preview app
-    using right now?"."""
-    return [ProcessResponse(**p) for p in db.list_all_processes()]
+    using right now?". Each row also carries `is_alive` so the UI can
+    distinguish live processes from stale DB rows (the process exited but
+    the row wasn't cleaned up)."""
+    rows = []
+    for p in db.list_all_processes():
+        # `os.kill(pid, 0)` is the cheapest "is this PID alive?" probe —
+        # sends no signal, just checks for ESRCH vs success. We tolerate
+        # permission errors (rare; only happens for setuid pids).
+        try:
+            os.kill(int(p["pid"]), 0)
+            alive = True
+        except (OSError, ProcessLookupError):
+            alive = False
+        except PermissionError:
+            # Process exists but we can't signal it (foreign user). Count as alive.
+            alive = True
+        p["is_alive"] = alive
+        rows.append(ProcessResponse(**p))
+    return rows
 
 
 @app.delete("/api/admin/processes/{pid}")
 def admin_processes_kill(pid: int, _root: dict = Depends(require_root)):
     """SIGTERM the process and unregister the row. Idempotent — if the
     process is already gone, just drops the row. Used to manually clean
-    up zombie dev servers / hung builds."""
-    import os
+    up zombie dev servers / hung builds. Refuses to kill the Ojas main
+    backend or the caddy reverse proxy — those are protected services,
+    not session-spawned work."""
     import signal
+    # Refuse to kill protected Ojas services
+    for svc in db.list_ojas_services():
+        if svc.get("pid") == pid and svc.get("source") in ("ojas-main", "ojas-proxy"):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"refusing to kill protected service '{svc['label']}' (pid {pid}); "
+                f"stop the backend / caddy via systemd instead",
+            )
     try:
         os.kill(pid, signal.SIGTERM)
     except (OSError, ProcessLookupError):
         pass
     db.unregister_process(pid)
     return {"ok": True}
+
+
+@app.get("/api/admin/services", response_model=list[OjasServiceResponse])
+def admin_services_list(_root: dict = Depends(require_root)):
+    """Every Ojas-owned service on this VM — main backend, caddy proxy,
+    deployed apps (port-only rows), MCP servers, future external services.
+    Each row is tagged with `source` so the admin UI can group them.
+
+    Also opportunistically reconciles against the live /proc/net/tcp view
+    so that any ports we've forgotten to register (e.g. an MCP server
+    started outside the DB) are picked up here."""
+    rows = db.list_ojas_services()
+
+    # For each row, derive a `ports` list. The boot-time registration
+    # stashes the full list in meta['ports'] (since the `port` column is
+    # scalar). For rows that don't have that, fall back to the scalar
+    # `port` field so the field is always populated.
+    for r in rows:
+        meta_ports = (r.get("meta") or {}).get("ports") or []
+        if meta_ports:
+            r["ports"] = sorted(set(int(x) for x in meta_ports))
+        elif r.get("port") is not None:
+            r["ports"] = [int(r["port"])]
+        else:
+            r["ports"] = []
+
+    # Reconcile: enumerate every listening port on the box and make sure
+    # each one is either (a) a registered ojas_services row, or (b) a
+    # system service we'd expect (sshd, systemd-resolve, caddy). Anything
+    # else is flagged as `ojas-external` so the admin sees it.
+    listening = _listening_ports_system_wide()
+    known_ports: set[int] = set()
+    for r in rows:
+        known_ports.update(r.get("ports") or [])
+        if r.get("port") is not None:
+            known_ports.add(int(r["port"]))
+    for port, proc_name, pid in listening:
+        if port in known_ports:
+            continue
+        # Skip well-known system ports we'd expect on a Linux box.
+        if port in (22, 53, 80, 443, 2019, 65529):
+            continue
+        if "systemd" in proc_name or "sshd" in proc_name:
+            continue
+        rows.append({
+            "id": f"external:{port}",
+            "source": "ojas-external",
+            "pid": pid,
+            "label": f"External listener on :{port}",
+            "command": proc_name,
+            "port": port,
+            "ports": [port],
+            "bind_addr": None,
+            "url": None,
+            "started_at": int(time.time()),
+            "meta": {"discovered_via": "proc_net_tcp"},
+        })
+
+    return [OjasServiceResponse(**r) for r in rows]
 
 
 @app.get("/api/admin/users", response_model=list[UserResponse])
@@ -1337,6 +1781,187 @@ def admin_users_list(_root: dict = Depends(require_root)):
         )
         for u in db.list_users()
     ]
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_user_delete(
+    user_id: str,
+    root: dict = Depends(require_root),
+):
+    """Hard-delete a user. Refuses to delete the last root account
+    (would leave the box un-administrable). Cascades to their auth
+    tokens + projects. FULLY removes their deployed apps (files + URL
+    + DB row + ojas_services row) — the public /apps/<slug>/ endpoint
+    will return 404 once this returns.
+
+    Side effects (all best-effort, never block the delete):
+      • SIGTERMs every agent-spawned process owned by the user (closes
+        their dev servers / http.servers / venv-spawned uvicorns so the
+        ports are released)
+      • removes per-session workspace subdirs under each project
+      • removes per-session langgraph checkpoint files
+      • clears per-session event bus subscribers
+      • rmtree's /opt/ojas-apps/<slug>/ for every deployed app the
+        user owns; the public URL stops serving immediately"""
+    target = db.get_user(user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    if target.get("role") == "root" and db.count_root_users() <= 1:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "refusing to delete the last root user — promote another user "
+            "to root first, or set OJAS_ROOT_EMAIL/PASSWORD in .env to "
+            "bootstrap a new one",
+        )
+    # Best-effort OS-level cleanup BEFORE the DB cascade. We catch
+    # everything so a single bad row can't lock the admin out.
+    try:
+        _purge_user_everything(user_id)
+    except Exception:
+        pass
+    # Fully tear down the user's deployed apps (files + URL + DB row +
+    # ojas_services row). Runs BEFORE auth.delete_user() because the FK
+    # on deployed_apps.owner_user_id is SET NULL — once the user is
+    # gone, the apps become orphan and we'd have to filter by name
+    # instead of owner_user_id.
+    import shutil
+    for app_row in db.list_deployed_apps(owner_user_id=user_id):
+        slug = app_row["slug"]
+        target_dir = Path(app_row["app_dir"])
+        try:
+            if target_dir.exists() and target_dir.is_dir():
+                shutil.rmtree(target_dir)
+        except OSError:
+            pass
+        try:
+            db.delete_deployed_app(slug)
+        except Exception:
+            pass
+        try:
+            db.delete_ojas_service(f"deployed:{slug}")
+        except Exception:
+            pass
+    try:
+        auth.delete_user(user_id)
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/password")
+def admin_user_reset_password(
+    user_id: str,
+    req: AdminResetPasswordRequest,
+    _root: dict = Depends(require_root),
+):
+    """Reset a user's password. Invalidates all of their existing
+    auth tokens so they have to log in again with the new password."""
+    target = db.get_user(user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+    try:
+        auth.reset_password(user_id, req.new_password)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
+    return {"ok": True}
+
+
+def _listening_ports_system_wide() -> list[tuple[int, str, int | None]]:
+    """Enumerate every TCP port currently in LISTEN on this host, with
+    the owning pid + comm name when available. Prefers `ss` (netlink,
+    works regardless of process ownership); falls back to a /proc scan
+    that can only attribute ports to same-user pids."""
+    ss = shutil.which("ss")
+    if ss:
+        out: list[tuple[int, str, int | None]] = []
+        try:
+            res = subprocess.run(
+                ["ss", "-ltnp", "-H"],
+                capture_output=True, text=True, timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            res = None
+        if res is not None and res.returncode == 0:
+            for line in res.stdout.splitlines():
+                # Example: LISTEN 0 4096 *:80 *:* users:(("caddy",pid=23816,fd=4))
+                try:
+                    local = line.split()[3]
+                    port = int(local.rsplit(":", 1)[-1])
+                except (IndexError, ValueError):
+                    continue
+                pid: int | None = None
+                if "pid=" in line:
+                    try:
+                        pid = int(line.split("pid=", 1)[1].split(",", 1)[0].split(")", 1)[0])
+                    except (IndexError, ValueError):
+                        pid = None
+                # Process name = the quoted token right before `pid=`
+                proc_name = ""
+                if "users:((\"" in line:
+                    try:
+                        proc_name = line.split("users:((\"", 1)[1].split("\"", 1)[0]
+                    except IndexError:
+                        proc_name = ""
+                out.append((port, proc_name, pid))
+            out.sort(key=lambda t: t[0])
+            return out
+
+    # Fallback: /proc scan. Only attributes ports to same-user pids.
+    try:
+        inode_to_pid: dict[str, int] = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                for fd in os.listdir(fd_dir):
+                    try:
+                        link = os.readlink(f"{fd_dir}/{fd}")
+                    except OSError:
+                        continue
+                    if link.startswith("socket:["):
+                        inode = link[len("socket:["):-1]
+                        inode_to_pid.setdefault(inode, pid)
+            except (OSError, PermissionError):
+                continue
+    except OSError:
+        return []
+
+    out = []
+    seen_ports: set[int] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r") as fh:
+                fh.readline()
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10 or parts[3] != "0A":
+                        continue
+                    local = parts[1]
+                    inode = parts[9]
+                    try:
+                        port = int(local.split(":", 1)[1], 16)
+                    except (ValueError, IndexError):
+                        continue
+                    if port in seen_ports:
+                        continue
+                    seen_ports.add(port)
+                    pid = inode_to_pid.get(inode)
+                    proc_name = ""
+                    if pid is not None:
+                        try:
+                            with open(f"/proc/{pid}/comm", "r") as pcf:
+                                proc_name = pcf.read().strip()
+                        except OSError:
+                            proc_name = f"pid:{pid}"
+                    out.append((port, proc_name, pid))
+        except OSError:
+            continue
+    out.sort(key=lambda t: t[0])
+    return out
 
 
 # ============================================================================

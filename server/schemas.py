@@ -35,6 +35,10 @@ class UserResponse(BaseModel):
  role: str
  created_at: int
 
+class AdminResetPasswordRequest(BaseModel):
+ # New password. Same validation as signup: min 6 chars.
+ new_password: str = Field(min_length=6, description="At least 6 characters")
+
 class LoginResponse(BaseModel):
  token: str
  user: UserResponse
@@ -69,6 +73,12 @@ class ProjectSettingsRequest(BaseModel):
 class SessionCreateRequest(BaseModel):
  name: str = Field(min_length=1, max_length=128)
 
+class SessionRenameRequest(BaseModel):
+ """PATCH body for renaming a session. Same name uniqueness rule as
+ create: no two sessions in the same project can share a name
+ (case-sensitive)."""
+ new_name: str = Field(min_length=1, max_length=128)
+
 class SessionResponse(BaseModel):
  id: str
  project_id: str
@@ -89,6 +99,31 @@ class ProcessResponse(BaseModel):
  command: str
  port: int | None = None
  started_at: int
+ # True if the PID is still a live process on the box. False means the
+ # DB row is stale (the process exited but the session wasn't cleaned
+ # up). The UI shows a 💀 marker on dead rows so the admin can decide
+ # whether to click Kill (which will unregister the row).
+ is_alive: bool = True
+
+class OjasServiceResponse(BaseModel):
+ """An Ojas-owned service row. Either a live process (pid set) or a
+ known port/URL endpoint (pid null — e.g. a deployed app's static URL
+ served by caddy). `source` is a short tag the admin UI uses to group
+ rows: 'ojas-main', 'ojas-proxy', 'ojas-deployed', 'ojas-mcp'."""
+ id: str
+ source: str
+ pid: int | None = None
+ label: str
+ command: str | None = None
+ port: int | None = None
+ # All listening ports the service currently owns. `port` above is the
+ # first entry of this list (kept for backward-compat single-port lookups);
+ # the full list lives here so the UI can show "caddy: 80, 443, 2019".
+ ports: list[int] = []
+ bind_addr: str | None = None
+ url: str | None = None
+ started_at: int
+ meta: dict | None = None
 
 # ---- Messages -------------------------------------------------------------
 

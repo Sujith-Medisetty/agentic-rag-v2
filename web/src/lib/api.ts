@@ -117,13 +117,49 @@ export interface AdminProcess {
   command: string;
   port: number | null;
   started_at: number;
+  // True if the PID is still alive on the box. False means the DB row
+  // is stale (the process exited but wasn't cleaned up). The UI shows
+  // a 💀 marker for dead rows.
+  is_alive: boolean;
+}
+
+export interface OjasService {
+  id: string;
+  // "ojas-main"     → FastAPI/uvicorn backend
+  // "ojas-proxy"    → caddy / reverse proxy
+  // "ojas-deployed" → a deployed app (static files served via caddy)
+  // "ojas-mcp"      → MCP server
+  // "ojas-external" → discovered on a listening port we didn't register
+  source: string;
+  pid: number | null;
+  label: string;
+  command: string | null;
+  port: number | null;
+  // Full list of listening ports the service owns. `port` above is the
+  // first entry; the full list is here so caddy shows 80, 443, 2019.
+  ports: number[];
+  bind_addr: string | null;
+  url: string | null;
+  started_at: number;
+  meta: Record<string, any> | null;
 }
 
 export const adminApi = {
   processes: () => request<AdminProcess[]>("/api/admin/processes"),
   killProcess: (pid: number) =>
     request<{ ok: true }>(`/api/admin/processes/${pid}`, { method: "DELETE" }),
+  services: () => request<OjasService[]>("/api/admin/services"),
   users: () => request<AuthUser[]>("/api/admin/users"),
+  deleteUser: (userId: string) =>
+    request<{ ok: true }>(`/api/admin/users/${encodeURIComponent(userId)}`, { method: "DELETE" }),
+  resetUserPassword: (userId: string, newPassword: string) =>
+    request<{ ok: true }>(
+      `/api/admin/users/${encodeURIComponent(userId)}/password`,
+      {
+        method: "POST",
+        body: JSON.stringify({ new_password: newPassword }),
+      },
+    ),
 };
 
 export const pathsApi = {
@@ -187,6 +223,11 @@ export const sessionsApi = {
       `/api/projects/${encodeURIComponent(projectId)}/sessions`,
       { method: "POST", body: JSON.stringify({ name }) },
     ),
+  rename: (sessionId: string, newName: string) =>
+    request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ new_name: newName }),
+    }),
   remove: (sessionId: string) =>
     request<{ ok: true }>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",
