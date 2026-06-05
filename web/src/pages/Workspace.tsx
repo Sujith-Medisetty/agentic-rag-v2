@@ -2,7 +2,8 @@
 // sidebar. The sidebar holds every session in the default project, a "+ New
 // chat" button, theme toggle, and log-out. There's NO project-picker page
 // anymore for casual use: when the user logs in, this page auto-creates a
-// default project at ~/Desktop/Ojas and lands them directly in the chat.
+// default project at the platform-default workspace (Linux: ~/ojas) and
+// lands them directly in the chat.
 
 import { useEffect, useRef, useState } from "react";
 import { Outlet, useNavigate, useParams, Link } from "react-router-dom";
@@ -272,27 +273,64 @@ export default function Workspace() {
           activeSessionId ? (
             <Outlet context={{ project, sidebarOpen }} />
           ) : (
-            <div className="flex flex-1 flex-col items-center justify-center px-6 py-8 text-center">
+            <div className="flex flex-1 flex-col items-center justify-center px-6 py-10 text-center">
               <div
                 aria-hidden
-                className="mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-gradient shadow-lift"
+                className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-accent-gradient shadow-lift"
               >
-                <span className="text-2xl font-bold text-white">F</span>
+                <span className="text-3xl font-bold text-white">O</span>
               </div>
-              <h1 className="font-serif text-3xl font-semibold tracking-tight">
+              <h1 className="font-serif text-3xl font-semibold tracking-tight md:text-4xl">
                 Welcome to Ojas
               </h1>
-              <p className="mt-2 max-w-md text-sm text-muted">
-                Pick a chat from the sidebar to resume it, or start a new one.
-                Everything you build lands under <span className="font-mono">~/Desktop/Ojas</span>.
+              <p className="mt-3 max-w-xl text-base text-muted">
+                Your personal coding agent. Describe what you want in plain
+                English — Ojas plans, writes, runs, and ships the code for
+                you, autonomously.
               </p>
+
               <button
                 type="button"
                 onClick={startNew}
-                className="btn-primary mt-5"
+                className="btn-primary mt-6 min-h-touch px-6"
               >
-                + New chat
+                + Start a new chat
               </button>
+              <p className="mt-3 text-xs text-muted">
+                Or pick an existing chat from the sidebar to resume it.
+              </p>
+
+              {/* Try-saying examples. Concrete prompts make it obvious
+                  what kind of asks Ojas handles best. Clicking one starts
+                  a new chat with the prompt pre-filled (the agent picks
+                  up the message when the user hits send). */}
+              <div className="mt-10 w-full max-w-2xl">
+                <p className="mb-3 text-xs font-medium uppercase tracking-wider text-muted">
+                  Try saying
+                </p>
+                <div className="grid gap-2 text-left text-sm sm:grid-cols-2">
+                  {[
+                    "Build a small todo app I can install on my phone.",
+                    "Make a snake game in vanilla JS.",
+                    "Set up a FastAPI backend with a hello endpoint.",
+                    "Add dark mode to my React app.",
+                  ].map((prompt) => (
+                    <button
+                      key={prompt}
+                      type="button"
+                      onClick={startNew}
+                      className="rounded-lg border border-border bg-elevated px-3 py-2.5 text-muted transition-colors hover:border-accent/40 hover:bg-surface hover:text-text"
+                    >
+                      &ldquo;{prompt}&rdquo;
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <p className="mt-10 text-xs text-muted/70">
+                Tip: install Ojas to your home screen — it works like a
+                native app. Look for the install button on this page.
+              </p>
             </div>
           )
         ) : (
@@ -302,7 +340,7 @@ export default function Workspace() {
                 {loadErr ? "Couldn't load workspace" : "Setting up your workspace…"}
               </div>
               <p className="mt-2 text-sm text-muted">
-                {loadErr ?? "Creating ~/Desktop/Ojas if it doesn't exist."}
+                {loadErr ?? "Getting your default project ready."}
               </p>
             </div>
           </div>
