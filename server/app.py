@@ -46,9 +46,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+logger = logging.getLogger("forge.app")
 
 # Load .env at the project root BEFORE any other module reads os.getenv. The
 # file is owner-only by convention (`chmod 600 .env`) and is git-ignored, so
@@ -246,8 +249,15 @@ def auth_signup(req: SignupRequest):
         _bootstrap_default_project(user)
     except Exception:
         # Project creation must not break signup itself — the user can
-        # still trigger it via the Workspace flow on next visit.
-        pass
+        # still trigger it via the Workspace flow on next visit. We log
+        # with full traceback so a recurrence is debuggable instead of
+        # silently leaving the user with a half-set-up account that
+        # later 500s on session create with a confusing permission
+        # error on the missing/wrong-owned workspace dir.
+        logger.exception(
+            "bootstrap_default_project failed for user_id=%s email=%s",
+            user.get("id"), user.get("email"),
+        )
 
     # Auto-log-in after signup so the user lands straight in the app.
     _, token = auth.login(req.email, req.password)
@@ -273,7 +283,18 @@ def _bootstrap_default_project(user: dict) -> None:
         local = user["email"].split("@", 1)[0]
         slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in local).lower()[:40]
         default_ws = str(Path(base_ws) / slug)
-    os.makedirs(default_ws, exist_ok=True)
+    try:
+        os.makedirs(default_ws, exist_ok=True)
+    except OSError:
+        # Surface why mkdir failed before re-raising. The signup caller
+        # swallows the exception but logs it, so this trace tells us
+        # whether the parent was unreadable, owned by root, on a RO
+        # mount, etc. instead of leaving us guessing later.
+        logger.exception(
+            "default workspace mkdir failed: path=%s euid=%s",
+            default_ws, os.geteuid(),
+        )
+        raise
     name = "Ojas"
     suffix = 0
     while True:
@@ -738,12 +759,34 @@ def sessions_create(
     # to ls. Real id is in the DB row.
     s = db.create_session(project_id, req.name, user_id=user["id"])
     subdir_slug = s["id"][:8]
-    subdir = Path(project["workspace_path"]) / subdir_slug
+    workspace_root = Path(project["workspace_path"])
+    subdir = workspace_root / subdir_slug
+    # Self-heal the project workspace directory if it went missing or was
+    # never materialised. Previously a silent _bootstrap_default_project
+    # failure during signup would leave the project row pointing at a path
+    # that didn't exist (or got patched in as root and thus unwritable by
+    # the forge service user) — sessions_create would then 500 with an
+    # opaque "Permission denied: <subdir>" error. Now we validate the
+    # parent first, attempt to (re)create it with our own ownership, and
+    # surface a much clearer error when even that fails.
     try:
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        if not os.access(workspace_root, os.W_OK):
+            raise PermissionError(
+                f"project workspace '{workspace_root}' exists but isn't "
+                f"writable by the backend (uid={os.geteuid()}). "
+                f"Check ownership: `sudo chown -R forge:forge "
+                f"{workspace_root}`."
+            )
         subdir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         # Roll back the session row so we don't leave a dangling record.
         db.delete_session(s["id"])
+        logger.error(
+            "sessions_create mkdir failed: project_id=%s workspace=%s "
+            "subdir=%s err=%s",
+            project_id, workspace_root, subdir, e,
+        )
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             f"could not create session workspace: {e}",
