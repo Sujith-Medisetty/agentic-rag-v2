@@ -465,7 +465,7 @@ def list_events(
     if since is not None:
         sql += " AND created_at > ?"
         args.append(since)
-    sql += " ORDER BY created_at ASC"
+    sql += " ORDER BY created_at ASC, rowid ASC"
     if limit is not None:
         sql += " LIMIT ?"
         args.append(limit)
