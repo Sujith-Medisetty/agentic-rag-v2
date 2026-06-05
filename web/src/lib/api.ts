@@ -141,6 +141,40 @@ export const pathsApi = {
     ),
 };
 
+// ---- Deployed apps -------------------------------------------------------
+//
+// Persistent installable apps living at https://<host>/apps/<slug>/. A
+// session's built dist/ is "promoted" via POST /api/sessions/:id/deploy.
+// The deployed app survives session-delete + backend restart — it's just
+// static files on disk + a DB row, no process.
+
+export interface DeployedApp {
+  slug: string;
+  name: string;
+  source_session_id: string | null;
+  source_project_id: string | null;
+  owner_user_id: string | null;
+  app_dir: string;
+  deployed_at: number;
+  last_redeploy_at: number;
+}
+
+export interface DeployResult {
+  slug: string;
+  url: string;
+  app: DeployedApp;
+}
+
+export const deployedAppsApi = {
+  list: () => request<DeployedApp[]>("/api/deployed-apps"),
+  delete: (slug: string) =>
+    request<{ ok: true }>(
+      `/api/deployed-apps/${encodeURIComponent(slug)}`,
+      { method: "DELETE" },
+    ),
+  // Deploy is per-session — convenience method lives on sessionApi below.
+};
+
 // ---- Sessions ------------------------------------------------------------
 
 export const sessionsApi = {
@@ -193,5 +227,14 @@ export const sessionApi = {
     request<{ ok: boolean; reason?: string; before?: number; after?: number }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/compact`,
       { method: "POST" },
+    ),
+  // Promote the session's built dist/ to a persistent installable URL
+  // at /apps/<slug>/. Slug is optional — server slugifies the session
+  // name and appends -2/-3 on collision. Re-deploying to the same slug
+  // (same owner) atomically swaps the files.
+  deploy: (sessionId: string, slug?: string) =>
+    request<DeployResult>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/deploy`,
+      { method: "POST", body: JSON.stringify({ slug: slug ?? null }) },
     ),
 };

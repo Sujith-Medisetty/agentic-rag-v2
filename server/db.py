@@ -114,6 +114,27 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
     created_at    INTEGER NOT NULL,
     last_used_at  INTEGER
 );
+
+-- Deployed apps: a session's built dist/ "promoted" to a persistent location
+-- under /opt/ojas-apps/<slug>/. Decoupled from the session — when the source
+-- session is deleted, the deployed app survives (owner_user_id falls back
+-- via ON DELETE SET NULL). Slug is the public URL component
+-- (https://<host>/apps/<slug>/), unique across the install.
+CREATE TABLE IF NOT EXISTS deployed_apps (
+    slug                 TEXT    PRIMARY KEY,
+    name                 TEXT    NOT NULL,
+    -- Source session is kept ONLY as a back-reference for the UI ("you
+    -- deployed this from session X"); nullable so deleting the source
+    -- session doesn't cascade-kill the deployed app.
+    source_session_id    TEXT,
+    source_project_id    TEXT,
+    owner_user_id        TEXT             REFERENCES users(id) ON DELETE SET NULL,
+    app_dir              TEXT    NOT NULL,
+    deployed_at          INTEGER NOT NULL,
+    last_redeploy_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deployed_apps_owner
+    ON deployed_apps(owner_user_id);
 """
 
 
@@ -621,3 +642,98 @@ def list_all_processes() -> list[dict]:
             "FROM session_processes ORDER BY started_at ASC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ============================================================================
+# Deployed apps — promoted session builds living at /opt/ojas-apps/<slug>/
+# ============================================================================
+
+import re as _re
+
+
+def _slugify(text: str) -> str:
+    """Lowercase, drop non-alphanumeric (except - and _), collapse repeated
+    hyphens. Returns '' for empty/garbage input so callers can fall back
+    to a default like 'app'."""
+    s = (text or "").strip().lower()
+    s = _re.sub(r"[^a-z0-9_-]+", "-", s)
+    s = _re.sub(r"-{2,}", "-", s).strip("-_")
+    return s[:40]   # cap length so URLs stay tidy
+
+
+def allocate_deployed_slug(desired: str) -> str:
+    """Return a free slug — `desired` if unused, else desired-2, desired-3, …
+    Up to -999 before giving up (in practice the user picks a better name
+    long before then). Raises RuntimeError on exhaustion."""
+    base = _slugify(desired) or "app"
+    if get_deployed_app(base) is None:
+        return base
+    for i in range(2, 1000):
+        candidate = f"{base}-{i}"
+        if get_deployed_app(candidate) is None:
+            return candidate
+    raise RuntimeError(f"couldn't allocate a slug starting with '{base}' (1000 already taken)")
+
+
+def create_deployed_app(
+    slug: str, name: str, app_dir: str,
+    source_session_id: str | None = None,
+    source_project_id: str | None = None,
+    owner_user_id: str | None = None,
+) -> dict:
+    """Insert a new deployed-app row. Caller has already copied files to
+    `app_dir` and verified the slug is free."""
+    now = int(time.time())
+    with _connect() as cx:
+        cx.execute(
+            "INSERT INTO deployed_apps "
+            "(slug, name, source_session_id, source_project_id, owner_user_id, "
+            "app_dir, deployed_at, last_redeploy_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (slug, name, source_session_id, source_project_id, owner_user_id,
+             app_dir, now, now),
+        )
+    return get_deployed_app(slug) or {}
+
+
+def touch_deployed_app(slug: str) -> None:
+    """Bump last_redeploy_at after an in-place re-promote of the same slug."""
+    with _connect() as cx:
+        cx.execute(
+            "UPDATE deployed_apps SET last_redeploy_at = ? WHERE slug = ?",
+            (int(time.time()), slug),
+        )
+
+
+def get_deployed_app(slug: str) -> dict | None:
+    with _connect() as cx:
+        row = cx.execute(
+            "SELECT * FROM deployed_apps WHERE slug = ?", (slug,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_deployed_apps(owner_user_id: str | None = None) -> list[dict]:
+    """List deployed apps. If owner_user_id is given, only that user's apps
+    (plus any orphan apps whose owner was deleted — keeps the admin view
+    able to clean those up). None = all (root scope)."""
+    with _connect() as cx:
+        if owner_user_id is None:
+            rows = cx.execute(
+                "SELECT * FROM deployed_apps ORDER BY last_redeploy_at DESC"
+            ).fetchall()
+        else:
+            rows = cx.execute(
+                "SELECT * FROM deployed_apps WHERE owner_user_id = ? "
+                "ORDER BY last_redeploy_at DESC",
+                (owner_user_id,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_deployed_app(slug: str) -> bool:
+    """Remove the DB row. Caller is responsible for rmtree on app_dir.
+    Returns True if a row was deleted."""
+    with _connect() as cx:
+        cur = cx.execute("DELETE FROM deployed_apps WHERE slug = ?", (slug,))
+        return cur.rowcount > 0

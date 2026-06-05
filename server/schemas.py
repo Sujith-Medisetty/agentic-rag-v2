@@ -126,3 +126,28 @@ class PushResponse(BaseModel):
  branch: str = ""
  remote: str = ""
  error: str = ""
+
+# ---- Deployed apps -------------------------------------------------------
+
+class DeployRequest(BaseModel):
+ # Optional user-chosen slug. If omitted, server slugifies session name.
+ # If the requested slug already exists, server appends -2, -3, etc.
+ slug: str | None = None
+
+class DeployedAppResponse(BaseModel):
+ slug: str
+ name: str
+ source_session_id: str | None = None
+ source_project_id: str | None = None
+ owner_user_id: str | None = None
+ app_dir: str
+ deployed_at: int
+ last_redeploy_at: int
+
+class DeployResponse(BaseModel):
+ # The slug we actually allocated (may differ from request if collision).
+ slug: str
+ # Relative URL — UI prepends current origin for the share link.
+ url: str
+ # The full DeployedAppResponse so the UI can immediately add it to its list.
+ app: DeployedAppResponse
