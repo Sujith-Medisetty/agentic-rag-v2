@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Forge — update + restart.
+# Ojas — update + restart.
 #
 # Run this AFTER `install.sh` whenever you want to pull the latest code:
-#   sudo bash /opt/forge/deploy/update.sh
+#   sudo bash /opt/ojas/deploy/update.sh
 #
 # Pulls from origin, reinstalls any new Python deps, rebuilds the frontend,
 # restarts the systemd unit. No need to re-touch Caddy unless the Caddyfile
@@ -10,8 +10,8 @@
 
 set -euo pipefail
 
-FORGE_DIR="${FORGE_DIR:-/opt/forge}"
-FORGE_USER="${FORGE_USER:-forge}"
+FORGE_DIR="${FORGE_DIR:-/opt/ojas}"
+FORGE_USER="${FORGE_USER:-ojas}"
 FORGE_BRANCH="${FORGE_BRANCH:-master}"
 
 BLUE="\033[34m"; GREEN="\033[32m"; RST="\033[0m"
@@ -44,11 +44,11 @@ EOF
 ok "Frontend built"
 
 log "Restarting backend"
-systemctl restart forge-backend
-ok "forge-backend restarted"
+systemctl restart ojas-backend
+ok "ojas-backend restarted"
 
 log "Reloading Caddy"
 systemctl reload caddy
 ok "Caddy reloaded"
 
-printf "\n${GREEN}Done.${RST} Tail logs with:  journalctl -u forge-backend -f\n"
+printf "\n${GREEN}Done.${RST} Tail logs with:  journalctl -u ojas-backend -f\n"

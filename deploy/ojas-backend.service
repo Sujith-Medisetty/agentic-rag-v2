@@ -1,30 +1,30 @@
-# Forge backend — systemd unit.
+# Ojas backend — systemd unit.
 #
-# Place at  /etc/systemd/system/forge-backend.service  then:
+# Place at  /etc/systemd/system/ojas-backend.service  then:
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable forge-backend
-#   sudo systemctl start forge-backend
-#   sudo systemctl status forge-backend
+#   sudo systemctl enable ojas-backend
+#   sudo systemctl start ojas-backend
+#   sudo systemctl status ojas-backend
 #
-# Logs:  journalctl -u forge-backend -f
+# Logs:  journalctl -u ojas-backend -f
 
 [Unit]
-Description=Forge — local agentic coding assistant (FastAPI)
+Description=Ojas — local agentic coding assistant (FastAPI)
 After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-User=forge
-Group=forge
-WorkingDirectory=/opt/forge
+User=ojas
+Group=ojas
+WorkingDirectory=/opt/ojas
 
 # Load .env BEFORE uvicorn starts so all the secrets are available. The file
-# must be readable by the forge user (chmod 600 + chown forge:forge).
-EnvironmentFile=/opt/forge/.env
+# must be readable by the ojas user (chmod 600 + chown ojas:ojas).
+EnvironmentFile=/opt/ojas/.env
 
 # Use the venv's uvicorn so we don't depend on system Python paths.
-ExecStart=/opt/forge/.venv/bin/uvicorn server.app:app \
+ExecStart=/opt/ojas/.venv/bin/uvicorn server.app:app \
     --host 127.0.0.1 \
     --port 8765 \
     --log-level info \
@@ -38,7 +38,7 @@ RestartSec=3
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
-# Standard logging to journald — `journalctl -u forge-backend` to read.
+# Standard logging to journald — `journalctl -u ojas-backend` to read.
 StandardOutput=journal
 StandardError=journal
 
@@ -48,9 +48,9 @@ StandardError=journal
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
-# Forge writes to /home/forge/.agentic-rag and /home/forge/forge — those
+# Ojas writes to /home/ojas/.agentic-rag and /home/ojas/ojas — those
 # need to stay writable; allow them explicitly.
-ReadWritePaths=/home/forge
+ReadWritePaths=/home/ojas
 
 # File descriptor limit — plenty for many concurrent WebSocket clients.
 LimitNOFILE=65536
