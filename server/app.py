@@ -348,6 +348,16 @@ def projects_default(user: dict = Depends(require_user)):
         └── <user_email_slug_2>/                  (another user's)
     Root user uses the unscoped root directly (no email subdir) for simplicity.
     """
+    # If the user already owns ANY project, reuse it. We used to require an
+    # exact `workspace_path` match here, but path canonicalization differences
+    # (symlinks / trailing slash / Path(...).resolve()) were producing one
+    # new orphan project per login on the VM — the old one's sessions then
+    # became unreachable. Returning the first owned project is robust to all
+    # of that. Users only ever have one "default" in practice.
+    existing = db.list_projects(user_id=user["id"])
+    if existing:
+        return ProjectResponse(**existing[0])
+
     base_ws = _default_workspace_path()
     if user["role"] == "root":
         default_ws = base_ws
@@ -357,10 +367,6 @@ def projects_default(user: dict = Depends(require_user)):
         slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in local).lower()[:40]
         default_ws = str(Path(base_ws) / slug)
 
-    # Reuse if a project already points here (idempotent) — scoped to user.
-    for p in db.list_projects(user_id=user["id"]):
-        if p["workspace_path"] == default_ws:
-            return ProjectResponse(**p)
     try:
         os.makedirs(default_ws, exist_ok=True)
     except OSError as e:
@@ -1068,3 +1074,43 @@ def admin_users_list(_root: dict = Depends(require_root)):
 @app.get("/api/health")
 def health():
     return {"ok": True, "needs_setup": auth.needs_setup()}
+
+
+@app.get("/api/debug/whoami")
+def debug_whoami(user: dict = Depends(require_user)):
+    """Diagnostic endpoint — answers "who does the server think I am, and
+    what data does it see for me?" Used to pin down session/project
+    persistence bugs. Safe to expose: only returns the caller's own data
+    (root sees everything, but that's already true everywhere)."""
+    projects = db.list_projects(user_id=user["id"])
+    sessions_by_project: list[dict] = []
+    total_sessions = 0
+    for p in projects:
+        ss = db.list_sessions(p["id"])
+        total_sessions += len(ss)
+        sessions_by_project.append({
+            "project_id":   p["id"],
+            "project_name": p["name"],
+            "workspace":    p["workspace_path"],
+            "user_id":      p.get("user_id"),
+            "session_count": len(ss),
+            "sessions": [
+                {
+                    "id":              s["id"],
+                    "name":            s["name"],
+                    "user_id":         s.get("user_id"),
+                    "workspace_subdir": s.get("workspace_subdir"),
+                    "last_active_at":  s["last_active_at"],
+                }
+                for s in ss[:10]   # cap so the response stays compact
+            ],
+        })
+    return {
+        "user": {
+            "id": user["id"], "email": user["email"], "role": user["role"],
+        },
+        "project_count": len(projects),
+        "session_count": total_sessions,
+        "projects": sessions_by_project,
+        "default_workspace_path": _default_workspace_path(),
+    }
