@@ -2,8 +2,8 @@
 // (when a valid token is already in localStorage).
 
 import { useEffect, useState } from "react";
-import { authApi } from "@/lib/api";
-import { hasToken } from "@/lib/auth";
+import { authApi, ApiError } from "@/lib/api";
+import { hasToken, clearToken } from "@/lib/auth";
 import Setup from "@/pages/Setup";
 import Login from "@/pages/Login";
 
@@ -20,13 +20,29 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
         if (cancelled) return;
         if (status.needs_setup) {
           setGate("setup");
-        } else if (hasToken()) {
-          setGate("ready");
+          return;
+        }
+        if (!hasToken()) {
+          setGate("login");
+          return;
+        }
+        // Validate the stored token against the server before rendering the
+        // workspace. A stale token (from a different account or a cleared DB)
+        // would let the workspace mount and then 401 on every API call with
+        // no way to recover short of a manual logout. /me is cheap and tells
+        // us whether the token is still live.
+        await authApi.me();
+        if (cancelled) return;
+        setGate("ready");
+      } catch (e) {
+        if (cancelled) return;
+        if (e instanceof ApiError && e.status === 401) {
+          // Token is invalid — clear it and show the login form.
+          clearToken();
+          setGate("login");
         } else {
           setGate("login");
         }
-      } catch {
-        if (!cancelled) setGate("login");
       }
     })();
     return () => {
