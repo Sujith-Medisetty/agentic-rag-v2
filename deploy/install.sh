@@ -21,11 +21,11 @@ set -euo pipefail
 
 # ---- Config (override via env) --------------------------------------------
 
-FORGE_REPO="${FORGE_REPO:-https://github.com/Sujith-Medisetty/agentic-rag-v2.git}"
-FORGE_BRANCH="${FORGE_BRANCH:-master}"
-FORGE_DIR="${FORGE_DIR:-/opt/ojas}"
-FORGE_USER="${FORGE_USER:-ojas}"
-FORGE_DOMAIN="${FORGE_DOMAIN:-forge.example.com}"
+OJAS_REPO="${OJAS_REPO:-https://github.com/Sujith-Medisetty/agentic-rag-v2.git}"
+OJAS_BRANCH="${OJAS_BRANCH:-master}"
+OJAS_DIR="${OJAS_DIR:-/opt/ojas}"
+OJAS_USER="${OJAS_USER:-ojas}"
+OJAS_DOMAIN="${OJAS_DOMAIN:-ojas.example.com}"
 
 # ---- Style ----------------------------------------------------------------
 
@@ -80,36 +80,36 @@ ok "Node installed: $(node -v)"
 # ---- 2. ojas user --------------------------------------------------------
 
 banner "Setting up ojas user"
-if ! id "${FORGE_USER}" >/dev/null 2>&1; then
-    useradd --system --create-home --shell /usr/sbin/nologin "${FORGE_USER}"
-    ok "Created system user '${FORGE_USER}'"
+if ! id "${OJAS_USER}" >/dev/null 2>&1; then
+    useradd --system --create-home --shell /usr/sbin/nologin "${OJAS_USER}"
+    ok "Created system user '${OJAS_USER}'"
 else
-    ok "User '${FORGE_USER}' already exists"
+    ok "User '${OJAS_USER}' already exists"
 fi
 
 # ---- 3. Clone repo --------------------------------------------------------
 
 banner "Fetching Ojas source"
-if [[ -d "${FORGE_DIR}/.git" ]]; then
-    log "Updating existing checkout at ${FORGE_DIR}"
+if [[ -d "${OJAS_DIR}/.git" ]]; then
+    log "Updating existing checkout at ${OJAS_DIR}"
     # Run git as the owning user. Running it as root on an ojas-owned repo
     # trips git's safe.directory protection ("dubious ownership"). Doing it
     # as the service user avoids that AND keeps file modes consistent.
-    sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" fetch origin "${FORGE_BRANCH}"
-    sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" reset --hard "origin/${FORGE_BRANCH}"
+    sudo -u "${OJAS_USER}" git -C "${OJAS_DIR}" fetch origin "${OJAS_BRANCH}"
+    sudo -u "${OJAS_USER}" git -C "${OJAS_DIR}" reset --hard "origin/${OJAS_BRANCH}"
 else
-    log "Cloning ${FORGE_REPO} into ${FORGE_DIR}"
-    git clone --branch "${FORGE_BRANCH}" "${FORGE_REPO}" "${FORGE_DIR}"
-    chown -R "${FORGE_USER}:${FORGE_USER}" "${FORGE_DIR}"
+    log "Cloning ${OJAS_REPO} into ${OJAS_DIR}"
+    git clone --branch "${OJAS_BRANCH}" "${OJAS_REPO}" "${OJAS_DIR}"
+    chown -R "${OJAS_USER}:${OJAS_USER}" "${OJAS_DIR}"
 fi
-ok "Source ready at ${FORGE_DIR}"
+ok "Source ready at ${OJAS_DIR}"
 
 # ---- 4. Python venv + deps ------------------------------------------------
 
 banner "Installing Python deps"
-sudo -u "${FORGE_USER}" bash <<EOF
+sudo -u "${OJAS_USER}" bash <<EOF
 set -e
-cd ${FORGE_DIR}
+cd ${OJAS_DIR}
 if [[ ! -d .venv ]]; then
     python3 -m venv .venv
 fi
@@ -122,43 +122,43 @@ ok "Python deps installed"
 # ---- 5. Frontend build ----------------------------------------------------
 
 banner "Building frontend (web/dist)"
-sudo -u "${FORGE_USER}" bash <<EOF
+sudo -u "${OJAS_USER}" bash <<EOF
 set -e
-cd ${FORGE_DIR}/web
+cd ${OJAS_DIR}/web
 if [[ ! -d node_modules ]]; then
     npm ci --silent
 fi
 npm run build --silent
 EOF
-ok "Frontend built → ${FORGE_DIR}/web/dist"
+ok "Frontend built → ${OJAS_DIR}/web/dist"
 
 # ---- 6. Systemd unit + Caddyfile -----------------------------------------
 
 banner "Installing systemd unit"
-install -o root -g root -m 644 "${FORGE_DIR}/deploy/ojas-backend.service" \
+install -o root -g root -m 644 "${OJAS_DIR}/deploy/ojas-backend.service" \
     /etc/systemd/system/ojas-backend.service
 ok "Unit file installed"
 
 banner "Installing Caddyfile"
-sed "s/forge\\.example\\.com/${FORGE_DOMAIN}/g" \
-    "${FORGE_DIR}/deploy/Caddyfile" > /etc/caddy/Caddyfile
-ok "Caddyfile installed for domain: ${FORGE_DOMAIN}"
+sed "s/ojas\\.example\\.com/${OJAS_DOMAIN}/g" \
+    "${OJAS_DIR}/deploy/Caddyfile" > /etc/caddy/Caddyfile
+ok "Caddyfile installed for domain: ${OJAS_DOMAIN}"
 
 # ---- 7. .env reminder -----------------------------------------------------
 
-ENV_PATH="${FORGE_DIR}/.env"
+ENV_PATH="${OJAS_DIR}/.env"
 if [[ ! -f "${ENV_PATH}" ]]; then
-    cp "${FORGE_DIR}/.env.example" "${ENV_PATH}"
-    chown "${FORGE_USER}:${FORGE_USER}" "${ENV_PATH}"
+    cp "${OJAS_DIR}/.env.example" "${ENV_PATH}"
+    chown "${OJAS_USER}:${OJAS_USER}" "${ENV_PATH}"
     chmod 600 "${ENV_PATH}"
     warn "Created ${ENV_PATH} from .env.example. EDIT IT before starting services:"
-    warn "  sudo -u ${FORGE_USER} \$EDITOR ${ENV_PATH}"
+    warn "  sudo -u ${OJAS_USER} \$EDITOR ${ENV_PATH}"
     warn ""
     warn "At minimum set:"
     warn "  ANTHROPIC_API_KEY (or your provider's API key)"
-    warn "  FORGE_ROOT_EMAIL"
-    warn "  FORGE_ROOT_PASSWORD"
-    warn "  FORGE_DEFAULT_WORKSPACE=/home/${FORGE_USER}/ojas"
+    warn "  OJAS_ROOT_EMAIL"
+    warn "  OJAS_ROOT_PASSWORD"
+    warn "  OJAS_DEFAULT_WORKSPACE=/home/${OJAS_USER}/ojas"
     warn ""
     warn "Then run: sudo systemctl daemon-reload && sudo systemctl restart ojas-backend caddy"
     exit 0
@@ -185,7 +185,7 @@ else
 fi
 
 printf "\n${GREEN}━━━ Done.${RST}\n"
-printf "Open: ${GREEN}https://${FORGE_DOMAIN}${RST}\n"
+printf "Open: ${GREEN}https://${OJAS_DOMAIN}${RST}\n"
 printf "\nUseful commands:\n"
 printf "  ${DIM}sudo systemctl status ojas-backend${RST}\n"
 printf "  ${DIM}journalctl -u ojas-backend -f${RST}\n"

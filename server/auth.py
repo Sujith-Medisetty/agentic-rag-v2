@@ -3,7 +3,7 @@ Multi-user email + password auth with a root user materialised from .env.
 
 Flow:
   1. First boot — server has no users yet → /api/auth/status returns
-     {needs_setup: true, has_root: bool}. If FORGE_ROOT_EMAIL / PASSWORD are
+     {needs_setup: true, has_root: bool}. If OJAS_ROOT_EMAIL / PASSWORD are
      set in .env, the very first /api/auth/login with those credentials
      materialises the root user in the DB and returns a token. Otherwise the
      client posts to /api/auth/signup to create a first regular user.
@@ -104,19 +104,19 @@ def _verify_password(password: str, stored_hash_hex: str, stored_salt_hex: str) 
 # ---------------------------------------------------------------------------
 
 def _root_credentials() -> tuple[str, str] | None:
-    """Return (email, password) from FORGE_ROOT_EMAIL / FORGE_ROOT_PASSWORD
+    """Return (email, password) from OJAS_ROOT_EMAIL / OJAS_ROOT_PASSWORD
     env vars, or None if either is missing. Password may be plaintext or a
-    pre-hashed value via FORGE_ROOT_PASSWORD_HASH (not implemented yet —
+    pre-hashed value via OJAS_ROOT_PASSWORD_HASH (not implemented yet —
     plaintext only for now)."""
-    email = os.getenv("FORGE_ROOT_EMAIL", "").strip().lower()
-    password = os.getenv("FORGE_ROOT_PASSWORD", "")
+    email = os.getenv("OJAS_ROOT_EMAIL", "").strip().lower()
+    password = os.getenv("OJAS_ROOT_PASSWORD", "")
     if not email or not password:
         return None
     return email, password
 
 
 def _ensure_root_user() -> dict | None:
-    """If FORGE_ROOT_* are set AND no row exists for that email yet, create
+    """If OJAS_ROOT_* are set AND no row exists for that email yet, create
     the root user. Returns the user dict, or None if no root creds are
     configured."""
     creds = _root_credentials()
@@ -138,8 +138,8 @@ def _ensure_root_user() -> dict | None:
 
 def signup_allowed() -> bool:
     """Whether non-root users can create accounts. Defaults to True; set
-    FORGE_ALLOW_SIGNUP=false in .env to lock it down."""
-    raw = os.getenv("FORGE_ALLOW_SIGNUP", "true").strip().lower()
+    OJAS_ALLOW_SIGNUP=false in .env to lock it down."""
+    raw = os.getenv("OJAS_ALLOW_SIGNUP", "true").strip().lower()
     return raw not in ("false", "0", "no", "off")
 
 
@@ -161,7 +161,7 @@ def needs_setup() -> bool:
 
 
 def has_root_configured() -> bool:
-    """True when FORGE_ROOT_EMAIL + PASSWORD are present in env."""
+    """True when OJAS_ROOT_EMAIL + PASSWORD are present in env."""
     return _root_credentials() is not None
 
 

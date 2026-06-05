@@ -20,14 +20,14 @@
 
 set -euo pipefail
 
-FORGE_DIR="${FORGE_DIR:-/opt/ojas}"
-FORGE_USER="${FORGE_USER:-ojas}"
-BRANCH="${FORGE_BRANCH:-master}"
+OJAS_DIR="${OJAS_DIR:-/opt/ojas}"
+OJAS_USER="${OJAS_USER:-ojas}"
+BRANCH="${OJAS_BRANCH:-master}"
 
-cd "${FORGE_DIR}"
+cd "${OJAS_DIR}"
 
 # Fetch quietly. Nothing to do if the remote has no new commits.
-sudo -u "${FORGE_USER}" git fetch origin "${BRANCH}" --quiet
+sudo -u "${OJAS_USER}" git fetch origin "${BRANCH}" --quiet
 
 LOCAL_SHA=$(git rev-parse HEAD)
 REMOTE_SHA=$(git rev-parse "origin/${BRANCH}")
@@ -38,5 +38,5 @@ if [[ "${LOCAL_SHA}" == "${REMOTE_SHA}" ]]; then
 fi
 
 echo "[$(date -Iseconds)] Update detected: ${LOCAL_SHA:0:8} → ${REMOTE_SHA:0:8}"
-bash "${FORGE_DIR}/deploy/update.sh"
+bash "${OJAS_DIR}/deploy/update.sh"
 echo "[$(date -Iseconds)] Deploy complete."

@@ -34,13 +34,13 @@ SSH into the VM as root (or use sudo), then:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Sujith-Medisetty/agentic-rag-v2/master/deploy/install.sh \
-    | FORGE_DOMAIN=ojas.yourdomain.com sudo -E bash
+    | OJAS_DOMAIN=ojas.yourdomain.com sudo -E bash
 ```
 
 The script:
 1. Installs Caddy, Node 20, Python build deps
-2. Creates a system `forge` user (no shell login)
-3. Clones the repo to `/opt/forge`
+2. Creates a system `ojas` user (no shell login)
+3. Clones the repo to `/opt/ojas`
 4. Sets up Python venv + installs requirements.txt
 5. Builds the frontend (`web/dist/`)
 6. Drops the systemd unit + Caddyfile
@@ -49,7 +49,7 @@ The script:
 ### 1.4 Fill in `.env`
 
 ```bash
-sudo -u forge nano /opt/forge/.env
+sudo -u ojas nano /opt/ojas/.env
 ```
 
 Minimum required:
@@ -68,17 +68,17 @@ MINIMAX_API_KEY=<your-key>
 # ANTHROPIC_API_KEY=sk-ant-...
 
 # --- Root user (you, the VM owner) ---
-FORGE_ROOT_EMAIL=you@example.com
-FORGE_ROOT_PASSWORD=a-strong-password
+OJAS_ROOT_EMAIL=you@example.com
+OJAS_ROOT_PASSWORD=a-strong-password
 
 # --- Where projects live on disk ---
-FORGE_DEFAULT_WORKSPACE=/home/forge/ojas
+OJAS_DEFAULT_WORKSPACE=/home/ojas/ojas
 ```
 
 Optional but useful:
 
 ```env
-FORGE_ALLOW_SIGNUP=false        # lock signup so only root has an account
+OJAS_ALLOW_SIGNUP=false        # lock signup so only root has an account
 AGENT_LLM_TIMEOUT_SECS=300      # hard per-LLM-call timeout
 ```
 
@@ -88,7 +88,7 @@ Save (Ctrl-O, Enter, Ctrl-X).
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now forge-backend
+sudo systemctl enable --now ojas-backend
 sudo systemctl reload caddy   # or restart if reload fails
 ```
 
@@ -104,7 +104,7 @@ curl https://ojas.yourdomain.com/api/health
 # Expect: same JSON
 
 # Tail logs if anything fails
-sudo journalctl -u forge-backend -f
+sudo journalctl -u ojas-backend -f
 sudo journalctl -u caddy -f
 ```
 
@@ -117,12 +117,12 @@ email + password you set.
 
 ### Roles
 - **root** — the VM owner. Materialised on first login with the
-  `FORGE_ROOT_EMAIL` + `FORGE_ROOT_PASSWORD` credentials. Sees every user's
+  `OJAS_ROOT_EMAIL` + `OJAS_ROOT_PASSWORD` credentials. Sees every user's
   projects + sessions, has the **Admin** tab, bypasses the workspace jail
   (full filesystem + shell access).
 - **user** — anyone who signs up via the Login screen (when
-  `FORGE_ALLOW_SIGNUP=true`). Sees only their own data. Writes are jailed
-  to `<FORGE_DEFAULT_WORKSPACE>/<their-email-slug>/`.
+  `OJAS_ALLOW_SIGNUP=true`). Sees only their own data. Writes are jailed
+  to `<OJAS_DEFAULT_WORKSPACE>/<their-email-slug>/`.
 
 ### What each user gets on first login
 - An auto-created default project pointing at their workspace folder
@@ -150,7 +150,7 @@ If you're upgrading from an older deploy and still see the bug:
 ### Manual (always works)
 
 ```bash
-sudo bash /opt/forge/deploy/update.sh
+sudo bash /opt/ojas/deploy/update.sh
 ```
 
 That script: `git pull` → reinstall any new Python deps → rebuild frontend
@@ -186,10 +186,10 @@ poller on the VM:
 
 ```bash
 sudo install -m 755 -o root -g root \
-    /opt/forge/deploy/cron-auto-update.sh /usr/local/bin/forge-auto-update
+    /opt/ojas/deploy/cron-auto-update.sh /usr/local/bin/ojas-auto-update
 sudo crontab -e
 # Add this line:
-*/5 * * * * /usr/local/bin/forge-auto-update >> /var/log/forge-auto-update.log 2>&1
+*/5 * * * * /usr/local/bin/ojas-auto-update >> /var/log/ojas-auto-update.log 2>&1
 ```
 
 Polls origin every 5 minutes; deploys only if there are new commits.
@@ -202,18 +202,18 @@ Polls origin every 5 minutes; deploys only if there are new commits.
 
 ```bash
 # Backend
-sudo systemctl status forge-backend
-sudo systemctl restart forge-backend
-sudo journalctl -u forge-backend -f
+sudo systemctl status ojas-backend
+sudo systemctl restart ojas-backend
+sudo journalctl -u ojas-backend -f
 
 # Caddy
 sudo systemctl reload caddy
 sudo journalctl -u caddy -f
 
-# Database queries (read-only is fine as the forge user)
-sudo -u forge sqlite3 /home/forge/.agentic-rag/server.db \
+# Database queries (read-only is fine as the ojas user)
+sudo -u ojas sqlite3 /home/ojas/.agentic-rag/server.db \
     "SELECT email, role FROM users;"
-sudo -u forge sqlite3 /home/forge/.agentic-rag/server.db \
+sudo -u ojas sqlite3 /home/ojas/.agentic-rag/server.db \
     "SELECT pid, port, command FROM session_processes;"
 ```
 
@@ -229,13 +229,13 @@ While logged in as root, the sidebar shows an **Admin** button:
 
 | Path | What |
 |------|------|
-| `/opt/forge/` | The Ojas source code (cloned from this repo) |
-| `/opt/forge/.env` | Secrets — chmod 600, owned by forge |
-| `/opt/forge/web/dist/` | Built frontend (served by Caddy) |
-| `/home/forge/.agentic-rag/server.db` | Sessions, messages, events, users |
-| `/home/forge/.agent/checkpoints.db` | LangGraph conversation checkpoints |
-| `/home/forge/.agent/sessions/<id>/` | Per-session sub-agent + todo state |
-| `<FORGE_DEFAULT_WORKSPACE>/<user-slug>/<session-slug>/` | What the agent built for that session |
+| `/opt/ojas/` | The Ojas source code (cloned from this repo) |
+| `/opt/ojas/.env` | Secrets — chmod 600, owned by ojas |
+| `/opt/ojas/web/dist/` | Built frontend (served by Caddy) |
+| `/home/ojas/.agentic-rag/server.db` | Sessions, messages, events, users |
+| `/home/ojas/.agent/checkpoints.db` | LangGraph conversation checkpoints |
+| `/home/ojas/.agent/sessions/<id>/` | Per-session sub-agent + todo state |
+| `<OJAS_DEFAULT_WORKSPACE>/<user-slug>/<session-slug>/` | What the agent built for that session |
 
 ### What gets deleted when you delete a session
 - DB rows (session + messages + events + processes)
@@ -250,7 +250,7 @@ While logged in as root, the sidebar shows an **Admin** button:
 - Plus the project row itself
 
 ### What is NEVER deleted automatically
-- Your `.env`, your DB, your source repo at `/opt/forge`
+- Your `.env`, your DB, your source repo at `/opt/ojas`
 - The shared LangGraph checkpoints DB file (just the rows for those threads)
 
 ---
@@ -261,9 +261,9 @@ While logged in as root, the sidebar shows an **Admin** button:
 |---------|---------------|
 | Can't reach the domain at all | DNS not propagated. `dig ojas.yourdomain.com +short` |
 | Browser says "your connection isn't private" | Caddy hasn't fetched the Let's Encrypt cert yet. `journalctl -u caddy -f` and wait |
-| Login shows wrong identity / Admin tab leaks | You're on an old build. Run `sudo bash /opt/forge/deploy/update.sh`, hard-refresh the browser, log out + log in. |
+| Login shows wrong identity / Admin tab leaks | You're on an old build. Run `sudo bash /opt/ojas/deploy/update.sh`, hard-refresh the browser, log out + log in. |
 | "Project not found" right after signup | Same as above — pre-fix builds had a state-leak bug. After update.sh, this is gone. |
-| 502 Bad Gateway from Caddy | Backend isn't running. `systemctl status forge-backend` and `journalctl -u forge-backend -n 50` |
+| 502 Bad Gateway from Caddy | Backend isn't running. `systemctl status ojas-backend` and `journalctl -u ojas-backend -n 50` |
 | Chat history doesn't load on refresh | Already-fixed bug (was a `LIMIT 1000` in `list_events`). Pull latest + redeploy. |
 | Agent spawns a dev server but admin doesn't show it | The agent must use `bash` with `run_in_background=true` for tracking to kick in. One-shot `npm run dev` in foreground exits with the tool call, so there's no PID to register. |
 | MiniMax 400 errors | Usually wrong `AGENT_MODEL` string. Check the API docs page for the exact model name. |
@@ -271,14 +271,14 @@ While logged in as root, the sidebar shows an **Admin** button:
 ### Reset a session entirely from CLI
 If a session is misbehaving:
 ```bash
-sudo -u forge sqlite3 /home/forge/.agentic-rag/server.db \
+sudo -u ojas sqlite3 /home/ojas/.agentic-rag/server.db \
     "DELETE FROM sessions WHERE id = '<session-id>';"
 # Or just use the UI's delete button.
 ```
 
 ### Full purge of a single user
 ```bash
-sudo -u forge sqlite3 /home/forge/.agentic-rag/server.db \
+sudo -u ojas sqlite3 /home/ojas/.agentic-rag/server.db \
     "DELETE FROM users WHERE email = 'alice@example.com';"
 # CASCADE deletes their projects, sessions, messages, events, processes
 ```
@@ -287,10 +287,10 @@ sudo -u forge sqlite3 /home/forge/.agentic-rag/server.db \
 
 ## Part 6 — Updating the LLM provider
 
-Live without restarting Forge:
+Live without restarting Ojas:
 
-1. Edit `/opt/forge/.env`
-2. `sudo systemctl restart forge-backend`
+1. Edit `/opt/ojas/.env`
+2. `sudo systemctl restart ojas-backend`
 
 That's it. Existing sessions keep working but the next turn uses the new
 provider. (LangGraph checkpoints survive — only the model client gets
@@ -305,11 +305,11 @@ session.
 
 ## Part 7 — Backup recommendation
 
-Single file to back up: `/home/forge/.agentic-rag/server.db`
+Single file to back up: `/home/ojas/.agentic-rag/server.db`
 
 This holds users, projects, sessions, messages, events, processes — i.e.
 everything you'd care about. The LangGraph checkpoint DB
-(`/home/forge/.agent/checkpoints.db`) is optional — losing it means
+(`/home/ojas/.agent/checkpoints.db`) is optional — losing it means
 sessions can't resume mid-conversation, but the chat history in `server.db`
 is still readable.
 
@@ -318,8 +318,8 @@ Quick cron-based backup:
 ```bash
 sudo crontab -e
 # Add:
-0 3 * * * sqlite3 /home/forge/.agentic-rag/server.db ".backup '/var/backups/ojas-$(date +\%F).db'"
+0 3 * * * sqlite3 /home/ojas/.agentic-rag/server.db ".backup '/var/backups/ojas-$(date +\%F).db'"
 ```
 
 Restores by copying the backup back over `server.db` while
-`forge-backend` is stopped.
+`ojas-backend` is stopped.

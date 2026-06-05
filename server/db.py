@@ -33,7 +33,7 @@ def server_db_path() -> Path:
 
 
 _SCHEMA = """
--- Multi-user identity. Root user (FORGE_ROOT_EMAIL from .env) is materialised
+-- Multi-user identity. Root user (OJAS_ROOT_EMAIL from .env) is materialised
 -- on first login; other users go through /api/auth/signup.
 CREATE TABLE IF NOT EXISTS users (
     id             TEXT    PRIMARY KEY,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS projects (
     auto_push_enabled     INTEGER NOT NULL DEFAULT 0,
     branch_strategy       TEXT    NOT NULL DEFAULT 'session',
     -- Project name is unique PER USER (so two users can both have a project
-    -- named "Forge" without colliding). Old uniqueness was global.
+    -- named "Ojas" without colliding). Old uniqueness was global.
     UNIQUE(user_id, name)
 );
 

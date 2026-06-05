@@ -1,7 +1,7 @@
 # Ojas — Caddy reverse proxy.
 #
-# Replace `forge.example.com` with YOUR domain in TWO places before deploying
-# (or set FORGE_DOMAIN when running install.sh — it sed's the substitution).
+# Replace `ojas.example.com` with YOUR domain in TWO places before deploying
+# (or set OJAS_DOMAIN when running install.sh — it sed's the substitution).
 # Caddy auto-fetches a Let's Encrypt cert for it on first start; no certbot
 # needed. Make sure DNS for your domain points at this VM's public IP first,
 # else Caddy will retry forever and you won't get TLS.
@@ -15,7 +15,7 @@
 # Place this file at  /etc/caddy/Caddyfile  on the VM, then:
 #   sudo systemctl reload caddy
 
-forge.example.com {
+ojas.example.com {
     # The frontend's built static files. The install script copies them here.
     root * /opt/ojas/web/dist
     encode gzip

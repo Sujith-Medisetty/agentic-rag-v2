@@ -51,7 +51,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-logger = logging.getLogger("forge.app")
+logger = logging.getLogger("ojas.app")
 
 # Load .env at the project root BEFORE any other module reads os.getenv. The
 # file is owner-only by convention (`chmod 600 .env`) and is git-ignored, so
@@ -155,7 +155,7 @@ app = FastAPI(title="agentic-rag-v2", lifespan=lifespan)
 _DEFAULT_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("AGENTIC_RAG_CORS_ORIGINS", _DEFAULT_ORIGINS).split(","),
+    allow_origins=os.getenv("OJAS_CORS_ORIGINS", _DEFAULT_ORIGINS).split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -379,14 +379,14 @@ def _default_workspace_path() -> str:
     """Where should the default project live on disk?
 
     Resolution order:
-      1. `FORGE_DEFAULT_WORKSPACE` env var — explicit override, wins always.
+      1. `OJAS_DEFAULT_WORKSPACE` env var — explicit override, wins always.
       2. Platform default:
          - macOS:    ~/Desktop/Ojas
-         - Linux:    ~/forge        (no Desktop folder convention)
+         - Linux:    ~/ojas         (no Desktop folder convention)
          - Windows:  ~/Ojas
     """
     import platform
-    override = os.getenv("FORGE_DEFAULT_WORKSPACE")
+    override = os.getenv("OJAS_DEFAULT_WORKSPACE")
     if override:
         return os.path.expanduser(override)
     system = platform.system()
@@ -394,16 +394,16 @@ def _default_workspace_path() -> str:
         return os.path.expanduser("~/Desktop/Ojas")
     if system == "Windows":
         return os.path.expanduser("~/Ojas")
-    return os.path.expanduser("~/forge")
+    return os.path.expanduser("~/ojas")
 
 
 @app.get("/api/projects/default", response_model=ProjectResponse)
 def projects_default(user: dict = Depends(require_user)):
     """Get-or-create THE default project for the calling user. Each user gets
-    their own Forge workspace folder so files don't mix across accounts.
+    their own Ojas workspace folder so files don't mix across accounts.
 
     Layout:
-      <FORGE_DEFAULT_WORKSPACE>/                  (shared root)
+      <OJAS_DEFAULT_WORKSPACE>/                  (shared root)
         ├── <user_email_slug_1>/                  (this user's projects + sessions)
         └── <user_email_slug_2>/                  (another user's)
     Root user uses the unscoped root directly (no email subdir) for simplicity.
@@ -585,7 +585,7 @@ def projects_delete(project_id: str, user: dict = Depends(require_user)):
     """Delete a project AND every cascade target. The workspace files on
     disk under <workspace>/<each session's subdir>/ ARE removed (since
     those were generated for that project). The root workspace path itself
-    is untouched if it was a folder you had before Forge."""
+    is untouched if it was a folder you had before Ojas."""
     _project_or_404(project_id, user)
     sessions = db.list_sessions(project_id)
     for s in sessions:
@@ -765,7 +765,7 @@ def sessions_create(
     # never materialised. Previously a silent _bootstrap_default_project
     # failure during signup would leave the project row pointing at a path
     # that didn't exist (or got patched in as root and thus unwritable by
-    # the forge service user) — sessions_create would then 500 with an
+    # the ojas service user) — sessions_create would then 500 with an
     # opaque "Permission denied: <subdir>" error. Now we validate the
     # parent first, attempt to (re)create it with our own ownership, and
     # surface a much clearer error when even that fails.
@@ -775,7 +775,7 @@ def sessions_create(
             raise PermissionError(
                 f"project workspace '{workspace_root}' exists but isn't "
                 f"writable by the backend (uid={os.geteuid()}). "
-                f"Check ownership: `sudo chown -R forge:forge "
+                f"Check ownership: `sudo chown -R ojas:ojas "
                 f"{workspace_root}`."
             )
         subdir.mkdir(parents=True, exist_ok=True)

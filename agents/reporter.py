@@ -121,7 +121,7 @@ class ProgressReporter:
 
 _default_reporter: ProgressReporter = ProgressReporter()   # working no-op
 _reporter_var: contextvars.ContextVar[ProgressReporter] = contextvars.ContextVar(
-    "agentic_rag_reporter", default=_default_reporter,
+    "ojas_reporter", default=_default_reporter,
 )
 
 
