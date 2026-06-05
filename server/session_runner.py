@@ -130,6 +130,7 @@ async def run_turn(
 
     iters = 0
     turn_failed = False
+    _turn_cancelled = False  # set to True when the asyncio Task is cancelled
 
     def _drive() -> int:
         """Sync body that runs in a worker thread. Returns iteration count.
@@ -198,6 +199,11 @@ async def run_turn(
             pass
 
         # Happy path — persist final assistant text and close the stream.
+        # Skip if the asyncio Task was already cancelled (the cancel path
+        # handles persistence itself; writing here too creates a duplicate
+        # message because the executor thread can't be interrupted mid-run).
+        if _turn_cancelled:
+            return 0
         final = runner_graph.get_state(config)
         final_text = _final_assistant_text(final.values.get("messages", []))
         if final_text:
@@ -234,6 +240,10 @@ async def run_turn(
         # indicators frozen and the turn unclosed in the persisted event log.
         # Don't re-raise: we want the finalizer below to publish turn_summary
         # and the function to return cleanly.
+        # Set the flag BEFORE doing anything else so the still-running
+        # executor thread sees it and skips its own db.append_message call
+        # (avoiding the duplicate-message-on-cancel bug).
+        _turn_cancelled = True
         turn_failed = True
         reporter.error("cancelled by user")
         reporter.assistant_text("", done=True)
