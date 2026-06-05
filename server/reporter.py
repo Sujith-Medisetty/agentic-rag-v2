@@ -166,6 +166,19 @@ def get_bus(session_id: str) -> SessionBus:
         return bus
 
 
+def discard_bus(session_id: str) -> None:
+    """Drop a session's bus from the in-memory registry on session delete.
+
+    The fanout task and any live WebSocket subscribers are NOT forcibly torn
+    down here — they're cheap (one coroutine awaiting an empty queue, a few
+    socket references) and the clients close themselves on navigation. The
+    goal is just to stop new lookups from finding a stale bus and to let
+    the GC reclaim it after the last reference goes away.
+    """
+    with _registry_lock:
+        _buses.pop(session_id, None)
+
+
 # ============================================================================
 # WebReporter — ProgressReporter that pipes events through a SessionBus
 # ============================================================================

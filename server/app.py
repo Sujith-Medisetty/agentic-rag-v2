@@ -246,31 +246,113 @@ def projects_get(project_id: str, _token: str = Depends(require_token)):
     return ProjectResponse(**p)
 
 
+def _purge_session_state_dir(session_id: str) -> None:
+    """Best-effort removal of a session's private agent-state directory
+    (~/.agent/sessions/<id>/). Silently swallows errors — the DB row is
+    already gone, so we don't want a stuck file to prevent the API call
+    from succeeding."""
+    import shutil
+    from server.session_runner import session_state_dir
+    try:
+        d = session_state_dir(session_id)
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _purge_langgraph_checkpoint(session_id: str) -> None:
+    """Delete this session's LangGraph checkpoint rows from
+    ~/.agent/checkpoints.db. Without this, the agent's compacted message
+    history persists forever even after the session is deleted — if the
+    same session_id were ever reused (unlikely but possible), the new
+    session would resume from the old conversation."""
+    try:
+        from agents.graph import runner_graph
+        cp = runner_graph.checkpointer
+        if cp is not None and hasattr(cp, "delete_thread"):
+            cp.delete_thread(session_id)
+    except Exception:
+        # Fallback: raw SQL on the known SqliteSaver tables. Best-effort —
+        # if the schema changes in a future langgraph version, this just
+        # leaves orphan rows (functionally harmless).
+        import sqlite3
+        from pathlib import Path
+        try:
+            conn = sqlite3.connect(
+                str(Path.home() / ".agent" / "checkpoints.db"),
+                check_same_thread=False,
+            )
+            try:
+                for table in ("checkpoints", "writes"):
+                    try:
+                        conn.execute(
+                            f"DELETE FROM {table} WHERE thread_id = ?",
+                            (session_id,),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _purge_session_bus(session_id: str) -> None:
+    """Drop the in-memory SessionBus so subsequent code can't accidentally
+    reuse it for a session that no longer exists in the DB."""
+    try:
+        from server.reporter import discard_bus
+        discard_bus(session_id)
+    except Exception:
+        pass
+
+
+def _purge_session_everything(session_id: str) -> None:
+    """One-stop cleanup for everything tied to a session OUTSIDE the main
+    SQLite (which CASCADE handles). Idempotent + best-effort — none of
+    these can fail the API call."""
+    _purge_session_state_dir(session_id)
+    _purge_langgraph_checkpoint(session_id)
+    _purge_session_bus(session_id)
+
+
 @app.delete("/api/projects/{project_id}")
 def projects_delete(project_id: str, _token: str = Depends(require_token)):
-    """Delete a project and every session/message/event under it. The
-    workspace folder on disk is NOT touched — only the agent's record of
-    the project is removed. FK cascades handle the rest."""
+    """Delete a project AND everything that links to it:
+      - rows in `sessions`, `messages`, `events` (FK CASCADE)
+      - each session's private `~/.agent/sessions/<id>/` directory
+      - each session's LangGraph checkpoint rows in `~/.agent/checkpoints.db`
+      - each session's in-memory SessionBus
+    The workspace folder on disk (the actual code) is NOT touched."""
+    sessions = db.list_sessions(project_id)
     # Cancel any in-flight turn in any session of this project so we don't
     # leak a running task or have it write events to a deleted session.
-    sessions = db.list_sessions(project_id)
     for s in sessions:
         task = _active_turns.get(s["id"])
         if task is not None and not task.done():
             task.cancel()
     if not db.delete_project(project_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+    for s in sessions:
+        _purge_session_everything(s["id"])
     return {"ok": True}
 
 
 @app.delete("/api/sessions/{session_id}")
 def sessions_delete(session_id: str, _token: str = Depends(require_token)):
-    """Delete one session and CASCADE its messages + events."""
+    """Delete one session AND everything that links to it:
+      - rows in `messages`, `events` (FK CASCADE on session)
+      - `~/.agent/sessions/<id>/` (sub-agent records + todo store)
+      - LangGraph checkpoint rows in `~/.agent/checkpoints.db`
+      - in-memory SessionBus"""
     task = _active_turns.get(session_id)
     if task is not None and not task.done():
         task.cancel()
     if not db.delete_session(session_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    _purge_session_everything(session_id)
     return {"ok": True}
 
 

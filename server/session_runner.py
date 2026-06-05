@@ -39,6 +39,22 @@ from server.git_autocommit import (
 from server.reporter import WebReporter, get_bus
 
 
+def session_state_dir(session_id: str) -> Path:
+    """Per-session private directory for sub-agent records, todo store, and
+    any other agent-loop artifacts. Lives under `~/.agent/sessions/<id>/`
+    so it's outside any user workspace (no pollution of project trees) and
+    deletable as a unit when a session is removed.
+
+    Without this, the agent's stores (`.clawd-agents/`, `.clawd-todos.json`)
+    used `Path.cwd()` and were SHARED across every project + session —
+    sub-agent records from one session leaked into another, and deleting a
+    session left orphan files forever.
+    """
+    base = Path.home() / ".agent" / "sessions" / session_id
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def _default_max_iterations() -> int:
     # Unlimited by default — this is an autonomous coding agent, and a hard
     # iteration cap was cutting off legitimate long builds mid-way. The real
@@ -122,6 +138,20 @@ async def run_turn(
         from a single place."""
         from agents.graph import runner_graph
         from agents.nodes import reset_run_budget
+
+        # Pin the sub-agent + todo stores to THIS session's private dir BEFORE
+        # we hand work to the graph. Without this, both stores fall back to
+        # `Path.cwd()` and every project/session shares one folder — sub-agent
+        # records leak across sessions and deletes leave orphan files forever.
+        # We set the env vars (the existing override hooks in
+        # tools/multi_agent._agent_store_dir and tools/utils._todo_store_path)
+        # right before invoking the graph. The default asyncio executor is
+        # single-threaded so concurrent turns don't race on these env vars in
+        # practice; if you ever raise the executor pool, swap this for a
+        # ContextVar.
+        session_root = session_state_dir(session_id)
+        os.environ["CLAWD_AGENT_STORE"] = str(session_root / "clawd-agents")
+        os.environ["CLAWD_TODO_STORE"]  = str(session_root / "clawd-todos.json")
 
         reset_run_budget(
             max_iters=max_iterations,

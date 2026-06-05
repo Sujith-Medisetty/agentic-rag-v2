@@ -269,6 +269,13 @@ def _get_llm(
         return ChatOpenAI(
             model=eff_model, api_key=api_key, base_url=base_url,
             streaming=streaming, timeout=timeout,
+            # OpenAI-compatible streaming hides usage by default — without this,
+            # `usage_metadata` is empty on every AIMessage and the per-call
+            # token_update event never fires (the UI's "X in / Y out" badge
+            # under each LLM call stays blank). `stream_usage=True` opts in to
+            # `stream_options={"include_usage": true}` upstream so usage
+            # arrives in the final stream chunk.
+            stream_usage=True,
         )
 
     if eff_provider in ("openai-compatible", "openai"):
@@ -284,6 +291,7 @@ def _get_llm(
         kwargs = {
             "model": eff_model, "api_key": api_key,
             "streaming": streaming, "timeout": timeout,
+            "stream_usage": True,   # see minimax branch above for why
         }
         if base_url:
             kwargs["base_url"] = base_url
@@ -653,12 +661,19 @@ def node_tools(state: RunnerState) -> dict:
     for msg in result.get("messages", []):
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
         name = getattr(msg, "name", "")
-        first = content.strip().splitlines()
-        preview = first[0][:80] if first else "(no output)"
+        # The collapsed UI view derives its own first-line / 110-char summary
+        # from `preview`. The expanded view renders the WHOLE thing. Earlier
+        # this code shipped only the first line / 80 chars to the reporter —
+        # which meant double-click-to-expand had nothing to expand because
+        # the rest of the output was thrown away here, before persistence.
+        # Now we ship the full content; reporter.tool_done caps at ~100KB so
+        # truly enormous outputs (rare) still get a graceful upper bound,
+        # and `previewTruncated` surfaces in the UI so the user knows.
+        first_line = content.strip().splitlines()[0] if content.strip() else ""
         is_error = (
             content.startswith("Error:") or content.startswith("BLOCKED:")
-            or "error" in preview.lower()[:20]
+            or "error" in first_line.lower()[:20]
         )
-        reporter.tool_done(name, preview, error=is_error)
+        reporter.tool_done(name, content or "(no output)", error=is_error)
 
     return result

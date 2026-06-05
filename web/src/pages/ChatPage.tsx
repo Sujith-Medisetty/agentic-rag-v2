@@ -74,6 +74,24 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Follow-mode for the chat scroll: stick to bottom while new events
+  // arrive UNLESS the user scrolls up to read. If they do, leave them where
+  // they are and pop a floating "↓" button so they can catch back up on a
+  // single tap. The button hides automatically when they reach the bottom
+  // again (either by scrolling or by tapping it).
+  const [chatAtBottom, setChatAtBottom] = useState(true);
+  const onChatScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const threshold = 60;   // px from bottom counted as "still at bottom"
+    setChatAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < threshold);
+  };
+  const jumpChatToBottom = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    setChatAtBottom(true);
+  };
 
   // ---- Debug stream — last N raw WS events so we can SEE what's flowing.
   // Toggle via the bug icon in the header; persists across reloads so it stays
@@ -470,12 +488,14 @@ export default function ChatPage() {
     }
   }
 
-  // ---- Auto-scroll on new content ---------------------------------------
+  // ---- Auto-scroll on new content (only while following) ----------------
   useEffect(() => {
+    if (!chatAtBottom) return;   // user has scrolled up; respect that
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [
+    chatAtBottom,
     turns.length,
     currentTurn?.assistantText,
     currentTurn?.thinkingText,
@@ -788,7 +808,12 @@ export default function ChatPage() {
       )}
 
       {/* Scrollable transcript — mono + 13px + tight leading via .transcript */}
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4">
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={scrollRef}
+          onScroll={onChatScroll}
+          className="h-full overflow-y-auto px-4"
+        >
         <div className="transcript mx-auto flex max-w-4xl flex-col">
           {loadErr && (
             <div className="mt-4 rounded border border-danger/40 bg-danger/10 p-3 text-danger">
@@ -805,6 +830,18 @@ export default function ChatPage() {
             <EmptyState />
           )}
         </div>
+        </div>
+        {!chatAtBottom && (
+          <button
+            type="button"
+            onClick={jumpChatToBottom}
+            className="absolute bottom-3 right-3 z-20 flex h-10 w-10 items-center justify-center rounded-full border border-border bg-elevated/95 text-base text-text shadow-lift backdrop-blur-md hover:border-accent/60 hover:bg-accent/15 hover:text-accent"
+            title="Jump to latest"
+            aria-label="Jump to latest activity"
+          >
+            ↓
+          </button>
+        )}
       </div>
 
       {/* Input — pinned bottom, safe-area aware. While a turn is in flight the
@@ -1417,12 +1454,27 @@ function DebugStream({
   events, onClear,
 }: { events: { kind: string; payload: any; ts: number }[]; onClear: () => void }) {
   const boxRef = useRef<HTMLDivElement | null>(null);
-  // Auto-stick to bottom when new events arrive.
+  // Follow-mode: stick to bottom while events arrive, unless the user has
+  // scrolled up to inspect. Same UX as the main chat scroll.
+  const [atBottom, setAtBottom] = useState(true);
   useEffect(() => {
+    if (!atBottom) return;
     const el = boxRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [events.length]);
+  }, [atBottom, events.length]);
+  const onScroll = () => {
+    const el = boxRef.current;
+    if (!el) return;
+    const threshold = 30;
+    setAtBottom(el.scrollHeight - el.scrollTop - el.clientHeight < threshold);
+  };
+  const jumpToBottom = () => {
+    const el = boxRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    setAtBottom(true);
+  };
 
   const rows = events.map((e, i) => {
     const prev = i > 0 ? events[i - 1].ts : e.ts;
@@ -1471,7 +1523,12 @@ function DebugStream({
           clear
         </button>
       </div>
-      <div ref={boxRef} className="max-h-72 overflow-y-auto px-3 py-2">
+      <div className="relative">
+      <div
+        ref={boxRef}
+        onScroll={onScroll}
+        className="max-h-72 overflow-y-auto px-3 py-2"
+      >
         {events.length === 0 ? (
           <div className="font-sans text-[11px] text-subtle">
             Waiting for events… send a message to see the stream.
@@ -1479,6 +1536,18 @@ function DebugStream({
         ) : (
           rows
         )}
+      </div>
+      {!atBottom && events.length > 0 && (
+        <button
+          type="button"
+          onClick={jumpToBottom}
+          className="absolute bottom-1.5 right-1.5 flex h-7 w-7 items-center justify-center rounded-full border border-border bg-elevated/95 text-xs text-text shadow-lift backdrop-blur-md hover:border-accent/60 hover:bg-accent/15 hover:text-accent"
+          title="Jump to latest event"
+          aria-label="Jump to latest event"
+        >
+          ↓
+        </button>
+      )}
       </div>
     </div>
   );
