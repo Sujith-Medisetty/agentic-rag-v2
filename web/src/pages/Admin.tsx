@@ -5,13 +5,14 @@
 
 import { useEffect, useState } from "react";
 import { Link, Navigate } from "react-router-dom";
-import { authApi, adminApi, ApiError } from "@/lib/api";
-import type { AuthUser, AdminProcess } from "@/lib/api";
+import { authApi, adminApi, deployedAppsApi, ApiError } from "@/lib/api";
+import type { AuthUser, AdminProcess, DeployedApp } from "@/lib/api";
 
 export default function Admin() {
   const [me, setMe] = useState<AuthUser | "loading" | "denied">("loading");
   const [users, setUsers] = useState<AuthUser[]>([]);
   const [procs, setProcs] = useState<AdminProcess[]>([]);
+  const [apps, setApps] = useState<DeployedApp[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   // Resolve current user once. Anyone non-root gets redirected.
@@ -32,9 +33,12 @@ export default function Admin() {
 
   const load = async () => {
     try {
-      const [us, ps] = await Promise.all([adminApi.users(), adminApi.processes()]);
+      const [us, ps, as] = await Promise.all([
+        adminApi.users(), adminApi.processes(), deployedAppsApi.list(),
+      ]);
       setUsers(us);
       setProcs(ps);
+      setApps(as);
       setErr(null);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : "failed to load");
@@ -51,6 +55,16 @@ export default function Admin() {
       setProcs((p) => p.filter((x) => x.pid !== pid));
     } catch (e: any) {
       alert(`Kill failed: ${e?.message ?? "unknown error"}`);
+    }
+  };
+
+  const takedownApp = async (slug: string) => {
+    if (!confirm(`Take down "${slug}"? Files at /opt/ojas-apps/${slug}/ will be deleted and the public URL will return 404.`)) return;
+    try {
+      await deployedAppsApi.delete(slug);
+      setApps((a) => a.filter((x) => x.slug !== slug));
+    } catch (e: any) {
+      alert(`Takedown failed: ${e?.message ?? "unknown error"}`);
     }
   };
 
@@ -195,6 +209,78 @@ export default function Admin() {
                     </td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {/* ===== Deployed apps ============================================ */}
+      <section>
+        <div className="flex items-baseline justify-between">
+          <h2 className="font-serif text-xl font-semibold tracking-tight">
+            Deployed apps
+          </h2>
+          <span className="text-tx-xs text-muted">
+            {apps.length} {apps.length === 1 ? "app" : "apps"} live
+          </span>
+        </div>
+        <p className="mt-1 text-sm text-muted">
+          Promoted session builds. Each app is static files served at
+          <span className="ml-1 font-mono">/apps/&lt;slug&gt;/</span>
+          — survives session delete + backend restart. Take down removes
+          the on-disk files + DB row.
+        </p>
+        {apps.length === 0 ? (
+          <div className="mt-3 rounded-md border border-border bg-elevated px-4 py-6 text-center text-sm text-muted">
+            No apps deployed yet. Click 🚀 Deploy next to a Preview banner in a chat.
+          </div>
+        ) : (
+          <div className="mt-3 overflow-x-auto rounded-lg border border-border">
+            <table className="w-full text-sm">
+              <thead className="bg-elevated text-left text-tx-xs uppercase tracking-wider text-muted">
+                <tr>
+                  <th className="px-3 py-2">Slug / URL</th>
+                  <th className="px-3 py-2">Name</th>
+                  <th className="px-3 py-2">Owner</th>
+                  <th className="px-3 py-2">Deployed</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {apps.map((a) => {
+                  const fullUrl = `${window.location.origin}/apps/${a.slug}/`;
+                  const ownerEmail = users.find((u) => u.id === a.owner_user_id)?.email
+                    ?? (a.owner_user_id ? a.owner_user_id.slice(0, 8) : "(orphan)");
+                  const last = new Date(a.last_redeploy_at * 1000).toLocaleString();
+                  return (
+                    <tr key={a.slug} className="border-t border-border/60">
+                      <td className="px-3 py-2">
+                        <a
+                          href={fullUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-mono text-tx-xs text-accent hover:underline"
+                          title={fullUrl}
+                        >
+                          /apps/{a.slug}/
+                        </a>
+                      </td>
+                      <td className="px-3 py-2 text-tx-xs">{a.name}</td>
+                      <td className="px-3 py-2 font-mono text-tx-xs text-muted">{ownerEmail}</td>
+                      <td className="px-3 py-2 text-tx-xs text-muted">{last}</td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          type="button"
+                          onClick={() => takedownApp(a.slug)}
+                          className="rounded-md border border-danger/30 bg-danger/10 px-2.5 py-1 text-tx-xs font-medium text-danger hover:border-danger/50 hover:bg-danger/15"
+                        >
+                          Take down
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

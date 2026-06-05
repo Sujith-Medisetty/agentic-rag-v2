@@ -33,6 +33,13 @@ ojas.example.com {
         reverse_proxy 127.0.0.1:8765
     }
 
+    # Deployed apps — persistent installable PWAs at /apps/<slug>/.
+    # Proxied to FastAPI which static-serves the dist from
+    # /opt/ojas-apps/<slug>/ with SPA fallback + path-traversal defence.
+    handle /apps/* {
+        reverse_proxy 127.0.0.1:8765
+    }
+
     # SPA fallback — every non-file route returns index.html so React
     # Router can take over client-side. file_server serves the asset if
     # it exists; try_files falls back to index.html for routes like /s/xyz.

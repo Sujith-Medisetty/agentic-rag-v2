@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -65,7 +66,7 @@ except ImportError:
     pass   # dotenv not installed — fall back to shell env only
 
 from fastapi import (
-    Depends, FastAPI, HTTPException, Header, Query, WebSocket,
+    Depends, FastAPI, HTTPException, Header, Query, Request, WebSocket,
     WebSocketDisconnect, status,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,7 +75,8 @@ from server import auth, db
 from server.git_autocommit import get_git_info, push_to_remote
 from server.reporter import WebReporter, get_bus
 from server.schemas import (
-    AuthStatusResponse, EventResponse, GitInfoResponse, LoginRequest,
+    AuthStatusResponse, DeployRequest, DeployResponse, DeployedAppResponse,
+    EventResponse, GitInfoResponse, LoginRequest,
     LoginResponse, MessagePostRequest, MessageResponse, ProcessResponse,
     ProjectCreateRequest, ProjectResponse, ProjectSettingsRequest,
     PushResponse, SessionCreateRequest, SessionResponse, SetupRequest,
@@ -1105,6 +1107,194 @@ def preview_serve(session_id: str, file_path: str = ""):
         if not target.exists():
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "preview index.html missing",
+            )
+    return FileResponse(target)
+
+
+# ============================================================================
+# Deployed apps — promote a session's built dist/ to a persistent URL.
+#
+# Flow:
+#   1. Agent builds → <session_workspace>/dist/index.html exists
+#   2. POST /api/sessions/<sid>/deploy {slug?}
+#   3. Server picks slug (slugify name; -2, -3 on collision), copies
+#      dist/ → /opt/ojas-apps/<slug>/, inserts deployed_apps row
+#   4. App is live at https://<host>/apps/<slug>/ — survives session delete
+#      + backend restart (it's just files on disk + a DB row, no process)
+# ============================================================================
+
+OJAS_APPS_ROOT = Path("/opt/ojas-apps")
+
+
+def _deployed_app_or_404(slug: str, user: dict) -> dict:
+    """Lookup + ownership check. Returns the row dict, or raises 404 if the
+    app doesn't exist OR the caller isn't allowed to see it. 404 (not 403)
+    so we don't leak the existence of other users' deploys."""
+    app = db.get_deployed_app(slug)
+    if app is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "app not found")
+    if user["role"] != "root" and app.get("owner_user_id") not in (None, user["id"]):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "app not found")
+    return app
+
+
+@app.post(
+    "/api/sessions/{session_id}/deploy",
+    response_model=DeployResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def sessions_deploy(
+    session_id: str,
+    req: DeployRequest,
+    request: Request,
+    user: dict = Depends(require_user),
+):
+    """Copy the session's built dist/ to a persistent /opt/ojas-apps/<slug>/
+    location and register it as a deployed app. The deployed app is
+    DECOUPLED from the session — deleting the session leaves the live URL
+    intact. Re-deploying the same session to the SAME slug is allowed
+    (atomic in-place swap); re-deploying without a slug picks a fresh one."""
+    import shutil
+    session = _session_or_404(session_id, user)
+    # 1. Need a built dist/
+    dist = _session_preview_dir(session_id)
+    if dist is None or not dist.exists():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "no built dist/ yet — ask the agent to run `npm run build` first",
+        )
+
+    # 2. Pick a slug. If user supplied one, slugify it; if it collides AND
+    # the caller doesn't own the colliding app, append -2/-3. If user
+    # supplied no slug, derive from session name.
+    desired = req.slug if req.slug else session["name"]
+    existing = db.get_deployed_app(db._slugify(desired)) if req.slug else None  # noqa: SLF001
+    if existing and existing.get("owner_user_id") == user["id"]:
+        # Same owner re-deploying to the same slug → atomic swap
+        slug = existing["slug"]
+        in_place = True
+    else:
+        slug = db.allocate_deployed_slug(desired)
+        in_place = False
+
+    # 3. Copy files. Use a sibling temp dir + rename for atomicity (so the
+    # public URL never serves a half-copied build).
+    OJAS_APPS_ROOT.mkdir(parents=True, exist_ok=True)
+    target = OJAS_APPS_ROOT / slug
+    staging = OJAS_APPS_ROOT / f".staging-{slug}-{int(time.time())}"
+    try:
+        shutil.copytree(dist, staging)
+        if target.exists():
+            backup = OJAS_APPS_ROOT / f".old-{slug}-{int(time.time())}"
+            target.rename(backup)
+            staging.rename(target)
+            shutil.rmtree(backup, ignore_errors=True)
+        else:
+            staging.rename(target)
+    except OSError as e:
+        # Best-effort cleanup of any half-copied staging dir
+        shutil.rmtree(staging, ignore_errors=True)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"could not deploy app: {e}",
+        )
+
+    # 4. Insert or touch the DB row
+    if in_place:
+        db.touch_deployed_app(slug)
+        app_row = db.get_deployed_app(slug) or {}
+    else:
+        app_row = db.create_deployed_app(
+            slug=slug,
+            name=session["name"],
+            app_dir=str(target),
+            source_session_id=session_id,
+            source_project_id=session.get("project_id"),
+            owner_user_id=user["id"],
+        )
+
+    # 5. Build the URL. Use the request's scheme + host so it works behind
+    # Caddy (forwarded headers handled by the uvicorn --proxy-headers flag).
+    scheme = request.url.scheme
+    host = request.headers.get("host", request.url.netloc)
+    return DeployResponse(
+        slug=slug,
+        url=f"{scheme}://{host}/apps/{slug}/",
+        app=DeployedAppResponse(**app_row),
+    )
+
+
+@app.get(
+    "/api/deployed-apps",
+    response_model=list[DeployedAppResponse],
+)
+def deployed_apps_list(user: dict = Depends(require_user)):
+    """List deployed apps. Root sees all; everyone else sees their own."""
+    owner = None if user["role"] == "root" else user["id"]
+    return [DeployedAppResponse(**a) for a in db.list_deployed_apps(owner_user_id=owner)]
+
+
+@app.delete("/api/deployed-apps/{slug}")
+def deployed_apps_delete(slug: str, user: dict = Depends(require_user)):
+    """Take down a deployed app — rmtree the on-disk files AND remove the
+    DB row. Idempotent on missing files (so a botched-half-state app can
+    still be cleaned up from the UI)."""
+    import shutil
+    app = _deployed_app_or_404(slug, user)
+    target = Path(app["app_dir"])
+    if target.exists() and target.is_dir():
+        try:
+            shutil.rmtree(target)
+        except OSError as e:
+            # Don't leave the DB row dangling on a filesystem hiccup —
+            # surface the error but still drop the row so the user can
+            # retry the deploy without slug collision.
+            db.delete_deployed_app(slug)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"deleted DB row but file removal failed: {e}",
+            )
+    db.delete_deployed_app(slug)
+    return {"ok": True}
+
+
+# Serve a deployed app's static files. Mirrors the /preview/* handler
+# (same SPA fallback + traversal defence + same Caddy reverse-proxy path),
+# but reads from the persistent /opt/ojas-apps/<slug>/ location.
+@app.get("/apps/{slug}")
+@app.get("/apps/{slug}/")
+@app.get("/apps/{slug}/{file_path:path}")
+def apps_serve(slug: str, file_path: str = ""):
+    """Static-serve a deployed app at /apps/<slug>/. NO auth — the URL is
+    intentionally shareable so users can install the PWA on any device.
+    Slugs are unguessable enough in practice (the alphanumeric space + the
+    fact that an app only exists if the owner explicitly deployed it)."""
+    from fastapi.responses import FileResponse
+    app = db.get_deployed_app(slug)
+    if app is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "app not found",
+        )
+    app_dir = Path(app["app_dir"])
+    if not app_dir.exists():
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "app files missing on disk (was it deleted?)",
+        )
+    app_resolved = app_dir.resolve()
+    requested = file_path or "index.html"
+    target = (app_dir / requested).resolve()
+    # Path traversal defence — target MUST be inside app_dir.
+    try:
+        target.relative_to(app_resolved)
+    except ValueError:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
+    if not target.exists() or not target.is_file():
+        # SPA fallback — every non-asset path returns index.html so the
+        # built React Router can take over client-side.
+        target = app_dir / "index.html"
+        if not target.exists():
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "app index.html missing",
             )
     return FileResponse(target)
 

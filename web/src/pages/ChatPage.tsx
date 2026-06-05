@@ -955,7 +955,7 @@ export default function ChatPage() {
 
       {/* Sticky plan panel — turn-independent state */}
       <PlanPanel items={plan} />
-      {previewUrl && <PreviewBanner url={previewUrl} onDismiss={() => setPreviewUrl(null)} />}
+      {previewUrl && <PreviewBanner url={previewUrl} sessionId={sessionId ?? ""} sessionName={turns[0]?.userPrompt ?? "app"} onDismiss={() => setPreviewUrl(null)} />}
 
       {/* Debug stream — floating raw WS event log. Use to diagnose live-event
           delivery: if events appear here in real time but the transcript
@@ -1946,8 +1946,8 @@ function DebugStream({
 // ============================================================================
 
 function PreviewBanner({
-  url, onDismiss,
-}: { url: string; onDismiss: () => void }) {
+  url, sessionId, sessionName, onDismiss,
+}: { url: string; sessionId: string; sessionName: string; onDismiss: () => void }) {
   // Resolve relative URLs to the current origin so the banner works on
   // any deployment (localhost dev, forge.karmacode.cloud, etc.).
   const fullUrl = url.startsWith("http")
@@ -1955,6 +1955,50 @@ function PreviewBanner({
     : `${window.location.origin}${url.startsWith("/") ? "" : "/"}${url}`;
   const isIOS = typeof navigator !== "undefined"
     && /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+  // ---- Deploy ("promote to permanent URL") state ------------------------
+  // Suggested slug = first 32 chars of the session-first-prompt slugified
+  // down to [a-z0-9-]. The user can tweak before submitting.
+  const suggestedSlug = (sessionName || "app")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32) || "app";
+  const [picking, setPicking] = useState(false);
+  const [slugInput, setSlugInput] = useState(suggestedSlug);
+  const [deploying, setDeploying] = useState(false);
+  const [deployedUrl, setDeployedUrl] = useState<string | null>(null);
+  const [deployedSlug, setDeployedSlug] = useState<string | null>(null);
+  const [deployErr, setDeployErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const submitDeploy = async () => {
+    if (!sessionId || deploying) return;
+    setDeploying(true);
+    setDeployErr(null);
+    try {
+      const res = await (await import("@/lib/api")).sessionApi.deploy(
+        sessionId, slugInput.trim() || undefined,
+      );
+      setDeployedSlug(res.slug);
+      setDeployedUrl(res.url);
+      setPicking(false);
+    } catch (e: any) {
+      setDeployErr(e?.message ?? "deploy failed");
+    } finally {
+      setDeploying(false);
+    }
+  };
+
+  const copyDeployedUrl = async () => {
+    if (!deployedUrl) return;
+    try {
+      await navigator.clipboard.writeText(deployedUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  };
 
   return (
     <div className="border-b border-accent/25 bg-accent/10 px-4 py-2.5">
@@ -1968,37 +2012,59 @@ function PreviewBanner({
           </span>
           <div className="min-w-0">
             <div className="text-sm font-semibold text-text">
-              Preview ready
+              {deployedUrl ? "App deployed" : "Preview ready"}
             </div>
             <div
               className="truncate font-mono text-tx-xs text-muted"
-              title={fullUrl}
+              title={deployedUrl ?? fullUrl}
             >
-              {fullUrl}
+              {deployedUrl ?? fullUrl}
             </div>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <a
-            href={fullUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="btn-ghost min-h-touch"
-            title="Open the built app in a new tab"
-          >
-            Open
-          </a>
-          <a
-            href={fullUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="btn-primary min-h-touch"
-            title={isIOS
-              ? "Open the app, then tap Share → Add to Home Screen"
-              : "Open the app — the install banner appears in the new tab"}
-          >
-            Install
-          </a>
+          {deployedUrl ? (
+            <>
+              <button
+                type="button"
+                onClick={copyDeployedUrl}
+                className="btn-ghost min-h-touch"
+                title="Copy the permanent URL"
+              >
+                {copied ? "✓ Copied" : "Copy"}
+              </button>
+              <a
+                href={deployedUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="btn-primary min-h-touch"
+                title="Open the deployed app"
+              >
+                Open
+              </a>
+            </>
+          ) : (
+            <>
+              <a
+                href={fullUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="btn-ghost min-h-touch"
+                title="Open the built app in a new tab"
+              >
+                Open
+              </a>
+              <button
+                type="button"
+                disabled={!sessionId || deploying}
+                onClick={() => setPicking(true)}
+                className="btn-primary min-h-touch"
+                title="Promote this build to a permanent installable URL at /apps/<slug>/. Survives session delete + backend restart."
+              >
+                🚀 Deploy
+              </button>
+            </>
+          )}
           <button
             type="button"
             onClick={onDismiss}
@@ -2010,7 +2076,63 @@ function PreviewBanner({
           </button>
         </div>
       </div>
-      {isIOS && (
+
+      {/* Slug picker — inline form that appears when user clicks Deploy.
+          Two-column on desktop, stacked on mobile. */}
+      {picking && (
+        <div className="mx-auto mt-2 max-w-4xl rounded-md border border-accent/40 bg-surface p-3">
+          <label className="block text-xs font-medium text-muted">
+            Pick a slug for the URL (we'll auto-suffix if it's taken)
+          </label>
+          <div className="mt-1.5 flex flex-col gap-2 sm:flex-row sm:items-center">
+            <div className="flex flex-1 items-center gap-1 rounded-md border border-border bg-elevated px-2 py-1.5 font-mono text-sm">
+              <span className="text-muted">{window.location.origin}/apps/</span>
+              <input
+                value={slugInput}
+                onChange={(e) => setSlugInput(e.target.value)}
+                className="min-w-0 flex-1 bg-transparent outline-none"
+                placeholder="my-app"
+                autoFocus
+              />
+              <span className="text-muted">/</span>
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setPicking(false)}
+                className="btn-ghost min-h-touch"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deploying}
+                onClick={submitDeploy}
+                className="btn-primary min-h-touch"
+              >
+                {deploying ? "Deploying…" : "Deploy"}
+              </button>
+            </div>
+          </div>
+          {deployErr && (
+            <div className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+              {deployErr}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* After deploy — show a one-liner confirming it's permanent + install hint. */}
+      {deployedUrl && (
+        <div className="mx-auto mt-1.5 max-w-4xl text-tx-xs text-muted">
+          Permanent URL — survives session delete. Slug: <span className="font-mono">{deployedSlug}</span>.
+          {isIOS
+            ? " On iOS, open the URL in Safari → Share → Add to Home Screen."
+            : " Open the URL in Chrome/Edge to install as a PWA."}
+        </div>
+      )}
+
+      {!deployedUrl && isIOS && (
         <div className="mx-auto mt-1.5 max-w-4xl text-tx-xs text-muted">
           iOS: after opening, tap the Share icon at the bottom, then
           “Add to Home Screen”.
