@@ -60,6 +60,38 @@ export default function Workspace() {
     }
   }, [editingId]);
 
+  // Live session name sync. ChatPage dispatches a window CustomEvent
+  // `ojas:session-renamed` whenever the server reports a rename (either
+  // from the user's inline PATCH or the background LLM-suggested
+  // rename). We update our local sessions list so the sidebar reflects
+  // the new name WITHOUT the user having to navigate away + back.
+  // Also shows a toast for the auto-suffix case (matches the inline
+  // rename UX in SessionList.tsx).
+  useEffect(() => {
+    const onRenamed = (ev: Event) => {
+      const detail = (ev as CustomEvent<{
+        session_id: string;
+        new_name: string;
+        previous_name: string;
+        was_suffixed: boolean;
+      }>).detail;
+      if (!detail?.session_id) return;
+      setSessions((cur) =>
+        cur.map((s) =>
+          s.id === detail.session_id ? { ...s, name: detail.new_name } : s,
+        ),
+      );
+      if (detail.was_suffixed && detail.new_name !== detail.previous_name) {
+        setToast({
+          kind: "info",
+          message: `Renamed to "${detail.new_name}" — "${detail.previous_name}" was already taken.`,
+        });
+      }
+    };
+    window.addEventListener("ojas:session-renamed", onRenamed);
+    return () => window.removeEventListener("ojas:session-renamed", onRenamed);
+  }, []);
+
 
   // Bootstrap: resolve default project + its sessions + the logged-in user.
   // The /me lookup is what tells the sidebar whether to show the Admin link.

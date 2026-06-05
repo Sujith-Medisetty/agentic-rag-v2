@@ -72,6 +72,35 @@ export default function SessionList() {
     }
   }, [editingId]);
 
+  // Live session name sync — ChatPage dispatches a window CustomEvent
+  // `ojas:session-renamed` whenever the server reports a rename
+  // (background LLM-suggested rename or inline PATCH). Update the list
+  // row in place + show a toast for the auto-suffix case.
+  useEffect(() => {
+    const onRenamed = (ev: Event) => {
+      const detail = (ev as CustomEvent<{
+        session_id: string;
+        new_name: string;
+        previous_name: string;
+        was_suffixed: boolean;
+      }>).detail;
+      if (!detail?.session_id) return;
+      setSessions((cur) =>
+        cur.map((s) =>
+          s.id === detail.session_id ? { ...s, name: detail.new_name } : s,
+        ),
+      );
+      if (detail.was_suffixed && detail.new_name !== detail.previous_name) {
+        setToast({
+          kind: "info",
+          message: `Renamed to "${detail.new_name}" — "${detail.previous_name}" was already taken.`,
+        });
+      }
+    };
+    window.addEventListener("ojas:session-renamed", onRenamed);
+    return () => window.removeEventListener("ojas:session-renamed", onRenamed);
+  }, []);
+
   const startNew = async () => {
     if (!projectId) return;
     setCreating(true);

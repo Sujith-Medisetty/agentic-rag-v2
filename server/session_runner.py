@@ -508,7 +508,7 @@ def _load_claude_md(workspace: str) -> str:
 # never raises, never blocks the turn, never visible to the user if the
 # LLM fails or times out.
 
-_AUTO_RENAME_DEFAULT_PREFIX = "Session "  # the placeholder the project view seeds
+_AUTO_RENAME_DEFAULT_PREFIXES = ("Session ", "Chat ")  # placeholder prefixes
 _AUTO_RENAME_MAX = 1                       # at most 1 auto-rename per session
 _AUTO_RENAME_HISTORY: set[str] = set()     # session_ids already auto-renamed
 
@@ -517,18 +517,22 @@ import re as _re
 
 
 def _looks_like_default_name(name: str) -> bool:
-    """True for the placeholder "Session <date>, <time>" the project view
-    creates. We only auto-rename those — never overwrite a name the user
-    explicitly set (even if it's also generic, e.g. "test")."""
+    """True for the placeholder the project view creates — currently
+    "Chat <date>, <time>" (the Workspace sidebar seeds new sessions with
+    that exact format). We only auto-rename those — never overwrite a
+    name the user explicitly set (even if it's also generic, e.g. "test").
+
+    The heuristic: the name starts with one of the known placeholder
+    prefixes AND the rest looks like a timestamp (has a comma, slash,
+    or any digit). This avoids over-eagerly renaming things like
+    "Session 0" which a user might have actually typed."""
     if not name:
         return True
     n = name.strip()
-    if not n.startswith(_AUTO_RENAME_DEFAULT_PREFIX):
+    prefix = next((p for p in _AUTO_RENAME_DEFAULT_PREFIXES if n.startswith(p)), None)
+    if prefix is None:
         return False
-    # "Session 6/5/2026, 10:34:21 PM" or "Session Jan 1, 2024 12:00 AM"
-    rest = n[len(_AUTO_RENAME_DEFAULT_PREFIX):].strip()
-    # Accept anything that has a comma (date, time pattern) or a slash
-    # (date with slashes) — i.e. looks like a timestamp.
+    rest = n[len(prefix):].strip()
     return ("," in rest) or ("/" in rest) or bool(_re.search(r"\d", rest))
 
 
@@ -543,21 +547,27 @@ async def _maybe_auto_rename(session_id: str) -> None:
     try:
         sess = db.get_session(session_id)
         if sess is None:
+            print(f"[auto-rename] {session_id[:8]}: no session row", flush=True)
             return
-        if not _looks_like_default_name(sess.get("name", "")):
+        current_name = sess.get("name", "")
+        if not _looks_like_default_name(current_name):
+            print(f"[auto-rename] {session_id[:8]}: name {current_name!r} is not a default placeholder — skipping", flush=True)
             return
         # Pull the first user prompt + the first assistant response.
         msgs = db.list_messages(session_id)
         if not msgs:
+            print(f"[auto-rename] {session_id[:8]}: no messages", flush=True)
             return
         first_user = next((m for m in msgs if m["role"] == "user"), None)
         if first_user is None:
+            print(f"[auto-rename] {session_id[:8]}: no user message", flush=True)
             return
         first_assistant = next(
             (m for m in msgs if m["role"] == "assistant" and m.get("content")),
             None,
         )
         if first_assistant is None:
+            print(f"[auto-rename] {session_id[:8]}: no assistant message", flush=True)
             return
         # Compose a compact prompt for the LLM.
         prompt_user = first_user["content"][:1000]
@@ -573,31 +583,49 @@ async def _maybe_auto_rename(session_id: str) -> None:
         )
         title = await _call_llm_for_title(suggest_prompt)
         if not title:
+            print(f"[auto-rename] {session_id[:8]}: LLM returned empty title", flush=True)
             return
         # Sanitize: strip quotes, collapse whitespace, cap length.
         title = title.strip().strip('"').strip("'").strip("`")
         title = _re.sub(r"\s+", " ", title).strip()
         title = title.strip(".,;:!?-—–")
         if not title or len(title) > 80:
+            print(f"[auto-rename] {session_id[:8]}: sanitized title {title!r} invalid", flush=True)
             return
         # Reject if the LLM gave us back the default placeholder.
         if _looks_like_default_name(title):
+            print(f"[auto-rename] {session_id[:8]}: LLM title {title!r} still looks like a default", flush=True)
             return
-        # Apply. The PATCH endpoint auto-suffixes on conflict, so we
-        # don't have to worry about duplicates here.
+        # Apply. Use allocate_unique_session_name for the suffix path so we
+        # capture was_suffixed for the UI toast. (allocate_unique_session_name
+        # just picks a name; rename_session actually writes it.)
         from server import db as _db
+        from server.reporter import WebReporter
         try:
             final = _db.allocate_unique_session_name(
                 project_id=sess["project_id"],
                 desired=title,
                 exclude_id=session_id,
             )
+            was_suffixed = (final != title)
             _db.rename_session(session_id, final)
-        except Exception:
-            pass
-    except Exception:
+            # Notify the WebSocket so the sidebar + chat header update
+            # without a manual refresh.
+            try:
+                WebReporter(session_id).session_renamed(
+                    new_name=final,
+                    previous_name=current_name,
+                    was_suffixed=was_suffixed,
+                )
+            except Exception:
+                pass
+            print(f"[auto-rename] {session_id[:8]}: '{current_name}' → '{final}' (suffixed={was_suffixed})", flush=True)
+        except Exception as e:
+            print(f"[auto-rename] {session_id[:8]}: rename failed: {e}", flush=True)
+    except Exception as e:
         # Swallow everything — this is best-effort and must never bleed
         # into the turn flow or the user's UI.
+        print(f"[auto-rename] {session_id[:8]}: unexpected error: {e}", flush=True)
         pass
 
 
@@ -605,25 +633,40 @@ async def _call_llm_for_title(prompt: str) -> str | None:
     """One-shot LLM call to generate a session title. Uses the same
     model the agent is configured with so titles match the agent's
     "voice". Bounded latency: 6 seconds max — if the model is slow, we
-    skip the rename rather than make the user wait."""
+    skip the rename rather than make the user wait.
+
+    IMPORTANT: this model emits extended-thinking blocks even when
+    asked not to, so the raw response usually looks like
+    "<think>...reasoning...</think>\n\nFix Login Flow". We strip
+    everything before the closing </think> tag and take what follows.
+    If there's no think block, the response is used as-is."""
     try:
         from agents.nodes import _get_llm
-        # Non-streaming, no thinking — we just need the final string fast.
         llm = _get_llm(streaming=False, thinking=False)
         from langchain_core.messages import HumanMessage
-        # 6-second ceiling: titles are 1-shot, 3-5 tokens; no need to
-        # block longer than that.
         coro = llm.ainvoke([HumanMessage(content=prompt)])
         msg = await _asyncio.wait_for(coro, timeout=6.0)
         # `msg.content` is either a string or a list of content blocks.
+        raw = ""
         if isinstance(msg.content, str):
-            return msg.content
-        if isinstance(msg.content, list):
+            raw = msg.content
+        elif isinstance(msg.content, list):
             for block in msg.content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    return block.get("text", "")
-                if hasattr(block, "text"):
-                    return block.text
-        return str(msg.content)
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        raw += block.get("text", "")
+                elif hasattr(block, "text"):
+                    raw += block.text
+        else:
+            raw = str(msg.content)
+        if not raw:
+            return None
+        # Strip <think>...</think> blocks (extended thinking).
+        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL)
+        # Also strip any markdown code fences the model might wrap the
+        # answer in (e.g. ```\nTitle\n```).
+        cleaned = _re.sub(r"^```[^\n]*\n", "", cleaned.strip())
+        cleaned = _re.sub(r"\n```$", "", cleaned.strip())
+        return cleaned.strip() or None
     except Exception:
         return None

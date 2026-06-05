@@ -405,6 +405,23 @@ export default function ChatPage() {
         });
         return;
       }
+      case "session_renamed": {
+        // The server (background LLM-suggested rename or our own PATCH
+        // path) changed this session's display name. Bubble the event up
+        // to the parent (Workspace sidebar + SessionList) via a
+        // window CustomEvent so they can update without a manual refresh.
+        window.dispatchEvent(
+          new CustomEvent("ojas:session-renamed", {
+            detail: {
+              session_id:    sessionId,
+              new_name:      String(p.new_name ?? ""),
+              previous_name: String(p.previous_name ?? ""),
+              was_suffixed:  Boolean(p.was_suffixed),
+            },
+          }),
+        );
+        return;
+      }
       case "error": {
         // Error means the turn is over — clear isStreaming RIGHT NOW so the
         // elapsed timer / "Thinking…" / streaming dot stop instantly. We

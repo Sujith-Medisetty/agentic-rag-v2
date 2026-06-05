@@ -381,5 +381,26 @@ class WebReporter(ProgressReporter):
             "cost_usd":           round(cost_usd, 6),
         })
 
+    def session_renamed(
+        self,
+        new_name: str,
+        previous_name: str,
+        was_suffixed: bool = False,
+    ) -> None:
+        """The session's display name just changed — most often because
+        the background LLM-suggested rename fired, but also fires for
+        manual user renames (so the sidebar in Workspace.tsx, the chat
+        header in ChatPage.tsx, and any other open views stay in sync
+        with the DB without a manual refresh).
+
+        `was_suffixed=True` if the server auto-appended "-2"/"-3" to
+        disambiguate a duplicate. The frontend uses that to show the
+        same "renamed to X — Y was taken" toast the inline rename uses."""
+        self._pub("session_renamed", {
+            "new_name":      new_name,
+            "previous_name": previous_name,
+            "was_suffixed":  was_suffixed,
+        })
+
     def error(self, message: str) -> None:
         self._pub("error", {"message": message})
