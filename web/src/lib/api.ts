@@ -223,6 +223,8 @@ export const sessionsApi = {
       `/api/projects/${encodeURIComponent(projectId)}/sessions`,
       { method: "POST", body: JSON.stringify({ name }) },
     ),
+  get: (sessionId: string) =>
+    request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}`),
   rename: (sessionId: string, newName: string) =>
     request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: "PATCH",

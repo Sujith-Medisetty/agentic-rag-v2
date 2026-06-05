@@ -886,6 +886,16 @@ def sessions_delete(session_id: str, user: dict = Depends(require_user)):
     return {"ok": True}
 
 
+@app.get("/api/sessions/{session_id}", response_model=SessionResponse)
+def sessions_get(session_id: str, user: dict = Depends(require_user)):
+    """Fetch a single session's current state. Used by the chat page
+    after turn_summary to re-read the (potentially LLM-renamed) name —
+    the WS session_renamed event isn't 100% reliable on flaky mobile
+    networks, so the frontend polls as a safety net."""
+    session = _session_or_404(session_id, user)
+    return SessionResponse(**session)
+
+
 @app.patch("/api/sessions/{session_id}", response_model=SessionResponse)
 def sessions_rename(
     session_id: str,

@@ -26,7 +26,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useOutletContext } from "react-router-dom";
 import type { Project as ProjectType } from "@/lib/types";
-import { sessionApi } from "@/lib/api";
+import { sessionApi, sessionsApi } from "@/lib/api";
 import { openEventStream } from "@/lib/ws";
 import { useTheme } from "@/lib/theme";
 import type {
@@ -192,6 +192,27 @@ export default function ChatPage() {
         // have. Falls back to 0 (full replay) on a fresh session.
         if (events.length > 0) {
           lastEventTsRef.current = events[events.length - 1].created_at;
+        }
+        // Session rename catch-up. If the live WebSocket missed the
+        // session_renamed event (e.g. WS was reconnecting, or the user
+        // came back to this tab after the rename fired), the latest
+        // session_renamed is in the event history — replay it so the
+        // sidebar in Workspace.tsx reflects the current DB name without
+        // waiting for the next live event.
+        const lastRename = [...events]
+          .reverse()
+          .find((e) => e.kind === "session_renamed");
+        if (lastRename) {
+          window.dispatchEvent(
+            new CustomEvent("ojas:session-renamed", {
+              detail: {
+                session_id:    sessionId,
+                new_name:      String(lastRename.payload.new_name ?? ""),
+                previous_name: String(lastRename.payload.previous_name ?? ""),
+                was_suffixed:  Boolean(lastRename.payload.was_suffixed),
+              },
+            }),
+          );
         }
       } catch (e: any) {
         if (!cancelled) setLoadErr(e?.message ?? "failed to load history");
@@ -403,6 +424,33 @@ export default function ChatPage() {
           setTurns((ts) => [...ts, finished]);
           return null;
         });
+        // Belt-and-suspenders for the LLM-suggested rename. The session
+        // name can change ~1s after turn_summary via the background
+        // auto-rename, but the WS might be closing, reconnecting, or
+        // just slow on mobile. Polling the session's current name
+        // directly from the API 1.5s after the turn ends catches all
+        // those cases — if the name changed, dispatch the rename event
+        // so Workspace's sidebar updates no matter what.
+        if (sessionId) {
+          const sid = sessionId;
+          setTimeout(() => {
+            sessionsApi.get(sid).then((s) => {
+              // The session object has `name`; we don't have the previous
+              // name in scope, so just dispatch the new name. The listener
+              // only acts if the name is different from what's in state.
+              window.dispatchEvent(
+                new CustomEvent("ojas:session-renamed", {
+                  detail: {
+                    session_id:    sid,
+                    new_name:      s.name,
+                    previous_name: "",
+                    was_suffixed:  false,
+                  },
+                }),
+              );
+            }).catch(() => { /* ignore — best-effort */ });
+          }, 1500);
+        }
         return;
       }
       case "session_renamed": {
