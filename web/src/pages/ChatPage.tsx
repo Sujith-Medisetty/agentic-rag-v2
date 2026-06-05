@@ -136,6 +136,24 @@ export default function ChatPage() {
   // ---- Initial reconstruction from history + events ---------------------
   useEffect(() => {
     if (!sessionId) return;
+    // HARD RESET all per-session state synchronously BEFORE any async load.
+    // Without this, switching from session A to session B mid-turn left A's
+    // currentTurn (with isStreaming=true) in state — the Stop button kept
+    // showing on B, but clicking it cancelled B (the URL's sessionId), not
+    // A. Same leak hit previewUrl (A's preview banner showed on B), plan,
+    // git, debugEvents, sending, and loadErr. Resetting all of them up
+    // front guarantees the new session starts from a clean slate; the
+    // load below then populates fresh data from B's event history.
+    setTurns([]);
+    setCurrentTurn(null);
+    setPlan([]);
+    setGit(null);
+    setPreviewUrl(null);
+    setSending(false);
+    setLoadErr(null);
+    setDebugEvents([]);
+    setWsStatus("connecting");
+
     let cancelled = false;
     (async () => {
       try {
@@ -164,9 +182,20 @@ export default function ChatPage() {
   // ---- WebSocket subscription -------------------------------------------
   useEffect(() => {
     if (!sessionId) return;
+    // Capture the sessionId this subscription was bound to in a local
+    // const. If the user switches sessions, the cleanup below closes the
+    // socket — but a message already in-flight (between WebSocket close()
+    // and the next event-loop tick) could still fire its callback after
+    // sessionId has changed. The boundSid guard makes those late events a
+    // no-op so they can't bleed into the NEW session's state.
+    const boundSid = sessionId;
     const handle = openEventStream(
       sessionId,
       (ev) => {
+        // Reject any event delivered after we navigated away from this
+        // session. The dependency-array invariant tells React this effect
+        // belongs to `boundSid`; if the URL's sessionId has drifted, ignore.
+        if (boundSid !== sessionId) return;
         // Tap every event into the debug stream FIRST so we capture it even
         // if handleEvent throws / drops it (which is what we're trying to
         // debug). Keep last 200 entries.
@@ -176,7 +205,7 @@ export default function ChatPage() {
         });
         handleEvent(ev);
       },
-      (s) => setWsStatus(s),
+      (s) => { if (boundSid === sessionId) setWsStatus(s); },
     );
     return () => handle.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
