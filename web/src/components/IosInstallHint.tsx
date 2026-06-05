@@ -83,7 +83,7 @@ export default function IosInstallHint() {
     <div className="fixed inset-x-0 bottom-0 z-30 mx-auto w-[min(480px,calc(100vw-16px))] rounded-t-lg border-x border-t border-border bg-elevated px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-lg">
       <div className="flex items-start gap-3">
         <div className="flex-1 text-sm">
-          <div className="font-medium">Install Forge</div>
+          <div className="font-medium">Install Ojas</div>
           <div className="mt-0.5 flex items-center gap-1 text-muted">
             Tap
             <ShareIcon />

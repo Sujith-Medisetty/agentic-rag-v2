@@ -321,9 +321,9 @@ def _default_workspace_path() -> str:
     Resolution order:
       1. `FORGE_DEFAULT_WORKSPACE` env var — explicit override, wins always.
       2. Platform default:
-         - macOS:    ~/Desktop/Forge
+         - macOS:    ~/Desktop/Ojas
          - Linux:    ~/forge        (no Desktop folder convention)
-         - Windows:  ~/Forge
+         - Windows:  ~/Ojas
     """
     import platform
     override = os.getenv("FORGE_DEFAULT_WORKSPACE")
@@ -331,9 +331,9 @@ def _default_workspace_path() -> str:
         return os.path.expanduser(override)
     system = platform.system()
     if system == "Darwin":
-        return os.path.expanduser("~/Desktop/Forge")
+        return os.path.expanduser("~/Desktop/Ojas")
     if system == "Windows":
-        return os.path.expanduser("~/Forge")
+        return os.path.expanduser("~/Ojas")
     return os.path.expanduser("~/forge")
 
 
@@ -369,7 +369,7 @@ def projects_default(user: dict = Depends(require_user)):
             f"could not create default workspace folder: {e}",
         )
     # Pick a unique name within this user.
-    name = "Forge"
+    name = "Ojas"
     suffix = 0
     while True:
         try:
@@ -377,7 +377,7 @@ def projects_default(user: dict = Depends(require_user)):
             break
         except ValueError:
             suffix += 1
-            name = f"Forge {suffix}"
+            name = f"Ojas {suffix}"
             if suffix > 50:
                 raise HTTPException(
                     status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -964,6 +964,61 @@ async def stream(websocket: WebSocket, session_id: str):
                 break
     finally:
         bus.unsubscribe(websocket)
+
+
+# ============================================================================
+# Preview — serve the session's built PWA so it can be installed on any device.
+# ============================================================================
+
+def _session_preview_dir(session_id: str) -> Path | None:
+    """Resolve the session's `dist/` folder, or None if the session/project
+    can't be found. Used by both the static-serve route AND the build
+    watcher that emits preview_ready events."""
+    session = db.get_session(session_id)
+    if session is None:
+        return None
+    project = db.get_project(session["project_id"])
+    if project is None:
+        return None
+    base = Path(project["workspace_path"])
+    if session.get("workspace_subdir"):
+        base = base / session["workspace_subdir"]
+    return base / "dist"
+
+
+@app.get("/preview/{session_id}")
+@app.get("/preview/{session_id}/")
+@app.get("/preview/{session_id}/{file_path:path}")
+def preview_serve(session_id: str, file_path: str = ""):
+    """Static-serve the session's `<workspace>/dist/` at a public URL.
+    NO auth — the URL is shareable to your phone so a PWA can install
+    itself. session_id is a uuid hex; guessing one is impractical, and the
+    preview only exists if the agent built one.
+
+    SPA fallback: missing assets resolve to `index.html` so client-side
+    React Router takes over."""
+    from fastapi.responses import FileResponse
+    dist_dir = _session_preview_dir(session_id)
+    if dist_dir is None or not dist_dir.exists():
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "preview not built yet — the agent needs to run `npm run build` first",
+        )
+    dist_resolved = dist_dir.resolve()
+    requested = file_path or "index.html"
+    target = (dist_dir / requested).resolve()
+    # Path traversal defence — target MUST be inside dist_dir.
+    try:
+        target.relative_to(dist_resolved)
+    except ValueError:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
+    if not target.exists() or not target.is_file():
+        target = dist_dir / "index.html"
+        if not target.exists():
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "preview index.html missing",
+            )
+    return FileResponse(target)
 
 
 # ============================================================================

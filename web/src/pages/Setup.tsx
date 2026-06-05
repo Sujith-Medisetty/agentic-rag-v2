@@ -25,7 +25,7 @@ export default function Setup({ onDone }: { onDone: () => void }) {
     try {
       const { token } = await authApi.signup(email, password);
       setToken(token);
-      onDone();
+      window.location.assign("/");   // hard reset — see Login.tsx for why
     } catch (e: any) {
       setErr(e?.message ?? "setup failed");
     } finally {
@@ -47,12 +47,12 @@ export default function Setup({ onDone }: { onDone: () => void }) {
               style={{ boxShadow: "0 0 0 4px hsl(var(--accent) / 0.18)" }}
             />
             <span className="brand-mark text-sm font-semibold tracking-tight">
-              Forge
+              Ojas
             </span>
           </div>
           <h1 className="text-xl font-semibold tracking-tight">Create your account</h1>
           <p className="text-xs text-muted">
-            First user on this Forge instance. Pick an email and password
+            First user on this Ojas instance. Pick an email and password
             you'll remember — there's no recovery on a personal backend.
           </p>
         </div>

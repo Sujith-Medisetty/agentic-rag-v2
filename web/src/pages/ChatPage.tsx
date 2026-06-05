@@ -91,6 +91,11 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Preview state — populated when a `preview_ready` event arrives from the
+  // backend's build watcher. The URL is relative; we resolve it to the
+  // current origin when rendering the banner so it works on any deployment.
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   // Follow-mode for the chat scroll: stick to bottom while new events
   // arrive UNLESS the user scrolls up to read. If they do, leave them where
   // they are and pop a floating "↓" button so they can catch back up on a
@@ -141,13 +146,14 @@ export default function ChatPage() {
         if (cancelled) return;
         if (gitInfo) setGit(gitInfo);
         // Walk the event log in chronological order, folding into turns.
-        const { turns: rebuilt, plan: replayedPlan } = rebuildTranscript(
+        const { turns: rebuilt, plan: replayedPlan, previewUrl: replayedPreview } = rebuildTranscript(
           events.map((e) => ({
             kind: e.kind, payload: e.payload, ts: e.created_at * 1000,
           })),
         );
         setTurns(rebuilt);
         setPlan(replayedPlan);
+        if (replayedPreview) setPreviewUrl(replayedPreview);
       } catch (e: any) {
         if (!cancelled) setLoadErr(e?.message ?? "failed to load history");
       }
@@ -186,6 +192,16 @@ export default function ChatPage() {
       case "todo_update": {
         const items = Array.isArray(p.items) ? (p.items as TodoItem[]) : [];
         setPlan(items);
+        return;
+      }
+
+      // --- Preview ready / updated ---
+      // Emitted by the backend's build watcher whenever
+      // `<session_workspace>/dist/index.html` lands or its mtime changes.
+      // We just store the URL; the PreviewBanner below renders the install card.
+      case "preview_ready": {
+        const url = typeof p.url === "string" ? p.url : "";
+        if (url) setPreviewUrl(url);
         return;
       }
 
@@ -849,6 +865,7 @@ export default function ChatPage() {
 
       {/* Sticky plan panel — turn-independent state */}
       <PlanPanel items={plan} />
+      {previewUrl && <PreviewBanner url={previewUrl} onDismiss={() => setPreviewUrl(null)} />}
 
       {/* Debug stream — floating raw WS event log. Use to diagnose live-event
           delivery: if events appear here in real time but the transcript
@@ -1118,11 +1135,12 @@ function _replaceLastTextBlock(
 // Replay an event log into turns + final plan. Pure function, used both on
 // mount (to restore state) and is the model the live handler emulates.
 function rebuildTranscript(events: LiveEvent[]): {
-  turns: Turn[]; plan: TodoItem[];
+  turns: Turn[]; plan: TodoItem[]; previewUrl: string | null;
 } {
   const completed: Turn[] = [];
   let curr: Turn | null = null;
   let plan: TodoItem[] = [];
+  let previewUrl: string | null = null;
 
   for (const ev of events) {
     const p = ev.payload as Record<string, any>;
@@ -1318,12 +1336,17 @@ function rebuildTranscript(events: LiveEvent[]): {
       case "todo_update":
         plan = Array.isArray(p.items) ? (p.items as TodoItem[]) : [];
         break;
+      case "preview_ready": {
+        const url = typeof p.url === "string" ? p.url : "";
+        if (url) previewUrl = url;
+        break;
+      }
     }
   }
   // If the log ended mid-turn, keep that turn open in the rebuilt state too —
   // the live WS handler will continue updating it.
   if (curr) completed.push({ ...curr, isStreaming: false });
-  return { turns: completed, plan };
+  return { turns: completed, plan, previewUrl };
 }
 
 // ============================================================================
@@ -1814,6 +1837,94 @@ function DebugStream({
     </div>
   );
 }
+
+// ============================================================================
+// PreviewBanner — sticky card shown above the chat once the agent's build
+// produces a `dist/` directory. Open / Install / Dismiss controls.
+//
+// "Install" delegates to the platform:
+//   - Android Chrome: opens the URL in a new tab; the PWA's own install
+//     banner (BeforeInstallPromptEvent) fires there.
+//   - iOS Safari: same; user uses Share → Add to Home Screen (Apple
+//     offers no API). We show a short hint for them.
+//   - Desktop Chromium: install icon appears in the address bar.
+// ============================================================================
+
+function PreviewBanner({
+  url, onDismiss,
+}: { url: string; onDismiss: () => void }) {
+  // Resolve relative URLs to the current origin so the banner works on
+  // any deployment (localhost dev, forge.karmacode.cloud, etc.).
+  const fullUrl = url.startsWith("http")
+    ? url
+    : `${window.location.origin}${url.startsWith("/") ? "" : "/"}${url}`;
+  const isIOS = typeof navigator !== "undefined"
+    && /iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+  return (
+    <div className="border-b border-accent/25 bg-accent/10 px-4 py-2.5">
+      <div className="mx-auto flex max-w-4xl flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span
+            aria-hidden
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-accent text-white"
+          >
+            ↗
+          </span>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-text">
+              Preview ready
+            </div>
+            <div
+              className="truncate font-mono text-tx-xs text-muted"
+              title={fullUrl}
+            >
+              {fullUrl}
+            </div>
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <a
+            href={fullUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="btn-ghost min-h-touch"
+            title="Open the built app in a new tab"
+          >
+            Open
+          </a>
+          <a
+            href={fullUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="btn-primary min-h-touch"
+            title={isIOS
+              ? "Open the app, then tap Share → Add to Home Screen"
+              : "Open the app — the install banner appears in the new tab"}
+          >
+            Install
+          </a>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="btn-icon"
+            title="Hide this banner"
+            aria-label="Dismiss preview banner"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+      {isIOS && (
+        <div className="mx-auto mt-1.5 max-w-4xl text-tx-xs text-muted">
+          iOS: after opening, tap the Share icon at the bottom, then
+          “Add to Home Screen”.
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 function truncForDebug(s: any, n: number): string {
   const str = String(s ?? "");

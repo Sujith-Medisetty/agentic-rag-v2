@@ -25,8 +25,8 @@ export default defineConfig({
         "icons/icon-maskable-512.png", "icons/apple-touch-icon.png",
       ],
       manifest: {
-        name: "Forge",
-        short_name: "Forge",
+        name: "Ojas",
+        short_name: "Ojas",
         description:
           "Your local coding agent — chat with your repo from any device.",
         theme_color: "#1B1814",

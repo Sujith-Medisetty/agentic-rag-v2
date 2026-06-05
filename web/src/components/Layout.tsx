@@ -30,7 +30,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               style={{ boxShadow: "0 0 0 4px hsl(var(--accent) / 0.18)" }}
             />
             <span className="brand-mark truncate text-base font-semibold tracking-tight">
-              Forge
+              Ojas
             </span>
           </Link>
           <button

@@ -27,11 +27,11 @@ forge.example.com {
         reverse_proxy 127.0.0.1:8765
     }
 
-    # Reserved for the future preview-serving feature (Item 8). Until that
-    # ships these requests 404 — uncomment the proxy line when implemented.
-    # handle /preview/* {
-    #     reverse_proxy 127.0.0.1:8765
-    # }
+    # Preview — static-served by FastAPI from each session's `dist/`. Public
+    # URL so phones can install the built PWA.
+    handle /preview/* {
+        reverse_proxy 127.0.0.1:8765
+    }
 
     # SPA fallback — every non-file route returns index.html so React
     # Router can take over client-side. file_server serves the asset if

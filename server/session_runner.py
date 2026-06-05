@@ -205,6 +205,16 @@ async def run_turn(
         reporter.assistant_text(final_text or "", done=True)
         return final.values.get("iterations", 0)
 
+    # Preview watcher — polls `<workspace>/dist/index.html` every 4 seconds
+    # for the duration of this turn. When it first appears (or its mtime
+    # changes), emits a `preview_ready` event with the public URL the user
+    # can install from. Stops when the turn finishes (success / cancel /
+    # error) so we don't leak background tasks.
+    preview_stop = asyncio.Event()
+    preview_task = asyncio.create_task(
+        _watch_preview(session_id, workspace, preview_stop)
+    )
+
     try:
         with reporter_scope(reporter):
             # `loop.run_in_executor` does NOT propagate ContextVars to the
@@ -264,6 +274,15 @@ async def run_turn(
     except Exception:
         pass
 
+    # Stop the preview watcher and do ONE final check so the last build
+    # state is captured even if it landed in the gap between polls.
+    preview_stop.set()
+    try:
+        await asyncio.wait_for(preview_task, timeout=2)
+    except (asyncio.TimeoutError, Exception):
+        pass
+    _emit_preview_if_ready(session_id, workspace, force=False)
+
     reporter.turn_summary(
         tools_used         = tool_count,
         duration_ms        = int((time.monotonic() - started) * 1000),
@@ -303,6 +322,51 @@ async def run_turn(
         )
     except Exception as e:   # commit/push must never break the turn
         reporter.commit_skipped(reason=f"unexpected error: {e}")
+
+
+# ============================================================================
+# Preview watcher — fires `preview_ready` events when the agent's build
+# produces a fresh `dist/index.html`. Per-session in-memory state of the
+# last mtime we saw, so subsequent rebuilds (during the same backend process
+# uptime) only emit when the build is genuinely newer.
+# ============================================================================
+
+_preview_last_mtime: dict[str, float] = {}
+
+
+def _emit_preview_if_ready(session_id: str, workspace: str, force: bool) -> None:
+    """Check `<workspace>/dist/index.html`. If it exists and its mtime is
+    newer than the last we emitted for this session, publish a
+    `preview_ready` event. `force=True` re-emits even if unchanged."""
+    try:
+        index = Path(workspace) / "dist" / "index.html"
+        if not index.exists():
+            return
+        mtime = index.stat().st_mtime
+        last = _preview_last_mtime.get(session_id)
+        if not force and last is not None and mtime <= last:
+            return
+        _preview_last_mtime[session_id] = mtime
+        bus = get_bus(session_id)
+        bus.publish("preview_ready", {
+            "url":   f"/preview/{session_id}/",
+            "mtime": int(mtime),
+        })
+    except Exception:
+        # Watcher must never break the turn. Swallow filesystem / bus errors.
+        pass
+
+
+async def _watch_preview(session_id: str, workspace: str, stop: asyncio.Event) -> None:
+    """Background coroutine that polls for new builds while a turn is
+    active. Stops cleanly when `stop` is set."""
+    POLL_SECS = 4
+    while not stop.is_set():
+        _emit_preview_if_ready(session_id, workspace, force=False)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=POLL_SECS)
+        except asyncio.TimeoutError:
+            continue
 
 
 def _autocommit_and_maybe_push(

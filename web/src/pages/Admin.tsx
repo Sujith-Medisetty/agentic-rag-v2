@@ -78,7 +78,7 @@ export default function Admin() {
           </h1>
           <p className="mt-1.5 text-sm text-muted">
             Logged in as <span className="font-mono text-text">{me.email}</span> (root).
-            Full control of this VM's Forge state.
+            Full control of this VM's Ojas state.
           </p>
         </div>
       </div>

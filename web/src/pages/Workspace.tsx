@@ -2,7 +2,7 @@
 // sidebar. The sidebar holds every session in the default project, a "+ New
 // chat" button, theme toggle, and log-out. There's NO project-picker page
 // anymore for casual use: when the user logs in, this page auto-creates a
-// default project at ~/Desktop/Forge and lands them directly in the chat.
+// default project at ~/Desktop/Ojas and lands them directly in the chat.
 
 import { useEffect, useState } from "react";
 import { Outlet, useNavigate, useParams, Link } from "react-router-dom";
@@ -123,7 +123,7 @@ export default function Workspace() {
               style={{ boxShadow: "0 0 0 4px hsl(var(--accent) / 0.18)" }}
             />
             <span className="brand-mark truncate text-base font-semibold tracking-tight">
-              Forge
+              Ojas
             </span>
           </Link>
           <button
@@ -262,11 +262,11 @@ export default function Workspace() {
                 <span className="text-2xl font-bold text-white">F</span>
               </div>
               <h1 className="font-serif text-3xl font-semibold tracking-tight">
-                Welcome to Forge
+                Welcome to Ojas
               </h1>
               <p className="mt-2 max-w-md text-sm text-muted">
                 Pick a chat from the sidebar to resume it, or start a new one.
-                Everything you build lands under <span className="font-mono">~/Desktop/Forge</span>.
+                Everything you build lands under <span className="font-mono">~/Desktop/Ojas</span>.
               </p>
               <button
                 type="button"
@@ -284,7 +284,7 @@ export default function Workspace() {
                 {loadErr ? "Couldn't load workspace" : "Setting up your workspace…"}
               </div>
               <p className="mt-2 text-sm text-muted">
-                {loadErr ?? "Creating ~/Desktop/Forge if it doesn't exist."}
+                {loadErr ?? "Creating ~/Desktop/Ojas if it doesn't exist."}
               </p>
             </div>
           </div>

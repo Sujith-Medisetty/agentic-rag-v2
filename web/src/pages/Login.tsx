@@ -26,7 +26,14 @@ export default function Login({ onDone }: { onDone: () => void }) {
         ? await authApi.login(email, password)
         : await authApi.signup(email, password);
       setToken(res.token);
-      onDone();
+      // Hard reload so every in-memory React state (Workspace's cached
+      // user/projects/sessions, ChatPage's cached turns, etc.) is reset
+      // and re-fetches with the new token. Without this, switching
+      // identity inside one tab (root → fresh signup → "user") leaves
+      // the previous user's identity stuck in component state and the
+      // UI shows the wrong role + "project not found" because the
+      // cached default-project belonged to the prior user.
+      window.location.assign("/");
     } catch (e: any) {
       setErr(e?.message ?? (mode === "login" ? "wrong email or password" : "signup failed"));
     } finally {
@@ -48,7 +55,7 @@ export default function Login({ onDone }: { onDone: () => void }) {
               style={{ boxShadow: "0 0 0 4px hsl(var(--accent) / 0.18)" }}
             />
             <span className="brand-mark text-sm font-semibold tracking-tight">
-              Forge
+              Ojas
             </span>
           </div>
           <h1 className="text-xl font-semibold tracking-tight">
