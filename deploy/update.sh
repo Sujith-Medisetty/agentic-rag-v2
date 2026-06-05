@@ -10,9 +10,9 @@
 
 set -euo pipefail
 
-FORGE_DIR="${FORGE_DIR:-/opt/ojas}"
-FORGE_USER="${FORGE_USER:-ojas}"
-FORGE_BRANCH="${FORGE_BRANCH:-master}"
+OJAS_DIR="${OJAS_DIR:-/opt/ojas}"
+OJAS_USER="${OJAS_USER:-ojas}"
+OJAS_BRANCH="${OJAS_BRANCH:-master}"
 
 BLUE="\033[34m"; GREEN="\033[32m"; RST="\033[0m"
 log()  { printf "${BLUE}▸${RST} %s\n" "$*"; }
@@ -21,23 +21,23 @@ ok()   { printf "${GREEN}✓${RST} %s\n" "$*"; }
 [[ $EUID -eq 0 ]] || { echo "Run with sudo." ; exit 1; }
 
 log "Pulling latest source"
-sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" fetch origin "${FORGE_BRANCH}"
-sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" reset --hard "origin/${FORGE_BRANCH}"
+sudo -u "${OJAS_USER}" git -C "${OJAS_DIR}" fetch origin "${OJAS_BRANCH}"
+sudo -u "${OJAS_USER}" git -C "${OJAS_DIR}" reset --hard "origin/${OJAS_BRANCH}"
 ok "Source updated"
 
 log "Installing any new Python deps"
-sudo -u "${FORGE_USER}" bash <<EOF
+sudo -u "${OJAS_USER}" bash <<EOF
 set -e
-cd ${FORGE_DIR}
+cd ${OJAS_DIR}
 . .venv/bin/activate
 pip install --quiet -r requirements.txt
 EOF
 ok "Python deps current"
 
 log "Rebuilding frontend"
-sudo -u "${FORGE_USER}" bash <<EOF
+sudo -u "${OJAS_USER}" bash <<EOF
 set -e
-cd ${FORGE_DIR}/web
+cd ${OJAS_DIR}/web
 npm ci --silent
 npm run build --silent
 EOF

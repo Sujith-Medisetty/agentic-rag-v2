@@ -10,7 +10,7 @@ class AuthStatusResponse(BaseModel):
  # True when no users exist yet AND no root creds are configured. The UI
  # uses this to show a signup screen on first boot.
  needs_setup: bool
- # True when FORGE_ROOT_EMAIL / PASSWORD are configured in env. Lets the
+ # True when OJAS_ROOT_EMAIL / PASSWORD are configured in env. Lets the
  # UI hint "use your root credentials" on the login page.
  has_root: bool = False
  # True when the server allows new signups via /api/auth/signup.

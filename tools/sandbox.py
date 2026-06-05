@@ -48,7 +48,7 @@ class SandboxConfig:
 # tests, server startup). In that state, every path is allowed: the jail is
 # purely a per-turn security layer.
 _active: ContextVar[SandboxConfig | None] = ContextVar(
-    "forge_sandbox_active", default=None,
+    "ojas_sandbox_active", default=None,
 )
 
 
