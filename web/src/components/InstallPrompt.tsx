@@ -82,7 +82,7 @@ export default function InstallPrompt() {
     <div className="fixed bottom-4 left-1/2 z-30 w-[min(420px,calc(100vw-32px))] -translate-x-1/2 rounded-lg border border-border bg-elevated p-3 shadow-lg">
       <div className="flex items-start gap-3">
         <div className="flex-1 text-sm">
-          <div className="font-medium">Install agentic-rag</div>
+          <div className="font-medium">Install Forge</div>
           <div className="text-muted">
             Add it to your home screen for one-tap access.
           </div>

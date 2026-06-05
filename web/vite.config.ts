@@ -25,12 +25,12 @@ export default defineConfig({
         "icons/icon-maskable-512.png", "icons/apple-touch-icon.png",
       ],
       manifest: {
-        name: "agentic-rag",
-        short_name: "agentic-rag",
+        name: "Forge",
+        short_name: "Forge",
         description:
-          "Local agentic coding assistant — chat with your repo from any device.",
-        theme_color: "#0b0d10",
-        background_color: "#0b0d10",
+          "Your local coding agent — chat with your repo from any device.",
+        theme_color: "#1B1814",
+        background_color: "#1B1814",
         display: "standalone",
         orientation: "any",
         scope: "/",

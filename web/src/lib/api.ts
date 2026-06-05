@@ -80,6 +80,8 @@ export const projectsApi = {
       method: "POST",
       body: JSON.stringify({ name, workspace_path }),
     }),
+  getDefault: () =>
+    request<Project>("/api/projects/default"),
   get: (id: string) =>
     request<Project>(`/api/projects/${encodeURIComponent(id)}`),
   updateSettings: (id: string, patch: ProjectSettingsUpdate) =>

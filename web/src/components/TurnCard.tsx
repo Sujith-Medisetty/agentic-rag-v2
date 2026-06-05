@@ -141,19 +141,24 @@ function TimelineBlockRow({
 function LlmCallBlock({
   inputTokens, outputTokens,
 }: { inputTokens: number; outputTokens: number }) {
+  // Right-aligned, borderless, subtle. Used to mark every model call inside a
+  // turn (so the user can see token cost per iteration), but it's secondary
+  // information — visual weight is reduced so it doesn't compete with tool
+  // / file / agent blocks. No box, no background, just a line of small
+  // labelled text aligned to the right rail.
   return (
-    <div
-      className="inline-flex items-baseline gap-2 rounded-md border border-border/60 bg-elevated/30 px-2 py-0.5 font-sans text-tx-xs"
-      title={`Model call · ${inputTokens.toLocaleString()} input / ${outputTokens.toLocaleString()} output tokens`}
-    >
-      <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-subtle">
-        LLM
-      </span>
-      <span className="font-mono">
-        <span className="text-accent">{formatTokensCompact(inputTokens)}</span>
-        <span className="text-subtle"> in </span>
-        <span className="text-accent-2">{formatTokensCompact(outputTokens)}</span>
-        <span className="text-subtle"> out</span>
+    <div className="flex justify-end pr-1 font-sans text-[10px] leading-tight text-subtle">
+      <span
+        className="inline-flex items-baseline gap-1.5"
+        title={`Model call · ${inputTokens.toLocaleString()} input / ${outputTokens.toLocaleString()} output tokens`}
+      >
+        <span className="font-semibold uppercase tracking-[0.16em]">llm</span>
+        <span className="font-mono text-tx-xs">
+          <span className="text-accent">{formatTokensCompact(inputTokens)}</span>
+          <span className="text-subtle"> in · </span>
+          <span className="text-accent-2">{formatTokensCompact(outputTokens)}</span>
+          <span className="text-subtle"> out</span>
+        </span>
       </span>
     </div>
   );

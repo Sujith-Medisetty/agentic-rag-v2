@@ -27,17 +27,21 @@ export default {
   theme: {
     extend: {
       fontFamily: {
+        // Inter — the closest free face to Claude's Söhne body. Used by
+        // Vercel, GitHub, Linear; works at every size, every weight.
         sans: [
-          "Geist", "Inter", "ui-sans-serif", "system-ui",
+          "Inter", "ui-sans-serif", "system-ui",
           "-apple-system", "BlinkMacSystemFont", "Segoe UI",
           "Roboto", "Helvetica Neue", "Arial", "sans-serif",
         ],
+        // Source Serif 4 — editorial weight for hero headings.
         serif: [
           "Source Serif 4", "ui-serif", "Georgia", "Cambria",
           "Times New Roman", "serif",
         ],
+        // JetBrains Mono — distinctive ligatures, legible code surface.
         mono: [
-          "Geist Mono", "ui-monospace", "SFMono-Regular", "SF Mono",
+          "JetBrains Mono", "ui-monospace", "SFMono-Regular", "SF Mono",
           "Menlo", "Monaco", "Consolas", "Liberation Mono",
           "Courier New", "monospace",
         ],

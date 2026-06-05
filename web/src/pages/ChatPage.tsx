@@ -24,7 +24,8 @@
 // fold into turns[]. This gives full restore-on-reload behaviour.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams, useOutletContext } from "react-router-dom";
+import type { Project as ProjectType } from "@/lib/types";
 import { sessionApi } from "@/lib/api";
 import { openEventStream } from "@/lib/ws";
 import { useTheme } from "@/lib/theme";
@@ -61,9 +62,19 @@ const EMPTY_TOTALS: SessionTotals = {
 // ============================================================================
 
 export default function ChatPage() {
-  const { projectId, sessionId } = useParams<{
-    projectId: string; sessionId: string;
-  }>();
+  // The new sidebar layout only puts the sessionId in the URL; the active
+  // project comes from the Workspace's outlet context. Legacy /p/:projectId
+  // routes still expose both via useParams as a fallback.
+  const params = useParams<{ projectId?: string; sessionId?: string }>();
+  const sessionId = params.sessionId;
+  const ctx = useOutletContext<{ project?: ProjectType; sidebarOpen?: boolean } | null>();
+  const projectId = params.projectId ?? ctx?.project?.id ?? "";
+  // The Workspace sidebar puts a hamburger icon at the top-left when it's
+  // collapsed. The chat header needs to reserve space for it whenever the
+  // sidebar is NOT visible (so its content doesn't get hidden behind the
+  // icon). Default to "reserve space" if context isn't available (legacy
+  // standalone routes use this path).
+  const needsHamburgerSpace = ctx ? !ctx.sidebarOpen : true;
 
   const [turns, setTurns] = useState<Turn[]>([]);
   const [currentTurn, setCurrentTurn] = useState<Turn | null>(null);
@@ -774,23 +785,12 @@ export default function ChatPage() {
           right edge. On phone, the center zone is empty (totals live in the
           sticky banner above the compose) and left + right close in tight. */}
       <header className="chrome-bar grid grid-cols-[auto_1fr_auto] items-center gap-2 px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 sm:gap-3 sm:px-4 sm:pt-3 sm:pb-3">
-        {/* LEFT — back + branch + push. Shrinks to content. */}
-        <div className="flex items-center gap-2">
-          <Link
-            to={`/p/${projectId}`}
-            className="btn-icon shrink-0 sm:hidden"
-            aria-label="Back to sessions"
-            title="Back to sessions"
-          >
-            ←
-          </Link>
-          <Link
-            to={`/p/${projectId}`}
-            className="group hidden shrink-0 items-center gap-1.5 text-sm text-muted transition-colors hover:text-accent sm:flex"
-          >
-            <span className="transition-transform group-hover:-translate-x-0.5">←</span>
-            <span>back</span>
-          </Link>
+        {/* LEFT — branch + push. The old "back to sessions" link is gone:
+            the Workspace sidebar handles switching between chats now. When
+            the sidebar is collapsed, the floating hamburger icon lives at
+            top-left, so we reserve pl-12; when it's open, no padding
+            needed (the sidebar's own column already pushes us right). */}
+        <div className={`flex items-center gap-2 ${needsHamburgerSpace ? "pl-12" : ""}`}>
           <BranchBadge git={git} />
           {git?.has_remote && git.ahead > 0 && (
             <button

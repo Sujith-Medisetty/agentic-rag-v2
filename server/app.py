@@ -50,6 +50,17 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Load .env at the project root BEFORE any other module reads os.getenv. The
+# file is owner-only by convention (`chmod 600 .env`) and is git-ignored, so
+# secrets stay out of the repo. python-dotenv silently no-ops if the file is
+# missing — production VMs can still set vars via systemd / docker env if
+# they prefer.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass   # dotenv not installed — fall back to shell env only
+
 from fastapi import (
     Depends, FastAPI, HTTPException, Header, Query, WebSocket,
     WebSocketDisconnect, status,
@@ -236,6 +247,68 @@ def projects_create(
     except ValueError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
     return ProjectResponse(**p)
+
+
+def _default_workspace_path() -> str:
+    """Where should the default project live on disk?
+
+    Resolution order:
+      1. `FORGE_DEFAULT_WORKSPACE` env var — explicit override, wins always.
+      2. Platform default:
+         - macOS:    ~/Desktop/Forge
+         - Linux:    ~/forge        (no Desktop folder convention)
+         - Windows:  ~/Forge
+    """
+    import platform
+    override = os.getenv("FORGE_DEFAULT_WORKSPACE")
+    if override:
+        return os.path.expanduser(override)
+    system = platform.system()
+    if system == "Darwin":
+        return os.path.expanduser("~/Desktop/Forge")
+    if system == "Windows":
+        return os.path.expanduser("~/Forge")
+    return os.path.expanduser("~/forge")
+
+
+@app.get("/api/projects/default", response_model=ProjectResponse)
+def projects_default(_token: str = Depends(require_token)):
+    """Get-or-create THE default project at the platform's Forge workspace
+    (overridable via FORGE_DEFAULT_WORKSPACE env var). Used by the sidebar
+    UI so casual users skip explicit project setup — every session lands
+    in this single workspace until they choose otherwise.
+
+    The folder is created on disk if missing so the agent's first `bash`
+    call in the workspace doesn't fail with ENOENT."""
+    default_ws = _default_workspace_path()
+    # Reuse if a project already points here (idempotent).
+    for p in db.list_projects():
+        if p["workspace_path"] == default_ws:
+            return ProjectResponse(**p)
+    try:
+        os.makedirs(default_ws, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"could not create default workspace folder: {e}",
+        )
+    # Pick a unique name — "Forge" is the obvious first choice but if the
+    # user already named another project that, fall back to a suffix.
+    name = "Forge"
+    suffix = 0
+    while True:
+        try:
+            project = db.create_project(name, default_ws)
+            break
+        except ValueError:
+            suffix += 1
+            name = f"Forge {suffix}"
+            if suffix > 50:  # paranoia — never spin forever
+                raise HTTPException(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    "couldn't create default project (too many name collisions)",
+                )
+    return ProjectResponse(**project)
 
 
 @app.get("/api/projects/{project_id}", response_model=ProjectResponse)
