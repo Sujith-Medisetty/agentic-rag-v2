@@ -42,12 +42,12 @@ export default function Login({ onDone }: { onDone: () => void }) {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4 py-10">
-      <div className="grid w-full max-w-5xl gap-10 md:grid-cols-[1.1fr_minmax(320px,360px)] md:gap-12 md:items-center">
-        {/* Hero — first thing a new visitor reads. Tells them what Ojas
-            does and how to use it before they fill in the form. On mobile
-            it stacks above the form; on desktop it sits to the left. */}
-        <section className="space-y-6 text-center md:text-left">
+    <div className="flex min-h-screen items-center justify-center px-4 py-6 md:py-10">
+      <div className="grid w-full max-w-5xl gap-5 md:grid-cols-[1.1fr_minmax(320px,360px)] md:gap-12 md:items-center">
+        {/* Hero — compact on mobile (title + short tagline only) so the
+            login form lands above the fold; full hero with bullets +
+            footer on desktop where there's room for both columns. */}
+        <section className="space-y-3 text-center md:space-y-6 md:text-left">
           <div className="flex items-center justify-center gap-3 md:justify-start">
             <span
               aria-hidden
@@ -59,18 +59,26 @@ export default function Login({ onDone }: { onDone: () => void }) {
             </span>
           </div>
 
-          <div className="space-y-3">
-            <h1 className="font-serif text-4xl font-semibold tracking-tight md:text-5xl">
+          <div className="space-y-2 md:space-y-3">
+            <h1 className="font-serif text-2xl font-semibold tracking-tight sm:text-3xl md:text-5xl">
               Your personal coding agent.
             </h1>
-            <p className="text-base text-muted md:text-lg">
+            {/* Short tagline on mobile (1-2 lines), fuller version on desktop. */}
+            <p className="text-sm text-muted md:hidden">
+              Describe what you want — Ojas plans, writes, runs, and
+              ships the code for you. Autonomously.
+            </p>
+            <p className="hidden text-lg text-muted md:block">
               Describe what you want in plain English — Ojas plans, writes,
               runs, and ships the code for you. Apps, scripts, bug fixes,
               prototypes. It thinks like an engineer so you don't have to.
             </p>
           </div>
 
-          <ul className="space-y-3 text-left text-sm">
+          {/* Bullets — desktop-only. They add weight on a phone screen
+              without earning their pixel cost (the user just wants to log
+              in). Hidden on mobile, visible alongside the form on desktop. */}
+          <ul className="hidden space-y-3 text-left text-sm md:block">
             <li className="flex items-start gap-3">
               <span aria-hidden className="mt-1 text-accent">●</span>
               <span>
@@ -109,10 +117,11 @@ export default function Login({ onDone }: { onDone: () => void }) {
         </section>
 
         {/* Auth card — the existing login/signup form, untouched apart from
-            wrapping. Lives on the right on desktop, below the hero on mobile. */}
+            wrapping. Lives on the right on desktop, below the compact hero
+            on mobile (visible above the fold on a typical 375x667+ phone). */}
         <form
           onSubmit={submit}
-          className="glass-card w-full space-y-5 p-7 md:max-w-sm"
+          className="glass-card w-full space-y-4 p-5 md:max-w-sm md:space-y-5 md:p-7"
         >
         <div className="space-y-1">
           <h2 className="text-xl font-semibold tracking-tight">
