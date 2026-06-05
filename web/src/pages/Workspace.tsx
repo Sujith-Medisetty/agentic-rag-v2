@@ -4,7 +4,7 @@
 // anymore for casual use: when the user logs in, this page auto-creates a
 // default project at ~/Desktop/Ojas and lands them directly in the chat.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Outlet, useNavigate, useParams, Link } from "react-router-dom";
 import { projectsApi, sessionsApi, sessionApi, authApi, ApiError } from "@/lib/api";
 import type { AuthUser } from "@/lib/api";
@@ -14,6 +14,10 @@ import type { Project, Session } from "@/lib/types";
 export default function Workspace() {
   const navigate = useNavigate();
   const { sessionId: activeSessionId } = useParams<{ sessionId?: string }>();
+  // Ref always holds the latest activeSessionId so async callbacks don't read
+  // a stale closure value (e.g. when startNew() navigates mid-load).
+  const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
   const [project, setProject] = useState<Project | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [me, setMe] = useState<AuthUser | null>(null);
@@ -40,7 +44,21 @@ export default function Workspace() {
         setMe(user);
         const ss = await sessionsApi.list(p.id);
         if (cancelled) return;
-        setSessions(ss);
+        // Merge: if startNew() ran while we were loading, the new session is
+        // already in local state but not in `ss` (which is a stale snapshot).
+        // Keep locally-added sessions so they don't vanish from the sidebar.
+        setSessions(prev => {
+          const apiIds = new Set(ss.map(s => s.id));
+          const localOnly = prev.filter(s => !apiIds.has(s.id));
+          return localOnly.length > 0 ? [...localOnly, ...ss] : ss;
+        });
+        // Auto-open the most recent session when the user lands with no
+        // session selected (e.g. logging in on a new device). Use the ref
+        // so we read the *current* URL param, not the stale closure value
+        // (which would be wrong if startNew() navigated while we were loading).
+        if (ss.length > 0 && !activeSessionIdRef.current) {
+          navigate(`/s/${ss[0].id}`, { replace: true });
+        }
       } catch (e) {
         if (!cancelled) setLoadErr(e instanceof ApiError ? e.message : "failed to load workspace");
       }

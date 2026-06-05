@@ -24,9 +24,10 @@ export function registerSW(): void {
   });
 
   wb.addEventListener("controlling", () => {
-    // A new SW just took control. We don't reload mid-session; let the next
-    // route change naturally pick up the new bundle. (If you ever DO want
-    // immediate reload, call window.location.reload() here.)
+    // New SW took control — reload so the page runs the fresh bundle.
+    // This fires at most once per deployment and only if the user was already
+    // on the page when the SW updated (rare). The reload is silent and instant.
+    window.location.reload();
   });
 
   wb.register().catch((err) => {
