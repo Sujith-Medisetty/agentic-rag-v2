@@ -56,31 +56,31 @@ export default function SessionList() {
   };
 
   return (
-    <div className="mx-auto max-w-3xl space-y-6 p-6 pt-8">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
+    <div className="mx-auto max-w-3xl space-y-6 px-4 pb-12 pt-6 sm:px-6 sm:pt-8">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+        <div className="min-w-0 flex-1">
           <Link
             to="/"
-            className="text-xs text-muted transition-colors hover:text-accent"
+            className="inline-flex items-center gap-1 text-xs text-muted transition-colors hover:text-accent"
           >
-            ← all projects
+            ← All projects
           </Link>
-          <h1 className="mt-2 truncate text-3xl font-semibold tracking-tight">
+          <h1 className="mt-2 truncate font-serif text-3xl font-semibold leading-tight tracking-tight sm:text-4xl">
             {project?.name ?? "Loading…"}
           </h1>
           {project && (
-            <div className="mt-1 truncate font-mono text-xs text-muted">
+            <div className="mt-1.5 truncate font-mono text-xs text-muted">
               {project.workspace_path}
             </div>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2 sm:self-start sm:pt-1">
           <button
             onClick={() => setShowSettings((v) => !v)}
             className="btn-ghost min-h-touch"
             aria-label="Project settings"
           >
-            ⚙ Settings
+            Settings
           </button>
           <button
             onClick={startNew}
@@ -117,7 +117,7 @@ export default function SessionList() {
 
       <div className="grid gap-2.5">
         {sessions.map((s) => (
-          <div key={s.id} className="list-card flex items-center gap-3">
+          <div key={s.id} className="list-card group flex items-center gap-3">
             <Link
               to={`/p/${projectId}/s/${s.id}`}
               className="min-w-0 flex-1"

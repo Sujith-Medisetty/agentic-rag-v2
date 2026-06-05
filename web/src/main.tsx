@@ -2,7 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "@/App";
 import { registerSW } from "@/pwa/registerSW";
+import { initThemeBeforeRender } from "@/lib/theme";
 import "@/index.css";
+
+// Apply the stored theme BEFORE React renders so the first paint is in the
+// right palette (no light → dark flash).
+initThemeBeforeRender();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

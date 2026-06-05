@@ -13,29 +13,30 @@
       content="Local agentic coding assistant — chat with your repo from any device."
     />
 
-    <!-- Browser chrome colour (Android address bar, desktop window). -->
-    <meta name="theme-color" content="#07080a" />
+    <!-- Browser chrome colour. Two values so iOS/Android pick the right one
+         per system theme — warm cream in light, warm near-black in dark. -->
+    <meta name="theme-color" content="#FBF9F4" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1B1814" media="(prefers-color-scheme: dark)" />
 
-    <!-- Inter — primary sans face. Preconnect for early handshake. -->
+    <!-- Typography: Geist Sans for body, Geist Mono for code surfaces,
+         Source Serif 4 for editorial headings. Preconnect cuts ~200ms off
+         first paint. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&display=swap"
     />
 
     <!-- iOS install metadata. iOS doesn't read manifest.json for these,
-         so we set them explicitly here. apple-touch-icon controls the
-         home-screen icon; the status-bar style draws the iOS clock /
-         signal in white on top of our dark background. -->
+         so we set them explicitly here. -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="agentic-rag" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
 
-    <!-- Favicon + PWA manifest. vite-plugin-pwa generates manifest.webmanifest
-         at build time; the icon.svg link gives older browsers a sharp tab icon. -->
+    <!-- Favicon + PWA manifest. -->
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <link rel="icon" type="image/x-icon" href="/favicon.ico" sizes="any" />
     <link rel="manifest" href="/manifest.webmanifest" />

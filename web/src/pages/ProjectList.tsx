@@ -26,25 +26,25 @@ export default function ProjectList() {
   }, []);
 
   return (
-    <div className="mx-auto max-w-3xl space-y-8 p-6 pt-8">
-      <div className="flex items-end justify-between gap-4">
-        <div>
-          <div className="text-xs uppercase tracking-[0.18em] text-subtle">
+    <div className="mx-auto max-w-3xl space-y-6 px-4 pb-12 pt-6 sm:space-y-8 sm:px-6 sm:pt-8">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+        <div className="min-w-0">
+          <div className="text-[11px] font-medium uppercase tracking-[0.18em] text-subtle">
             Workspace
           </div>
-          <h1 className="mt-1 text-3xl font-semibold tracking-tight">
+          <h1 className="mt-1.5 font-serif text-3xl font-semibold leading-tight tracking-tight sm:text-4xl">
             Projects
           </h1>
-          <p className="mt-1 text-sm text-muted">
+          <p className="mt-1.5 text-sm text-muted">
             Each project points at a local repo. Open one to start a session.
           </p>
         </div>
-        <button onClick={() => setShowCreate(true)} className="btn-primary">
+        <button onClick={() => setShowCreate(true)} className="btn-primary min-h-touch self-start sm:self-end">
           + New project
         </button>
       </div>
 
-      {loading && <div className="text-muted">Loading…</div>}
+      {loading && <div className="text-sm text-muted">Loading…</div>}
       {err && (
         <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
           {err}
@@ -52,9 +52,9 @@ export default function ProjectList() {
       )}
 
       {!loading && !err && projects.length === 0 && (
-        <div className="glass-card-soft p-10 text-center">
-          <div className="text-base text-text">No projects yet</div>
-          <div className="mt-1 text-sm text-muted">
+        <div className="glass-card-soft p-8 text-center sm:p-12">
+          <div className="text-base font-medium text-text">No projects yet</div>
+          <div className="mt-1.5 text-sm text-muted">
             Create one to get started.
           </div>
         </div>
@@ -62,7 +62,7 @@ export default function ProjectList() {
 
       <div className="grid gap-2.5">
         {projects.map((p) => (
-          <div key={p.id} className="list-card flex items-center gap-3">
+          <div key={p.id} className="list-card group flex items-center gap-3">
             <Link to={`/p/${p.id}`} className="min-w-0 flex-1">
               <div className="truncate font-medium text-text">{p.name}</div>
               <div className="mt-0.5 truncate font-mono text-xs text-muted">

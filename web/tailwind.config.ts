@@ -1,21 +1,26 @@
 import type { Config } from "tailwindcss";
 
 /**
- * Refined dark palette — warm neutrals, teal primary, soft violet secondary
- * (used only for accent gradients / brand mark, never for chrome).
+ * Claude-inspired design system — warm cream + coral.
  *
- *   bg        ▼ darkest layer, the page background
- *   surface     cards / panels sitting on top of bg
- *   elevated    inputs / hover states / nested cards inside surface
- *   border      hairline borders (subtle, not harsh)
- *   text        primary text (body)
+ * Colors are wired through CSS variables (see src/index.css) so the
+ * palette flips between light + dark automatically based on
+ * prefers-color-scheme. To force a mode, set `data-theme="light"` or
+ * `data-theme="dark"` on the root element (not currently wired but the
+ * CSS variables already cover that path).
+ *
+ *   bg          page surface (warm cream in light, near-black in dark)
+ *   surface     primary card surface (white in light)
+ *   elevated    nested / hover surface (warmer cream)
+ *   border      hairlines — low contrast on purpose
+ *   text        primary body text
  *   muted       secondary text (metadata, captions)
  *   subtle      tertiary text (timestamps, very low priority)
- *   accent      primary accent — teal
- *   accent-2    secondary accent — soft violet (gradients only)
- *   success     positive status (commit, tool done)
- *   warn        warnings (dirty branch, paused, stash)
- *   danger      errors (failed commit/push, system messages)
+ *   accent      coral — Claude's signature
+ *   accent-2    warm tan (gradients / secondary accent)
+ *   success     sage green
+ *   warn        amber
+ *   danger      rust
  */
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
@@ -23,40 +28,45 @@ export default {
     extend: {
       fontFamily: {
         sans: [
-          "Inter", "ui-sans-serif", "system-ui", "-apple-system", "BlinkMacSystemFont",
-          "Segoe UI", "Roboto", "Helvetica Neue", "Arial", "sans-serif",
+          "Geist", "Inter", "ui-sans-serif", "system-ui",
+          "-apple-system", "BlinkMacSystemFont", "Segoe UI",
+          "Roboto", "Helvetica Neue", "Arial", "sans-serif",
+        ],
+        serif: [
+          "Source Serif 4", "ui-serif", "Georgia", "Cambria",
+          "Times New Roman", "serif",
         ],
         mono: [
-          "ui-monospace", "SFMono-Regular", "SF Mono", "Menlo",
-          "Monaco", "Consolas", "Liberation Mono", "Courier New", "monospace",
+          "Geist Mono", "ui-monospace", "SFMono-Regular", "SF Mono",
+          "Menlo", "Monaco", "Consolas", "Liberation Mono",
+          "Courier New", "monospace",
         ],
       },
       colors: {
-        bg:        "#07080a",   // page
-        surface:   "#0f1115",   // cards on bg
-        elevated:  "#171a20",   // inputs / nested cards
-        border:    "#262a33",   // hairlines
-        text:      "#ecedf0",   // primary
-        muted:     "#9097a3",   // secondary
-        subtle:    "#5e6470",   // tertiary
-        accent:    "#5eead4",   // ONE accent (teal)
-        "accent-2": "#a78bfa",  // soft violet — used in gradients only
-        success:   "#34d399",
-        warn:      "#fbbf24",
-        danger:    "#f87171",
+        bg:        "hsl(var(--bg))",
+        surface:   "hsl(var(--surface))",
+        elevated:  "hsl(var(--elevated))",
+        border:    "hsl(var(--border))",
+        text:      "hsl(var(--text))",
+        muted:     "hsl(var(--muted))",
+        subtle:    "hsl(var(--subtle))",
+        accent:    "hsl(var(--accent))",
+        "accent-2": "hsl(var(--accent-2))",
+        success:   "hsl(var(--success))",
+        warn:      "hsl(var(--warn))",
+        danger:    "hsl(var(--danger))",
       },
       backgroundImage: {
         "brand-gradient":
-          "linear-gradient(135deg, #5eead4 0%, #67e8f9 45%, #a78bfa 100%)",
+          "linear-gradient(135deg, hsl(var(--accent)) 0%, hsl(var(--accent-2)) 100%)",
         "accent-gradient":
-          "linear-gradient(135deg, #5eead4 0%, #22d3ee 100%)",
-        "surface-glow":
-          "radial-gradient(120% 80% at 50% 0%, rgba(94, 234, 212, 0.06) 0%, rgba(167, 139, 250, 0.04) 35%, transparent 70%)",
+          "linear-gradient(135deg, hsl(var(--accent)) 0%, hsl(var(--accent-2)) 100%)",
       },
       boxShadow: {
-        "soft":      "0 1px 0 0 rgba(255,255,255,0.04) inset, 0 6px 24px -8px rgba(0,0,0,0.55)",
-        "lift":      "0 1px 0 0 rgba(255,255,255,0.05) inset, 0 12px 36px -10px rgba(0,0,0,0.7)",
-        "glow-accent": "0 0 0 1px rgba(94,234,212,0.35), 0 8px 30px -8px rgba(94,234,212,0.35)",
+        // Warm soft shadows in light mode; deeper in dark.
+        "soft":        "0 1px 2px 0 hsl(var(--shadow-soft) / 0.06), 0 1px 1px 0 hsl(var(--shadow-soft) / 0.04)",
+        "lift":        "0 4px 12px -2px hsl(var(--shadow-lift) / 0.10), 0 2px 4px -1px hsl(var(--shadow-lift) / 0.06)",
+        "glow-accent": "0 0 0 3px hsl(var(--accent) / 0.18)",
       },
       spacing: {
         "safe-top":   "env(safe-area-inset-top)",
@@ -65,19 +75,23 @@ export default {
         "safe-right": "env(safe-area-inset-right)",
       },
       fontSize: {
-        // Terminal-dense reading scale — slightly tighter than the default
-        // Tailwind base. Used everywhere in the transcript.
+        // Dense-but-readable scale for the transcript surface.
         "tx":    ["13px", { lineHeight: "20px" }],
         "tx-sm": ["12px", { lineHeight: "18px" }],
         "tx-xs": ["11px", { lineHeight: "16px" }],
       },
       minHeight: { "touch": "44px" },
       minWidth:  { "touch": "44px" },
+      borderRadius: {
+        // Slightly more generous defaults — fits the Claude warmth better.
+        "lg":  "10px",
+        "xl":  "14px",
+        "2xl": "20px",
+      },
       animation: {
         "fade-in":     "fadeIn 180ms ease-out",
         "fade-in-up":  "fadeInUp 220ms ease-out",
         "pulse-soft":  "pulseSoft 2s ease-in-out infinite",
-        "ambient":     "ambient 18s ease-in-out infinite",
         "shimmer":     "shimmer 2.4s linear infinite",
       },
       keyframes: {
@@ -92,10 +106,6 @@ export default {
         pulseSoft: {
           "0%, 100%": { opacity: "1" },
           "50%":      { opacity: "0.4" },
-        },
-        ambient: {
-          "0%, 100%": { transform: "translate3d(0,0,0) scale(1)",     opacity: "0.55" },
-          "50%":      { transform: "translate3d(2%,1%,0) scale(1.05)", opacity: "0.8"  },
         },
         shimmer: {
           "0%":   { backgroundPosition: "-200% 0" },

@@ -88,10 +88,12 @@ export default function TurnCard({ turn, index }: { turn: Turn; index: number })
       )}
 
       {/* FOOTER ----------------------------------------------------------- */}
+      {/* Completed turns keep their own per-turn stats card so history is
+          inspectable when scrolling back. The LIVE ticker for the running
+          turn is NOT shown inside the card — it lives in the sticky
+          ChatStatusBar above the compose divider so the user always sees
+          current activity without scrolling. */}
       {turn.summary && <TurnFooter summary={turn.summary} />}
-      {!turn.summary && turn.isStreaming && !turn.error && (
-        <LiveProgress turn={turn} />
-      )}
     </article>
   );
 }

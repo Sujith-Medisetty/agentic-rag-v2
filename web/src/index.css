@@ -2,157 +2,241 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  html, body, #root {
-    height: 100%;
+/* ---------------------------------------------------------------------------
+ * Design tokens — clean, premium, Linear/Vercel-inspired.
+ *
+ * Modes are switched via `data-theme` on <html> (set by lib/theme.ts).
+ * Defaults follow `prefers-color-scheme` until the user picks one
+ * explicitly via the toggle in the header.
+ *
+ *   bg          page surface
+ *   surface     cards / panels on bg
+ *   elevated    nested cards / hover state / inputs
+ *   border      hairlines (low contrast)
+ *   text        primary body text
+ *   muted       secondary text (metadata)
+ *   subtle      tertiary text (timestamps)
+ *   accent      ONE confident accent (indigo)
+ *   accent-2    secondary accent (violet — gradients only)
+ *   success / warn / danger — earthy status
+ *
+ * All values stored as HSL triples (no `hsl(` wrapper) so Tailwind can wrap
+ * them with `hsl(var(--name) / <alpha-value>)`.
+ * ------------------------------------------------------------------------- */
+
+:root,
+[data-theme="light"] {
+  /* Warm off-white — easier on the eyes than pure white. Similar to the
+     light surface in Claude's apps + most editor light themes. */
+  --bg:          40 22% 97%;     /* warm cream-white */
+  --surface:     40 30% 99%;     /* slightly brighter card surface */
+  --elevated:    40 18% 94%;     /* nested / hover */
+  --border:      36 14% 86%;     /* warm hairline */
+  --text:        25 18% 14%;     /* warm dark, not pure black */
+  --muted:       30 10% 40%;
+  --subtle:      30 10% 58%;
+  --accent:     243 70% 58%;     /* premium indigo */
+  --accent-2:   258 80% 65%;     /* violet (gradients only) */
+  --success:    142 55% 32%;
+  --warn:        32 90% 42%;
+  --danger:       0 65% 44%;
+  --shadow-soft: 30 25% 18%;
+  --shadow-lift: 30 30% 12%;
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  /* Warm dark — the Claude Code / editor "dim" aesthetic. NOT pure black,
+     so heavy whites in text don't blast the eye. */
+  --bg:          30  8% 10%;     /* warm dark gray */
+  --surface:     30  8% 13%;
+  --elevated:    30  8% 17%;
+  --border:      30  6% 24%;
+  --text:        36 18% 92%;     /* warm off-white text */
+  --muted:       30  8% 62%;
+  --subtle:      30  6% 44%;
+  --accent:     234 85% 76%;     /* brighter indigo for dark contrast */
+  --accent-2:   258 80% 78%;
+  --success:    142 55% 60%;
+  --warn:        45 90% 65%;
+  --danger:       2 75% 66%;
+  --shadow-soft:  0  0%  0%;
+  --shadow-lift:  0  0%  0%;
+  color-scheme: dark;
+}
+
+/* If the user hasn't picked an explicit theme, follow system preference. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg:          30  8% 10%;
+    --surface:     30  8% 13%;
+    --elevated:    30  8% 17%;
+    --border:      30  6% 24%;
+    --text:        36 18% 92%;
+    --muted:       30  8% 62%;
+    --subtle:      30  6% 44%;
+    --accent:     234 85% 76%;
+    --accent-2:   258 80% 78%;
+    --success:    142 55% 60%;
+    --warn:        45 90% 65%;
+    --danger:       2 75% 66%;
+    --shadow-soft:  0  0%  0%;
+    --shadow-lift:  0  0%  0%;
+    color-scheme: dark;
   }
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
   body {
     margin: 0;
-    background-color: #07080a;
-    color: #ecedf0;
+    background-color: hsl(var(--bg));
+    color: hsl(var(--text));
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    font-feature-settings: "ss01", "cv11";
-    /* Subtle ambient backdrop: two soft radial glows on near-black. */
+    font-family: theme("fontFamily.sans");
+    font-feature-settings: "cv11", "ss01";
+    /* Subtle ambient gradient on bg so it doesn't feel flat. */
     background-image:
-      radial-gradient(900px 600px at 12% -10%, rgba(94, 234, 212, 0.07), transparent 60%),
-      radial-gradient(800px 500px at 100% 110%, rgba(167, 139, 250, 0.06), transparent 60%),
-      linear-gradient(180deg, #07080a 0%, #0a0b10 100%);
+      radial-gradient(1200px 700px at 5% -10%, hsl(var(--accent) / 0.04), transparent 60%),
+      radial-gradient(900px 500px at 110% 110%, hsl(var(--accent-2) / 0.03), transparent 60%);
     background-attachment: fixed;
   }
 
-  /* Selection: subtle accent tint, not harsh blue. */
+  h1, h2 { letter-spacing: -0.02em; }
+
   ::selection {
-    background-color: rgb(94 234 212 / 0.25);
+    background-color: hsl(var(--accent) / 0.22);
     color: inherit;
   }
 
-  /* Scrollbars: thin, themed, only on hover for desktop. */
   @media (pointer: fine) {
-    *::-webkit-scrollbar       { width: 8px; height: 8px; }
+    *::-webkit-scrollbar       { width: 10px; height: 10px; }
     *::-webkit-scrollbar-track { background: transparent; }
     *::-webkit-scrollbar-thumb {
-      background-color: #262a33; border-radius: 4px;
+      background-color: hsl(var(--border));
+      border: 2px solid hsl(var(--bg));
+      border-radius: 6px;
     }
-    *::-webkit-scrollbar-thumb:hover { background-color: #323743; }
+    *::-webkit-scrollbar-thumb:hover { background-color: hsl(var(--subtle) / 0.5); }
   }
 
-  /* Native form controls — give them the dark theme too. */
   select option {
-    background-color: #171a20;
-    color: #ecedf0;
+    background-color: hsl(var(--surface));
+    color: hsl(var(--text));
   }
 }
 
 @layer components {
-  /* ----- Transcript surface ------------------------------------------- */
-  /* Terminal-dense reading. Used on the chat scroll region so everything
-     inside (turns, tools, diffs, footers) inherits mono + size. */
+  /* Transcript surface — dense reading inside the chat scroll area. */
   .transcript {
     @apply font-mono text-tx leading-snug text-text;
     font-variant-ligatures: none;
   }
+  .tree-line { @apply flex items-baseline gap-1.5 whitespace-pre; }
+  .tree-rail { @apply border-l border-border pl-3; }
 
-  /* ----- Tree connectors ---------------------------------------------- */
-  .tree-line {
-    @apply flex items-baseline gap-1.5 whitespace-pre;
-  }
-  .tree-rail {
-    @apply border-l border-border/40 pl-3;
-  }
-
-  /* ----- Pills / badges ----------------------------------------------- */
+  /* ---------------------------------------------------------------------
+   * Pills / badges
+   * ------------------------------------------------------------------- */
   .pill {
-    @apply inline-flex items-center gap-1.5 rounded-md border border-border
-           bg-elevated/70 px-2 py-0.5 font-sans text-tx-xs text-muted
-           backdrop-blur-sm;
+    @apply inline-flex items-center gap-1.5 rounded-full border border-border
+           bg-elevated px-2.5 py-0.5 font-sans text-tx-xs text-muted;
   }
-  .pill-accent  { @apply text-accent  border-accent/30  bg-accent/5; }
-  .pill-success { @apply text-success border-success/30 bg-success/5; }
-  .pill-warn    { @apply text-warn    border-warn/30    bg-warn/5; }
-  .pill-danger  { @apply text-danger  border-danger/30  bg-danger/5; }
+  .pill-accent  { @apply text-accent  border-accent/30  bg-accent/10; }
+  .pill-success { @apply text-success border-success/30 bg-success/10; }
+  .pill-warn    { @apply text-warn    border-warn/30    bg-warn/10; }
+  .pill-danger  { @apply text-danger  border-danger/30  bg-danger/10; }
 
-  /* ----- Streaming dot ------------------------------------------------ */
   .stream-dot {
     @apply inline-block h-1.5 w-1.5 animate-pulse-soft rounded-full bg-accent
            align-middle;
-    box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.18);
+    box-shadow: 0 0 0 4px hsl(var(--accent) / 0.20);
   }
 
-  /* ----- Brand wordmark ----------------------------------------------- */
-  /* Used for "agentic-rag" header logo and large headings on auth screens. */
   .brand-mark {
-    @apply bg-clip-text text-transparent;
-    background-image: linear-gradient(135deg, #5eead4 0%, #67e8f9 45%, #a78bfa 100%);
+    @apply bg-clip-text text-transparent font-semibold tracking-tight;
+    background-image: linear-gradient(135deg, hsl(var(--accent)) 0%, hsl(var(--accent-2)) 100%);
   }
 
-  /* ----- Glass card --------------------------------------------------- */
-  /* Semi-transparent panel with backdrop blur + soft elevation. Use for
-     auth cards, modals, and the chat input bar. */
+  /* ---------------------------------------------------------------------
+   * Card surfaces
+   * ------------------------------------------------------------------- */
   .glass-card {
-    @apply rounded-2xl border border-border/80 bg-surface/70 backdrop-blur-xl
-           shadow-lift;
-    background-image: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0) 60%);
+    @apply rounded-2xl border border-border bg-surface shadow-lift;
   }
-  /* Variant: a lighter inner card for nested content. */
   .glass-card-soft {
-    @apply rounded-xl border border-border/60 bg-elevated/60 backdrop-blur-md;
+    @apply rounded-xl border border-border bg-elevated;
   }
 
-  /* ----- Sticky chrome ------------------------------------------------- */
-  /* Top header, plan panel, input bar — translucent with blur so the ambient
-     background bleeds through. */
+  /* Sticky chrome — top header + bottom input bar. */
   .chrome-bar {
-    @apply border-b border-border/70 bg-surface/70 backdrop-blur-xl;
+    @apply border-b border-border bg-bg/90 backdrop-blur-xl;
   }
   .chrome-bar-bottom {
-    @apply border-t border-border/70 bg-surface/70 backdrop-blur-xl;
+    @apply border-t border-border bg-bg/90 backdrop-blur-xl;
   }
 
-  /* ----- Buttons ------------------------------------------------------ */
-  /* Primary — gradient accent with a soft glow. Use sparingly. */
-  .btn-primary {
-    @apply inline-flex items-center justify-center gap-1.5 rounded-lg
-           bg-accent-gradient px-4 py-2 text-sm font-semibold text-bg
-           shadow-soft transition-all duration-200
-           hover:shadow-glow-accent hover:brightness-105
-           active:translate-y-px
-           disabled:opacity-50 disabled:hover:shadow-soft disabled:hover:brightness-100;
-  }
-  /* Secondary — outlined / ghost. */
-  .btn-ghost {
-    @apply inline-flex items-center justify-center gap-1.5 rounded-lg
-           border border-border bg-elevated/60 px-3 py-1.5 text-sm text-text
-           transition-colors hover:border-accent/50 hover:bg-elevated
-           disabled:opacity-50;
-  }
-
-  /* ----- Inputs ------------------------------------------------------- */
-  .field {
-    @apply w-full rounded-lg border border-border bg-elevated/60 px-3 py-2
-           text-text placeholder:text-subtle outline-none transition-colors
-           focus:border-accent/70 focus:bg-elevated
-           focus:shadow-[0_0_0_3px_rgba(94,234,212,0.12)];
-  }
-
-  /* ----- List card (project / session list rows) ---------------------- */
-  /* Subtle gradient surface with a hover-lift + glow on the border. */
   .list-card {
+    /* Pair with `group` on the element if children use `group-hover:*`. */
     @apply relative block overflow-hidden rounded-xl border border-border
            bg-surface px-4 py-3.5 shadow-soft transition-all duration-200
            hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-lift;
-    background-image:
-      linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0) 60%);
   }
-  /* Decorative thin gradient bar that appears on the left edge on hover. */
   .list-card::before {
     content: "";
     position: absolute;
     inset: 0 auto 0 0;
-    width: 2px;
-    background: linear-gradient(180deg, #5eead4, #a78bfa);
+    width: 3px;
+    background: linear-gradient(180deg, hsl(var(--accent)), hsl(var(--accent-2)));
     opacity: 0;
     transition: opacity 200ms ease;
   }
   .list-card:hover::before { opacity: 1; }
+
+  /* ---------------------------------------------------------------------
+   * Buttons
+   * ------------------------------------------------------------------- */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg
+           bg-accent px-4 py-2 text-sm font-semibold text-white
+           shadow-soft transition-all duration-200
+           hover:bg-accent/90 hover:shadow-lift
+           active:translate-y-px
+           disabled:opacity-50 disabled:hover:bg-accent disabled:hover:shadow-soft;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg
+           border border-border bg-surface px-3 py-1.5 text-sm text-text
+           transition-colors hover:border-accent/50 hover:bg-elevated
+           disabled:opacity-50;
+  }
+  .btn-icon {
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-lg
+           border border-border bg-surface text-muted
+           transition-colors hover:border-accent/50 hover:bg-elevated hover:text-text;
+  }
+
+  /* ---------------------------------------------------------------------
+   * Inputs
+   * ------------------------------------------------------------------- */
+  .field {
+    @apply w-full rounded-lg border border-border bg-surface px-3 py-2
+           text-text placeholder:text-subtle outline-none transition-colors
+           focus:border-accent/60 focus:shadow-[0_0_0_3px_hsl(var(--accent)/0.16)];
+  }
+
+  /* ---------------------------------------------------------------------
+   * Mobile bottom-sheet — used for modals on small screens.
+   * ------------------------------------------------------------------- */
+  .sheet {
+    @apply fixed inset-x-0 bottom-0 z-30 flex max-h-[88vh] flex-col
+           rounded-t-2xl border-t border-border bg-surface shadow-lift
+           animate-fade-in-up sm:inset-x-auto sm:bottom-auto sm:left-1/2
+           sm:top-1/2 sm:max-h-[80vh] sm:w-full sm:max-w-md
+           sm:-translate-x-1/2 sm:-translate-y-1/2 sm:rounded-2xl sm:border;
+  }
+  .sheet-backdrop {
+    @apply fixed inset-0 z-30 bg-black/40 backdrop-blur-sm;
+  }
 }

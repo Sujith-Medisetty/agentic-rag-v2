@@ -27,6 +27,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { sessionApi } from "@/lib/api";
 import { openEventStream } from "@/lib/ws";
+import { useTheme } from "@/lib/theme";
 import type {
   LiveEvent, TodoItem, AgentRecord, FileChange, GitInfo,
   CommitRecord, ToolEvent, TurnSummary, Turn, SessionTotals,
@@ -70,6 +71,10 @@ export default function ChatPage() {
   const [git, setGit] = useState<GitInfo | null>(null);
   const [pushing, setPushing] = useState(false);
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed" | "error">("connecting");
+  // App-wide theme. Same hook used by Layout's header; the chat page renders
+  // its own header (so it can show the WS status / debug pill) and therefore
+  // needs to surface the toggle here too.
+  const { effective: themeEffective, toggle: toggleTheme } = useTheme();
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -755,19 +760,37 @@ export default function ChatPage() {
     }
   };
 
+  // True when this is a brand-new session with no exchanges yet. Drives the
+  // Claude.ai-style centered "Start a conversation" layout: the compose form
+  // floats in the middle of the screen instead of being pinned at the bottom,
+  // and the scroll/status chrome stay hidden until there's something to show.
+  const isEmpty = turns.length === 0 && !currentTurn && !loadErr;
+
   // ============================================================================
   return (
     <div className="flex h-screen flex-col">
-      {/* Header — sticky, has back link + git + push + totals + connection */}
-      <header className="chrome-bar flex items-center justify-between gap-3 px-4 pt-[max(0.75rem,env(safe-area-inset-top))] pb-3">
-        <Link
-          to={`/p/${projectId}`}
-          className="group flex shrink-0 items-center gap-1.5 text-sm text-muted transition-colors hover:text-accent"
-        >
-          <span className="transition-transform group-hover:-translate-x-0.5">←</span>
-          <span>back</span>
-        </Link>
-        <div className="flex min-w-0 items-center gap-2">
+      {/* Header — three explicit zones (left | center | right) so session
+          totals can sit truly centered on desktop instead of drifting to the
+          right edge. On phone, the center zone is empty (totals live in the
+          sticky banner above the compose) and left + right close in tight. */}
+      <header className="chrome-bar grid grid-cols-[auto_1fr_auto] items-center gap-2 px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 sm:gap-3 sm:px-4 sm:pt-3 sm:pb-3">
+        {/* LEFT — back + branch + push. Shrinks to content. */}
+        <div className="flex items-center gap-2">
+          <Link
+            to={`/p/${projectId}`}
+            className="btn-icon shrink-0 sm:hidden"
+            aria-label="Back to sessions"
+            title="Back to sessions"
+          >
+            ←
+          </Link>
+          <Link
+            to={`/p/${projectId}`}
+            className="group hidden shrink-0 items-center gap-1.5 text-sm text-muted transition-colors hover:text-accent sm:flex"
+          >
+            <span className="transition-transform group-hover:-translate-x-0.5">←</span>
+            <span>back</span>
+          </Link>
           <BranchBadge git={git} />
           {git?.has_remote && git.ahead > 0 && (
             <button
@@ -777,19 +800,46 @@ export default function ChatPage() {
               className="pill pill-accent min-h-touch disabled:opacity-50"
               title={`Push ${git.ahead} commit(s) to origin`}
             >
-              {pushing ? "Pushing…" : `↑ Push ${git.ahead}`}
+              {pushing ? "Pushing…" : `↑ ${git.ahead}`}
             </button>
           )}
+        </div>
+
+        {/* CENTER — session totals + live chip on desktop only. Empty on
+            mobile so the left + right zones determine the layout. */}
+        <div className="hidden min-w-0 items-center justify-center gap-2 sm:flex">
           {currentTurn && currentTurn.isStreaming && !currentTurn.error && (
             <NowChip turn={currentTurn} />
           )}
           <RunningTotals totals={totals} />
-          <StatusPill status={wsStatus} />
+        </div>
+
+        {/* RIGHT — theme toggle + debug toggle. Both icon-only on mobile, the
+            debug button expands to a labeled pill on desktop. */}
+        <div className="flex items-center gap-2 justify-self-end">
+          <button
+            type="button"
+            onClick={toggleTheme}
+            className="btn-icon shrink-0"
+            title={`Switch to ${themeEffective === "dark" ? "light" : "dark"} mode`}
+            aria-label={`Switch to ${themeEffective === "dark" ? "light" : "dark"} mode`}
+          >
+            {themeEffective === "dark" ? <SunGlyph /> : <MoonGlyph />}
+          </button>
+          <button
+            type="button"
+            onClick={toggleDebug}
+            title={debugOpen ? "Close debug stream" : "Open debug stream"}
+            aria-label="Toggle debug stream"
+            className={`shrink-0 ${debugOpen ? "pill-accent" : ""} btn-icon sm:hidden`}
+          >
+            ⌘
+          </button>
           <button
             type="button"
             onClick={toggleDebug}
             title="Toggle raw WebSocket event stream"
-            className={`pill min-h-touch ${debugOpen ? "pill-accent" : ""}`}
+            className={`pill min-h-touch hidden sm:inline-flex ${debugOpen ? "pill-accent" : ""}`}
           >
             ⌘ debug
           </button>
@@ -804,17 +854,26 @@ export default function ChatPage() {
           doesn't reflect them, it's a render bug; if they only appear after
           the turn ends, it's a backend buffering bug. */}
       {debugOpen && (
-        <DebugStream events={debugEvents} onClear={() => setDebugEvents([])} />
+        <DebugStream
+          events={debugEvents}
+          onClear={() => setDebugEvents([])}
+          onClose={toggleDebug}
+        />
       )}
 
-      {/* Scrollable transcript — mono + 13px + tight leading via .transcript */}
-      <div className="relative min-h-0 flex-1">
+      {/* Scrollable transcript — mono + 13px + tight leading via .transcript.
+          The bottom padding gives the last line room to breathe before the
+          sticky Live banner / compose divider starts; the gradient fade at
+          the bottom of the scroll wrapper softens the visual transition so
+          chat content never appears to be cut off mid-line. Hidden when the
+          session is empty so the compose form can center vertically. */}
+      <div className={`relative min-h-0 ${isEmpty ? "hidden" : "flex-1"}`}>
         <div
           ref={scrollRef}
           onScroll={onChatScroll}
           className="h-full overflow-y-auto px-4"
         >
-        <div className="transcript mx-auto flex max-w-4xl flex-col">
+        <div className="transcript mx-auto flex max-w-4xl flex-col pb-16">
           {loadErr && (
             <div className="mt-4 rounded border border-danger/40 bg-danger/10 p-3 text-danger">
               {loadErr}
@@ -844,11 +903,43 @@ export default function ChatPage() {
         )}
       </div>
 
+      {/* Centered welcome — only shown for brand-new sessions, sits just
+          above the centered compose form. Mirrors the Claude.ai-style first-
+          turn UX: hero copy + a single prominent input. */}
+      {isEmpty && (
+        <div className="mt-auto px-4 pt-8 text-center">
+          <div
+            aria-hidden
+            className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-gradient shadow-lift"
+          >
+            <span className="text-2xl font-bold text-white">⌘</span>
+          </div>
+          <h1 className="font-serif text-3xl font-semibold tracking-tight text-text sm:text-4xl">
+            Start a conversation
+          </h1>
+          <p className="mx-auto mt-2.5 max-w-md text-sm text-muted">
+            Type a request below. The agent will reply, call tools, edit files,
+            and track tokens — everything visible as it happens.
+          </p>
+        </div>
+      )}
+
+      {/* Sticky LIVE activity strip — only shown when a turn is actually
+          running (and there's chat above to anchor it). */}
+      {!isEmpty && <ChatStatusBar currentTurn={currentTurn} />}
+
       {/* Input — pinned bottom, safe-area aware. While a turn is in flight the
-          Send button morphs into Stop so cancelling is a single click. */}
+          Send button morphs into Stop so cancelling is a single click.
+          When the session is empty (no turns yet), the form is restyled to
+          center itself in the chat area instead of sitting at the very
+          bottom — Claude.ai-style "start a conversation" feel. */}
       <form
         onSubmit={send}
-        className="chrome-bar-bottom relative px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+        className={
+          isEmpty
+            ? "relative mb-auto w-full px-3 pb-8 pt-4"
+            : "chrome-bar-bottom relative px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
+        }
       >
         {/* Slash-command autocomplete picker — pops up from above the input
             whenever the input starts with "/" and there are matches. ↑/↓
@@ -1234,6 +1325,110 @@ function rebuildTranscript(events: LiveEvent[]): {
   return { turns: completed, plan };
 }
 
+// ============================================================================
+// ChatStatusBar — sticky LIVE activity strip pinned above the compose divider.
+//
+// Only renders while a turn is actually running. Completed turns keep their
+// own per-turn stats card inside the TurnCard (so history is inspectable on
+// scroll). Centered to the same max-width as the chat content so it visually
+// lines up with the conversation above instead of running edge-to-edge.
+// ============================================================================
+
+function ChatStatusBar({
+  currentTurn,
+}: { currentTurn: Turn | null }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!currentTurn?.isStreaming) return;
+    const id = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(id);
+  }, [currentTurn?.isStreaming]);
+
+  if (!currentTurn || !currentTurn.isStreaming || currentTurn.error) return null;
+
+  const totalIn = currentTurn.liveInputTokens;
+  const totalOut = currentTurn.liveOutputTokens;
+  const runningTools = currentTurn.tools.filter((t) => t.status === "running").length;
+  const runningAgents = Object.values(currentTurn.agents).filter((a) => a.status === "running").length;
+
+  return (
+    <div className="bg-bg">
+      <div className="mx-auto max-w-4xl px-4 py-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-accent/25 bg-accent/10 px-3 py-1.5 font-sans text-tx-xs">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="stream-dot" />
+            <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-accent">
+              Live
+            </span>
+          </span>
+          <Sep />
+          <StatItem label="Elapsed" value={formatDurationCompact(now - currentTurn.startedAt)} />
+          <Sep />
+          <StatItem
+            label="Tools"
+            value={`${currentTurn.tools.length}${runningTools ? ` (${runningTools} run)` : ""}`}
+            valueClass={runningTools ? "text-warn" : "text-text"}
+          />
+          {Object.keys(currentTurn.agents).length > 0 && (
+            <>
+              <Sep />
+              <StatItem
+                label="Agents"
+                value={`${Object.keys(currentTurn.agents).length}${runningAgents ? ` (${runningAgents} run)` : ""}`}
+                valueClass={runningAgents ? "text-warn" : "text-text"}
+              />
+            </>
+          )}
+          {(totalIn > 0 || totalOut > 0) && (
+            <>
+              <Sep />
+              <StatItem label="In"  value={formatTokensTiny(totalIn)}  valueClass="text-accent" />
+              <StatItem label="Out" value={formatTokensTiny(totalOut)} valueClass="text-accent-2" />
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatItem({
+  label, value, valueClass = "text-text",
+}: { label: string; value: string; valueClass?: string }) {
+  return (
+    <span className="inline-flex items-baseline gap-1">
+      <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">
+        {label}
+      </span>
+      <span className={`font-mono text-tx-sm ${valueClass}`}>{value}</span>
+    </span>
+  );
+}
+
+function Sep() {
+  return <span className="text-subtle">·</span>;
+}
+
+function formatDurationCompact(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+  const m = Math.floor(s / 60);
+  const r = Math.round(s % 60);
+  return `${m}m ${r}s`;
+}
+
+function formatTokensTiny(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "k";
+  return (n / 1_000_000).toFixed(1) + "M";
+}
+
+function formatCostTiny(c: number): string {
+  return c < 0.01 ? `$${c.toFixed(4)}` : `$${c.toFixed(c < 1 ? 3 : 2)}`;
+}
+
+
 function StatusPill({
   status,
 }: { status: "connecting" | "open" | "closed" | "error" }) {
@@ -1412,7 +1607,7 @@ function EmptyState() {
         aria-hidden
         className="relative flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-gradient shadow-glow-accent"
       >
-        <span className="text-bg text-2xl font-bold">⌘</span>
+        <span className="text-white text-2xl font-bold">⌘</span>
       </div>
       <div className="text-xl font-semibold tracking-tight text-text">
         Start a conversation
@@ -1451,9 +1646,44 @@ const DEBUG_KIND_COLOR: Record<string, string> = {
 };
 
 function DebugStream({
-  events, onClear,
-}: { events: { kind: string; payload: any; ts: number }[]; onClear: () => void }) {
+  events, onClear, onClose,
+}: {
+  events: { kind: string; payload: any; ts: number }[];
+  onClear: () => void;
+  onClose: () => void;
+}) {
   const boxRef = useRef<HTMLDivElement | null>(null);
+
+  // Drag state — desktop only. The header acts as the drag handle; click +
+  // drag moves the panel via a transform offset from its CSS anchor
+  // (sm:bottom-20 sm:right-4). Mobile uses the inline layout (under the
+  // header) so dragging is disabled there.
+  const [dragOff, setDragOff] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+
+  const onHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    // Only drag on desktop. matchMedia is the cheap way to gate.
+    if (window.matchMedia("(max-width: 639px)").matches) return;
+    // Don't start a drag if the click landed on a button (Clear / Close).
+    if ((e.target as HTMLElement).closest("button")) return;
+    dragRef.current = {
+      startX: e.clientX, startY: e.clientY,
+      baseX: dragOff.x, baseY: dragOff.y,
+    };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  };
+  const onHeaderPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    setDragOff({
+      x: dragRef.current.baseX + (e.clientX - dragRef.current.startX),
+      y: dragRef.current.baseY + (e.clientY - dragRef.current.startY),
+    });
+  };
+  const onHeaderPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch {}
+  };
   // Follow-mode: stick to bottom while events arrive, unless the user has
   // scrolled up to inspect. Same UX as the main chat scroll.
   const [atBottom, setAtBottom] = useState(true);
@@ -1505,8 +1735,28 @@ function DebugStream({
   });
 
   return (
-    <div className="fixed bottom-20 right-4 z-30 w-[420px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-lg border border-border bg-bg/95 shadow-lift backdrop-blur-md">
-      <div className="flex items-center justify-between border-b border-border bg-elevated/60 px-3 py-1.5">
+    <div
+      style={
+        // Apply drag offset only when there IS one (and only on desktop, where
+        // the panel is fixed-positioned). On mobile the panel is inline so
+        // dragOff stays at {0,0} naturally and transform is a no-op.
+        dragOff.x !== 0 || dragOff.y !== 0
+          ? { transform: `translate(${dragOff.x}px, ${dragOff.y}px)` }
+          : undefined
+      }
+      className="
+        z-30 w-full overflow-hidden border-b border-border bg-bg/95
+        sm:fixed sm:bottom-20 sm:right-4 sm:w-[420px] sm:max-w-[calc(100vw-2rem)]
+        sm:rounded-lg sm:border sm:shadow-lift sm:backdrop-blur-md
+      "
+    >
+      <div
+        onPointerDown={onHeaderPointerDown}
+        onPointerMove={onHeaderPointerMove}
+        onPointerUp={onHeaderPointerUp}
+        onPointerCancel={onHeaderPointerUp}
+        className="flex select-none items-center justify-between border-b border-border bg-elevated/60 px-3 py-1.5 sm:cursor-move"
+      >
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-accent">
             Debug stream
@@ -1515,13 +1765,24 @@ function DebugStream({
             {events.length} events
           </span>
         </div>
-        <button
-          type="button"
-          onClick={onClear}
-          className="text-[10px] text-muted hover:text-danger"
-        >
-          clear
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onClear}
+            className="text-[10px] text-muted hover:text-danger"
+          >
+            clear
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-5 w-5 items-center justify-center rounded text-muted hover:bg-elevated hover:text-text"
+            title="Close debug panel"
+            aria-label="Close debug panel"
+          >
+            ✕
+          </button>
+        </div>
       </div>
       <div className="relative">
       <div
@@ -1556,4 +1817,31 @@ function DebugStream({
 function truncForDebug(s: any, n: number): string {
   const str = String(s ?? "");
   return str.length <= n ? str : str.slice(0, n - 1) + "…";
+}
+
+// Inline sun/moon glyphs — shared shape with Layout's header icons but kept
+// local so the chat page doesn't add an import cycle.
+function SunGlyph() {
+  return (
+    <svg
+      width="16" height="16" viewBox="0 0 24 24"
+      fill="none" stroke="currentColor" strokeWidth="2"
+      strokeLinecap="round" strokeLinejoin="round" aria-hidden
+    >
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  );
+}
+
+function MoonGlyph() {
+  return (
+    <svg
+      width="16" height="16" viewBox="0 0 24 24"
+      fill="none" stroke="currentColor" strokeWidth="2"
+      strokeLinecap="round" strokeLinejoin="round" aria-hidden
+    >
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
 }
