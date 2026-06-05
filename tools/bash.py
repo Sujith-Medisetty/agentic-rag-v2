@@ -3,11 +3,21 @@ Bash tool — execute shell commands.
 
 Handles subprocess spawning, timeout, background execution.
 Safety validation happens in safety/bash_validator.py before this runs.
+
+PROCESS-SAFETY HARD GUARD (added Jun 2026 after the agent ran
+`fuser -k 8765/tcp` and killed its own parent backend):
+A small allowlist-style check below refuses any command that tries to
+kill a process bound to the Ojas backend's port, or that uses
+`fuser -k` / `pkill` / `killall` against the parent. The system prompt
+also tells the agent to NEVER kill processes — pick a different free
+port instead. The hard guard is belt-and-braces in case the model
+ignores the prompt.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 
@@ -36,6 +46,116 @@ class BashOutput:
     structured_content: list[dict] | None = None
 
 
+# ---------------------------------------------------------------------------
+# Process-safety hard guard
+# ---------------------------------------------------------------------------
+# Ports the agent must never touch with a kill-family verb. 8765 is the
+# parent Ojas backend's uvicorn port — `fuser -k 8765/tcp` literally killed
+# our own service in production. The list is extensible (commas / spaces /
+# env override).
+
+def _protected_ports() -> set[int]:
+    raw = os.getenv("OJAS_PROTECTED_PORTS", "8765")
+    out: set[int] = set()
+    for tok in re.split(r"[,\s]+", raw):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(int(tok))
+        except ValueError:
+            continue
+    return out or {8765}
+
+
+# Kill-family verbs we look for. Detection is intentionally generous —
+# easier to false-positive a `fuser -k` than to miss one.
+_KILL_VERBS = re.compile(
+    r"\b(fuser\s+[^|;&]*-k|kill\b|pkill\b|killall\b)",
+    re.IGNORECASE,
+)
+
+
+def _check_self_destruct(command: str) -> str | None:
+    """Return a block-reason string if the command would (or could) kill a
+    protected process. Return None if safe.
+
+    Triggers:
+      1. ANY `fuser -k` is refused outright (the agent has no business
+         doing this — pick a different port instead).
+      2. ANY `pkill`, `killall`, or `kill -9` on the WHOLE host is refused
+         (we can't tell from a string whether the target is our backend or
+         a child of it; safer to block all of them than to whitelist).
+      3. ANY combination of a kill-family verb + a protected port number
+         (8765 by default) anywhere in the command — extra defence layer.
+
+    The agent can still terminate its OWN children via `kill <pid>` with a
+    specific pid it spawned itself; we only refuse pkill/killall (broad
+    targeting) and fuser -k (port-based targeting), which are the two
+    that can hit the parent.
+    """
+    cmd = command.strip()
+    if not cmd:
+        return None
+
+    # (1) fuser -k anywhere → block
+    if re.search(r"\bfuser\s+[^|;&]*-k\b", cmd, re.IGNORECASE):
+        return (
+            "Refused: `fuser -k` is forbidden — it can kill the Ojas "
+            "backend (PID bound to port 8765). If a port is in use, pick "
+            "a DIFFERENT free port for your dev server instead of killing "
+            "what's holding it."
+        )
+
+    # (2) pkill / killall anywhere → block (broad targeting, can hit
+    # parent uvicorn). Specific `kill <pid>` of a known child is OK.
+    if re.search(r"\bpkill\b", cmd, re.IGNORECASE):
+        return (
+            "Refused: `pkill` is forbidden — pattern-matching kill can "
+            "match the Ojas backend. To stop a dev server you started in "
+            "this session, use `kill <pid>` with the specific pid from "
+            "the bash output; better, start the server with "
+            "`run_in_background=true` so the session-delete cleanup "
+            "handles it automatically."
+        )
+    if re.search(r"\bkillall\b", cmd, re.IGNORECASE):
+        return (
+            "Refused: `killall` is forbidden — name-matching kill can "
+            "match the Ojas backend (`killall uvicorn` would kill us). "
+            "Use `kill <pid>` with a specific pid, or pick a different "
+            "port for your dev server."
+        )
+
+    # (3) Any kill-family verb mentioning a protected port. Catches
+    # creative `kill -9 $(lsof -ti :8765)` style commands.
+    protected = _protected_ports()
+    if _KILL_VERBS.search(cmd):
+        for port in protected:
+            # Look for the port number near a kill verb: ':8765', '8765/tcp',
+            # 'port 8765', or bare '8765' near a kill verb.
+            pat = rf"(:{port}\b|\b{port}/(?:tcp|udp)\b|\bport\s+{port}\b|\b{port}\b)"
+            if re.search(pat, cmd):
+                return (
+                    f"Refused: command targets the Ojas backend port "
+                    f"({port}) with a kill-family verb. Pick a different "
+                    f"free port (try 3000-3999 or 5000-9999, just NOT "
+                    f"{port}) instead of killing whatever is on it."
+                )
+
+    return None
+
+
+def _self_destruct_output(reason: str) -> BashOutput:
+    """Return a BashOutput representing a refused command, in the format
+    the agent expects so it can read the reason and adapt."""
+    return BashOutput(
+        stdout="",
+        stderr=reason,
+        interrupted=False,
+        return_code_interpretation="refused by Ojas process-safety guard",
+    )
+
+
 def execute_bash(input: BashInput) -> BashOutput:
     """Execute a shell command and return its output.
 
@@ -45,7 +165,15 @@ def execute_bash(input: BashInput) -> BashOutput:
     The active session sandbox (if any) is consulted for `cwd` so commands
     run inside the session's workspace by default — `cd /tmp && rm -rf /`
     is no longer a footgun for a non-root session.
+
+    Process-safety guard runs FIRST: any `fuser -k`, `pkill`, `killall`,
+    or kill-family verb targeting a protected port (defaults to 8765, the
+    Ojas backend) is refused before subprocess.run is even called.
     """
+    # Hard guard against the agent killing its own parent.
+    block = _check_self_destruct(input.command)
+    if block is not None:
+        return _self_destruct_output(block)
     if input.run_in_background:
         return _run_background(input.command)
     return _run_foreground(input.command, input.timeout)

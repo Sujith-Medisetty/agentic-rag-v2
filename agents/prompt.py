@@ -90,6 +90,22 @@ def get_simple_doing_tasks_section() -> str:
         "specifically and cross-workspace writes corrupt other projects' "
         "state. Read-only filesystem inspection (ls / which / git config) "
         "of common paths is fine; WRITES are workspace-only.",
+        "NEVER KILL PROCESSES OR FREE PORTS. The Ojas backend runs on port "
+        "8765 — `fuser -k 8765/tcp`, `pkill uvicorn`, `killall python`, "
+        "`kill -9 $(lsof -ti :8765)` etc. will KILL THE PARENT AGENT "
+        "ITSELF and crash your own session mid-turn. Hard rule: NO "
+        "`fuser -k`, NO `pkill`, NO `killall` — ever. These commands will "
+        "be refused by the runtime even if you try. If you need to stop a "
+        "dev server you started, use `kill <specific-pid>` with the pid "
+        "from your earlier bash output; better, start it with "
+        "`run_in_background=true` so the session-delete cleanup handles it. "
+        "If a port is in use by something you didn't start, ALWAYS pick a "
+        "DIFFERENT free port (3000–3999 or 5000–9999 are usually safe — "
+        "just NOT 8765). Never \"free up\" a port by killing what's on it. "
+        "When you need a port, try the next free one until something binds: "
+        "`python3 -m http.server 0` (kernel picks), or "
+        "`for p in 3001 3002 3003; do nc -z localhost $p || { PORT=$p; "
+        "break; }; done`.",
         "Read relevant code before changing it and keep changes tightly scoped to "
         "the request.",
         "Do not add speculative abstractions, compatibility shims, or unrelated "
