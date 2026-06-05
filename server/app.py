@@ -237,6 +237,18 @@ def auth_signup(req: SignupRequest):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     except PermissionError as e:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(e)) from e
+
+    # Immediately materialise the user's default project so they aren't
+    # stranded with a token but no project if the Workspace page fails to
+    # load for any reason (network blip, navigation race, etc.). This was
+    # the "I signed up but my sidebar is empty / project_count = 0" bug.
+    try:
+        _bootstrap_default_project(user)
+    except Exception:
+        # Project creation must not break signup itself — the user can
+        # still trigger it via the Workspace flow on next visit.
+        pass
+
     # Auto-log-in after signup so the user lands straight in the app.
     _, token = auth.login(req.email, req.password)
     return LoginResponse(
@@ -246,6 +258,33 @@ def auth_signup(req: SignupRequest):
             "role": user["role"], "created_at": user["created_at"],
         },
     )
+
+
+def _bootstrap_default_project(user: dict) -> None:
+    """Idempotent — create the calling user's default project if they don't
+    already have one. Shared between auth_signup and projects_default so
+    both code paths behave identically."""
+    if db.list_projects(user_id=user["id"]):
+        return
+    base_ws = _default_workspace_path()
+    if user["role"] == "root":
+        default_ws = base_ws
+    else:
+        local = user["email"].split("@", 1)[0]
+        slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in local).lower()[:40]
+        default_ws = str(Path(base_ws) / slug)
+    os.makedirs(default_ws, exist_ok=True)
+    name = "Ojas"
+    suffix = 0
+    while True:
+        try:
+            db.create_project(name, default_ws, user_id=user["id"])
+            return
+        except ValueError:
+            suffix += 1
+            name = f"Ojas {suffix}"
+            if suffix > 50:
+                return
 
 
 @app.post("/api/auth/login", response_model=LoginResponse)
