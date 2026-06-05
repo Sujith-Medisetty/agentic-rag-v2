@@ -355,6 +355,21 @@ def get_frontend_ui_quality_section() -> str:
         "die at the timeout boundary. The user installs from "
         "`dist/`-served content, so a successful production build is "
         "what unlocks the install banner.",
+        "- **Deploy is a UI button — tell the user to click it.** Once "
+        "your `npm run build` finishes AND your turn ends, the chat shows "
+        "a **🚀 Deploy** button (or **🔄 Update <slug>** if this session "
+        "has been deployed before) next to a Preview link. Clicking it "
+        "promotes the build to a permanent installable URL at "
+        "`https://<host>/apps/<slug>/` that survives session-delete and "
+        "backend-restart. The button is HIDDEN while a turn is in progress "
+        "(partial builds = broken apps), so don't expect it to appear "
+        "mid-turn — it appears the moment your turn ends. ALWAYS mention "
+        "this in your end-of-turn summary so the user knows to click it: "
+        "'Build complete. Click 🚀 Deploy (top of the chat) to get a "
+        "permanent installable URL you can share.' For subsequent "
+        "rebuilds in the same session, say 'Click 🔄 Update to push the "
+        "new build to the same URL.' Don't claim 'deployed' or 'live at "
+        "<url>' yourself — only the user's click actually deploys.",
         "",
         "## Polish (the difference between 'works' and 'shippable')",
         "- Skeleton placeholders shaped like the real content (same height, "
