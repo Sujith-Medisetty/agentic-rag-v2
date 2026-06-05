@@ -29,6 +29,28 @@ export default function Workspace() {
     return window.matchMedia("(min-width: 768px)").matches;
   });
 
+  // Inline rename state for the chat sidebar (mirrors SessionList.tsx).
+  // `editingId` is the session currently being renamed; the input value
+  // lives in `editingValue`; `editingBusy` disables the input while the
+  // PATCH is in flight; the input ref is auto-focused on edit start.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState("");
+  const [editingBusy, setEditingBusy] = useState(false);
+  const editInputRef = useRef<HTMLInputElement>(null);
+  // Name-conflict modal (real React <dialog>, not a native alert).
+  const [conflict, setConflict] = useState<{
+    desired: string;
+    existingId: string;
+    existingName: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (editingId && editInputRef.current) {
+      editInputRef.current.focus();
+      editInputRef.current.select();
+    }
+  }, [editingId]);
+
 
   // Bootstrap: resolve default project + its sessions + the logged-in user.
   // The /me lookup is what tells the sidebar whether to show the Admin link.
@@ -97,6 +119,42 @@ export default function Workspace() {
       if (activeSessionId === sid) navigate("/");
     } catch (e: any) {
       setLoadErr(e?.message ?? "delete failed");
+    }
+  };
+
+  const beginEdit = (s: Session) => {
+    setEditingId(s.id);
+    setEditingValue(s.name);
+  };
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditingValue("");
+  };
+  const commitEdit = async (s: Session) => {
+    const trimmed = editingValue.trim();
+    if (!trimmed || trimmed === s.name) {
+      cancelEdit();
+      return;
+    }
+    setEditingBusy(true);
+    try {
+      const updated = await sessionsApi.rename(s.id, trimmed);
+      setSessions((cur) => cur.map((x) => (x.id === s.id ? updated : x)));
+      cancelEdit();
+    } catch (e: any) {
+      if (e instanceof ApiError && e.status === 409) {
+        let detail: any = null;
+        try { detail = JSON.parse(e.message); } catch { detail = null; }
+        setConflict({
+          desired: trimmed,
+          existingId: detail?.existing_session_id ?? "",
+          existingName: detail?.existing_session_name ?? "the existing session",
+        });
+      } else {
+        setLoadErr(e?.message ?? "rename failed");
+      }
+    } finally {
+      setEditingBusy(false);
     }
   };
 
@@ -190,33 +248,79 @@ export default function Workspace() {
             <ul className="space-y-0.5">
               {sessions.map((s) => {
                 const isActive = s.id === activeSessionId;
+                const isEditing = editingId === s.id;
                 return (
                   <li key={s.id} className="group relative">
-                    <button
-                      type="button"
-                      onClick={() => openSession(s.id)}
-                      className={`
-                        block w-full truncate rounded-md px-3 py-1.5 pr-9 text-left text-sm transition-colors
-                        ${isActive
-                          ? "bg-accent/10 text-text"
-                          : "text-muted hover:bg-elevated hover:text-text"}
-                      `}
-                      title={s.name}
-                    >
-                      {s.name}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteSession(s.id);
-                      }}
-                      className="absolute right-1.5 top-1/2 hidden h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-subtle hover:bg-danger/10 hover:text-danger group-hover:flex"
-                      title="Delete chat"
-                      aria-label="Delete chat"
-                    >
-                      <TrashIcon />
-                    </button>
+                    {isEditing ? (
+                      <input
+                        ref={editInputRef}
+                        type="text"
+                        value={editingValue}
+                        onChange={(e) => setEditingValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            void commitEdit(s);
+                          } else if (e.key === "Escape") {
+                            e.preventDefault();
+                            cancelEdit();
+                          }
+                        }}
+                        onBlur={() => {
+                          if (!editingBusy && editingValue.trim() && editingValue.trim() !== s.name) {
+                            void commitEdit(s);
+                          } else {
+                            cancelEdit();
+                          }
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        disabled={editingBusy}
+                        maxLength={128}
+                        className="block w-full rounded-md border border-accent bg-bg px-3 py-1.5 pr-3 text-sm text-text outline-none focus:ring-2 focus:ring-accent/30"
+                      />
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => openSession(s.id)}
+                          className={`
+                            block w-full truncate rounded-md px-3 py-1.5 pr-20 text-left text-sm transition-colors
+                            ${isActive
+                              ? "bg-accent/10 text-text"
+                              : "text-muted hover:bg-elevated hover:text-text"}
+                          `}
+                          title={s.name}
+                        >
+                          {s.name}
+                        </button>
+                        {/* Edit (pencil) — always visible, neutral */}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            beginEdit(s);
+                          }}
+                          className="absolute right-7 top-1/2 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-subtle transition-colors hover:bg-elevated hover:text-text"
+                          title="Rename chat"
+                          aria-label={`Rename chat ${s.name}`}
+                        >
+                          <PencilIcon />
+                        </button>
+                        {/* Delete (trash) — always visible, red */}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteSession(s.id);
+                          }}
+                          className="absolute right-1.5 top-1/2 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-subtle transition-colors hover:bg-danger/10 hover:text-danger"
+                          title="Delete chat"
+                          aria-label="Delete chat"
+                        >
+                          <TrashIcon />
+                        </button>
+                      </>
+                    )}
                   </li>
                 );
               })}
@@ -346,7 +450,88 @@ export default function Workspace() {
           </div>
         )}
       </div>
+
+      {/* Name-conflict modal — real React <dialog>, not a native alert. */}
+      {conflict && (
+        <NameConflictModal
+          desired={conflict.desired}
+          existingName={conflict.existingName}
+          existingId={conflict.existingId}
+          onClose={() => setConflict(null)}
+        />
+      )}
     </div>
+  );
+}
+
+// Name-conflict modal (same behavior as in SessionList.tsx). Real <dialog>
+// so we get a focus trap + Esc to close + backdrop click to close. The
+// "Open existing session →" button jumps the user to the conflicting
+// session in the same project.
+function NameConflictModal({
+  desired,
+  existingName,
+  existingId,
+  onClose,
+}: {
+  desired: string;
+  existingName: string;
+  existingId: string;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    ref.current?.showModal();
+  }, []);
+  return (
+    <dialog
+      ref={ref}
+      onClose={onClose}
+      onClick={(e) => {
+        if (e.target === ref.current) ref.current?.close();
+      }}
+      className="rounded-xl border border-border bg-bg p-0 text-text shadow-2xl backdrop:bg-black/40"
+    >
+      <div className="w-[min(90vw,28rem)] p-5">
+        <div className="flex items-start gap-3">
+          <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-warning/40 bg-warning/10 text-warning">
+            ⚠
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="font-serif text-lg font-semibold leading-tight">
+              Name already in use
+            </h2>
+            <p className="mt-1.5 text-sm text-muted">
+              Another chat in this project is already named{" "}
+              <span className="font-mono text-text">{existingName}</span>.
+              Chat names must be unique within a project.
+            </p>
+            <p className="mt-2 text-xs text-muted">
+              You tried to rename to{" "}
+              <span className="font-mono text-text">{desired}</span>.
+            </p>
+          </div>
+        </div>
+        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn-ghost min-h-touch"
+            autoFocus
+          >
+            Try a different name
+          </button>
+          {existingId && (
+            <a
+              href={`/s/${existingId}`}
+              className="btn-primary inline-flex min-h-touch items-center justify-center"
+            >
+              Open existing chat →
+            </a>
+          )}
+        </div>
+      </div>
+    </dialog>
   );
 }
 
@@ -396,6 +581,15 @@ function ShieldIcon() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
          strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
       <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    </svg>
+  );
+}
+function PencilIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.121 2.121 0 113 3L7 19l-4 1 1-4 12.5-12.5z" />
     </svg>
   );
 }
