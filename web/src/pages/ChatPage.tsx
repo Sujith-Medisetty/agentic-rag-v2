@@ -125,6 +125,14 @@ export default function ChatPage() {
   const [debugEvents, setDebugEvents] = useState<
     { kind: string; payload: any; ts: number }[]
   >([]);
+  // Track the last-seen event timestamp (in ms) so we can refetch any
+  // events the WebSocket missed during the load gap. Without this, an
+  // event emitted by the backend AFTER /events returns but BEFORE the
+  // WS subscription opens would silently disappear from the UI.
+  // Tracked across BOTH the initial events load AND every incoming
+  // live event. The WS-open handler uses it to ask for "anything since
+  // this timestamp" and replays the gap through handleEvent.
+  const lastEventTsRef = useRef<number>(0);
   const toggleDebug = () => {
     setDebugOpen((v) => {
       const next = !v;
@@ -153,6 +161,7 @@ export default function ChatPage() {
     setLoadErr(null);
     setDebugEvents([]);
     setWsStatus("connecting");
+    lastEventTsRef.current = 0;
 
     let cancelled = false;
     (async () => {
@@ -163,15 +172,27 @@ export default function ChatPage() {
         ]);
         if (cancelled) return;
         if (gitInfo) setGit(gitInfo);
-        // Walk the event log in chronological order, folding into turns.
-        const { turns: rebuilt, plan: replayedPlan, previewUrl: replayedPreview } = rebuildTranscript(
+        // Walk the event log in chronological order, folding into turns +
+        // (if the log ends mid-turn) an in-progress currentTurn. Setting
+        // currentTurn from the rebuild is what makes streaming RESUME on
+        // refresh / session-switch — live WS events arriving after this
+        // point have a non-null target to update.
+        const { turns: rebuilt, currentTurn: rebuiltCurrent, plan: replayedPlan, previewUrl: replayedPreview } = rebuildTranscript(
           events.map((e) => ({
             kind: e.kind, payload: e.payload, ts: e.created_at * 1000,
           })),
         );
         setTurns(rebuilt);
+        setCurrentTurn(rebuiltCurrent);
         setPlan(replayedPlan);
         if (replayedPreview) setPreviewUrl(replayedPreview);
+        // Record the watermark for the WS catchup. Use the latest event's
+        // created_at in SECONDS (backend's column unit) so the next
+        // ?since=<ts> query returns ONLY events newer than what we already
+        // have. Falls back to 0 (full replay) on a fresh session.
+        if (events.length > 0) {
+          lastEventTsRef.current = events[events.length - 1].created_at;
+        }
       } catch (e: any) {
         if (!cancelled) setLoadErr(e?.message ?? "failed to load history");
       }
@@ -196,6 +217,15 @@ export default function ChatPage() {
         // session. The dependency-array invariant tells React this effect
         // belongs to `boundSid`; if the URL's sessionId has drifted, ignore.
         if (boundSid !== sessionId) return;
+        // Advance the watermark so the next WS-reconnect catchup query
+        // only refetches truly-newer events. Live event ts is in MS;
+        // convert to SECONDS to match the backend column unit. Math.floor
+        // ensures we don't accidentally request the same event again on
+        // a sub-second precision mismatch.
+        const evSecs = Math.floor(ev.ts / 1000);
+        if (evSecs > lastEventTsRef.current) {
+          lastEventTsRef.current = evSecs;
+        }
         // Tap every event into the debug stream FIRST so we capture it even
         // if handleEvent throws / drops it (which is what we're trying to
         // debug). Keep last 200 entries.
@@ -205,7 +235,38 @@ export default function ChatPage() {
         });
         handleEvent(ev);
       },
-      (s) => { if (boundSid === sessionId) setWsStatus(s); },
+      (s) => {
+        if (boundSid !== sessionId) return;
+        setWsStatus(s);
+        // ---- Race-window catchup ------------------------------------------
+        // Every time the WS transitions to "open" (initial connect AND any
+        // reconnect after network blip), fetch any events the backend
+        // emitted while we weren't subscribed. The watermark `lastEventTsRef`
+        // is updated by the initial events load + every incoming WS event,
+        // so this query returns only the gap. Replay each through
+        // handleEvent so they update currentTurn / turns just like a live
+        // event would. Without this, an assistant_text emitted during the
+        // ~50–200ms gap between the events HTTP fetch and the WS handshake
+        // would be silently lost — the user would see a frozen turn and
+        // think streaming broke.
+        if (s === "open" && lastEventTsRef.current > 0) {
+          sessionApi.events(sessionId, lastEventTsRef.current)
+            .then((missed) => {
+              if (boundSid !== sessionId) return;   // navigated away mid-fetch
+              for (const ev of missed) {
+                const live: LiveEvent = {
+                  kind: ev.kind, payload: ev.payload, ts: ev.created_at * 1000,
+                };
+                const evSecs = ev.created_at;
+                if (evSecs > lastEventTsRef.current) {
+                  lastEventTsRef.current = evSecs;
+                }
+                handleEvent(live);
+              }
+            })
+            .catch(() => { /* best-effort — next reconnect will retry */ });
+        }
+      },
     );
     return () => handle.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1164,7 +1225,7 @@ function _replaceLastTextBlock(
 // Replay an event log into turns + final plan. Pure function, used both on
 // mount (to restore state) and is the model the live handler emulates.
 function rebuildTranscript(events: LiveEvent[]): {
-  turns: Turn[]; plan: TodoItem[]; previewUrl: string | null;
+  turns: Turn[]; currentTurn: Turn | null; plan: TodoItem[]; previewUrl: string | null;
 } {
   const completed: Turn[] = [];
   let curr: Turn | null = null;
@@ -1372,10 +1433,15 @@ function rebuildTranscript(events: LiveEvent[]): {
       }
     }
   }
-  // If the log ended mid-turn, keep that turn open in the rebuilt state too —
-  // the live WS handler will continue updating it.
-  if (curr) completed.push({ ...curr, isStreaming: false });
-  return { turns: completed, plan, previewUrl };
+  // If the log ended mid-turn, return the in-progress turn as `currentTurn`
+  // (NOT shoved into the completed turns array). This is the critical fix
+  // for joining a session that's actively streaming: without it, refreshing
+  // the page or switching to a session mid-turn left curr=null, so every
+  // subsequent live WS event handler (`setCurrentTurn(c => c ? {...} : c)`)
+  // silently no-op'd — the Stop button stayed hidden and streaming text
+  // never appeared. Keeping isStreaming=true here is what unlocks the Stop
+  // button rendering condition and the live spinner.
+  return { turns: completed, currentTurn: curr, plan, previewUrl };
 }
 
 // ============================================================================
