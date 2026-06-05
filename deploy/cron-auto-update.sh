@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Forge — cron-driven auto-update.
+# Ojas — cron-driven auto-update.
 #
 # Drop this in /usr/local/bin and have cron run it every 5 minutes:
 #
 #   sudo install -m 755 -o root -g root \
-#       /opt/forge/deploy/cron-auto-update.sh /usr/local/bin/forge-auto-update
+#       /opt/ojas/deploy/cron-auto-update.sh /usr/local/bin/ojas-auto-update
 #
 #   sudo crontab -e
 #   # Add:
-#   */5 * * * * /usr/local/bin/forge-auto-update >> /var/log/forge-auto-update.log 2>&1
+#   */5 * * * * /usr/local/bin/ojas-auto-update >> /var/log/ojas-auto-update.log 2>&1
 #
 # What it does:
-#   1. `git fetch` on /opt/forge
+#   1. `git fetch` on /opt/ojas
 #   2. If origin/master has new commits → run update.sh
 #   3. Else → silently exit
 #
@@ -20,8 +20,8 @@
 
 set -euo pipefail
 
-FORGE_DIR="${FORGE_DIR:-/opt/forge}"
-FORGE_USER="${FORGE_USER:-forge}"
+FORGE_DIR="${FORGE_DIR:-/opt/ojas}"
+FORGE_USER="${FORGE_USER:-ojas}"
 BRANCH="${FORGE_BRANCH:-master}"
 
 cd "${FORGE_DIR}"

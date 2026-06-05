@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Forge — one-shot installer for Ubuntu 22.04+ / Debian 12+ VMs.
+# Ojas — one-shot installer for Ubuntu 22.04+ / Debian 12+ VMs.
 #
 # Usage (as root or with sudo):
 #   curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/deploy/install.sh | bash
@@ -8,12 +8,12 @@
 #
 # What it does:
 #   1. Installs system packages: python3, nodejs, caddy, git
-#   2. Creates a `forge` Linux user (no shell login, only systemd)
-#   3. Clones (or updates) the repo at /opt/forge
+#   2. Creates an `ojas` Linux user (no shell login, only systemd)
+#   3. Clones (or updates) the repo at /opt/ojas
 #   4. Sets up Python venv + installs requirements.txt
 #   5. Builds the frontend (web/dist)
 #   6. Drops the systemd unit + Caddyfile in place
-#   7. Prompts you to edit /opt/forge/.env, then starts services
+#   7. Prompts you to edit /opt/ojas/.env, then starts services
 #
 # Re-running this script is safe — every step is idempotent.
 
@@ -23,8 +23,8 @@ set -euo pipefail
 
 FORGE_REPO="${FORGE_REPO:-https://github.com/Sujith-Medisetty/agentic-rag-v2.git}"
 FORGE_BRANCH="${FORGE_BRANCH:-master}"
-FORGE_DIR="${FORGE_DIR:-/opt/forge}"
-FORGE_USER="${FORGE_USER:-forge}"
+FORGE_DIR="${FORGE_DIR:-/opt/ojas}"
+FORGE_USER="${FORGE_USER:-ojas}"
 FORGE_DOMAIN="${FORGE_DOMAIN:-forge.example.com}"
 
 # ---- Style ----------------------------------------------------------------
@@ -77,9 +77,9 @@ if ! command -v node >/dev/null || [[ "$(node -v | tr -d 'v' | cut -d. -f1)" -lt
 fi
 ok "Node installed: $(node -v)"
 
-# ---- 2. forge user --------------------------------------------------------
+# ---- 2. ojas user --------------------------------------------------------
 
-banner "Setting up forge user"
+banner "Setting up ojas user"
 if ! id "${FORGE_USER}" >/dev/null 2>&1; then
     useradd --system --create-home --shell /usr/sbin/nologin "${FORGE_USER}"
     ok "Created system user '${FORGE_USER}'"
@@ -89,12 +89,12 @@ fi
 
 # ---- 3. Clone repo --------------------------------------------------------
 
-banner "Fetching Forge source"
+banner "Fetching Ojas source"
 if [[ -d "${FORGE_DIR}/.git" ]]; then
     log "Updating existing checkout at ${FORGE_DIR}"
-    # Run git as the owning user. Running it as root on a forge-owned repo
+    # Run git as the owning user. Running it as root on an ojas-owned repo
     # trips git's safe.directory protection ("dubious ownership"). Doing it
-    # as forge avoids that AND keeps file modes consistent.
+    # as the service user avoids that AND keeps file modes consistent.
     sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" fetch origin "${FORGE_BRANCH}"
     sudo -u "${FORGE_USER}" git -C "${FORGE_DIR}" reset --hard "origin/${FORGE_BRANCH}"
 else
@@ -107,9 +107,9 @@ ok "Source ready at ${FORGE_DIR}"
 # ---- 4. Python venv + deps ------------------------------------------------
 
 banner "Installing Python deps"
-sudo -u "${FORGE_USER}" bash <<'EOF'
+sudo -u "${FORGE_USER}" bash <<EOF
 set -e
-cd /opt/forge
+cd ${FORGE_DIR}
 if [[ ! -d .venv ]]; then
     python3 -m venv .venv
 fi
@@ -122,21 +122,21 @@ ok "Python deps installed"
 # ---- 5. Frontend build ----------------------------------------------------
 
 banner "Building frontend (web/dist)"
-sudo -u "${FORGE_USER}" bash <<'EOF'
+sudo -u "${FORGE_USER}" bash <<EOF
 set -e
-cd /opt/forge/web
+cd ${FORGE_DIR}/web
 if [[ ! -d node_modules ]]; then
     npm ci --silent
 fi
 npm run build --silent
 EOF
-ok "Frontend built → /opt/forge/web/dist"
+ok "Frontend built → ${FORGE_DIR}/web/dist"
 
 # ---- 6. Systemd unit + Caddyfile -----------------------------------------
 
 banner "Installing systemd unit"
-install -o root -g root -m 644 "${FORGE_DIR}/deploy/forge-backend.service" \
-    /etc/systemd/system/forge-backend.service
+install -o root -g root -m 644 "${FORGE_DIR}/deploy/ojas-backend.service" \
+    /etc/systemd/system/ojas-backend.service
 ok "Unit file installed"
 
 banner "Installing Caddyfile"
@@ -155,12 +155,12 @@ if [[ ! -f "${ENV_PATH}" ]]; then
     warn "  sudo -u ${FORGE_USER} \$EDITOR ${ENV_PATH}"
     warn ""
     warn "At minimum set:"
-    warn "  ANTHROPIC_API_KEY"
+    warn "  ANTHROPIC_API_KEY (or your provider's API key)"
     warn "  FORGE_ROOT_EMAIL"
     warn "  FORGE_ROOT_PASSWORD"
-    warn "  FORGE_DEFAULT_WORKSPACE=/home/${FORGE_USER}/forge"
+    warn "  FORGE_DEFAULT_WORKSPACE=/home/${FORGE_USER}/ojas"
     warn ""
-    warn "Then run: sudo systemctl daemon-reload && sudo systemctl restart forge-backend caddy"
+    warn "Then run: sudo systemctl daemon-reload && sudo systemctl restart ojas-backend caddy"
     exit 0
 fi
 ok ".env already present (not overwriting)"
@@ -169,8 +169,8 @@ ok ".env already present (not overwriting)"
 
 banner "Starting services"
 systemctl daemon-reload
-systemctl enable --now forge-backend
-ok "forge-backend started"
+systemctl enable --now ojas-backend
+ok "ojas-backend started"
 systemctl reload caddy || systemctl restart caddy
 ok "Caddy reloaded"
 
@@ -181,13 +181,13 @@ sleep 1
 if curl -fsS http://127.0.0.1:8765/api/health >/dev/null 2>&1; then
     ok "Backend responds on 127.0.0.1:8765"
 else
-    warn "Backend didn't respond — check: journalctl -u forge-backend -f"
+    warn "Backend didn't respond — check: journalctl -u ojas-backend -f"
 fi
 
 printf "\n${GREEN}━━━ Done.${RST}\n"
 printf "Open: ${GREEN}https://${FORGE_DOMAIN}${RST}\n"
 printf "\nUseful commands:\n"
-printf "  ${DIM}sudo systemctl status forge-backend${RST}\n"
-printf "  ${DIM}journalctl -u forge-backend -f${RST}\n"
+printf "  ${DIM}sudo systemctl status ojas-backend${RST}\n"
+printf "  ${DIM}journalctl -u ojas-backend -f${RST}\n"
 printf "  ${DIM}sudo systemctl reload caddy${RST}\n"
 printf "  ${DIM}journalctl -u caddy -f${RST}\n"
