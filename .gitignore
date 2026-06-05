@@ -12,12 +12,22 @@ venv/
 node_modules/
 web/dist/
 .vite/
+# TypeScript incremental build cache
+web/tsconfig.tsbuildinfo
+# Stray compile artifacts that escape into src/ when `tsc` is run without
+# noEmit. The .tsx files are the source of truth — these are noise.
+web/src/**/*.js
 
 # Local state — never commit these
 .agent/                  # LangGraph SqliteSaver checkpoints (~/.agent shouldn't be here either)
 .agentic-rag/            # web backend state
 .clawd-agents/           # spawned sub-agent manifests
 .clawd-todos.json        # per-workspace todo list
+
+# Secrets — .env holds API keys + root password, never goes to git.
+# See .env.example for the variable names a fresh clone needs to set.
+.env
+.env.local
 
 # Editor / OS noise
 .DS_Store
