@@ -30,9 +30,9 @@
 # Let's Encrypt rate limits.
 # --------------------------------------------------------------------------
 {
-    on_demand_tls {
-        ask http://127.0.0.1:8765/internal/caddy-ask
-    }
+	on_demand_tls {
+		ask http://127.0.0.1:8765/internal/caddy-ask
+	}
 }
 
 # --------------------------------------------------------------------------
@@ -46,78 +46,97 @@
 # you used above). install.sh handles the sed.
 # --------------------------------------------------------------------------
 *.ojas.example.com {
-    tls {
-        on_demand
-    }
-    encode gzip
-    # {labels.0} is the leftmost label (the subdomain slug).
-    root * /opt/ojas-apps/{labels.0}
-    try_files {path} /index.html
-    file_server
-    header {
-        X-Content-Type-Options "nosniff"
-    }
-    @hashed path /assets/*
-    header @hashed Cache-Control "public, max-age=31536000, immutable"
-    @sw path /sw.js
-    header @sw Cache-Control "no-store"
-    @html path_regexp ^\/$|\.html$
-    header @html Cache-Control "no-cache"
+	tls {
+		on_demand
+	}
+	encode gzip
+	header {
+		X-Content-Type-Options "nosniff"
+	}
+	@hashed path /assets/*
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	@sw path /sw.js
+	header @sw Cache-Control "no-store"
+	@html path_regexp ^\/$|\.html$
+	header @html Cache-Control "no-cache"
+	# Per-host static root.
+	#
+	# Two Caddy quirks drove this dance:
+	#   (1) Caddy indexes `{labels}` TLD-FIRST — `{labels.0}` is the
+	#       right-most label (the TLD), not the subdomain. The subdomain
+	#       lives at `{labels.3}` for the 3-level-deep `ojas.<tld>` root.
+	#       (For a 2-level root like `example.com`, use `{labels.2}` —
+	#       install.sh sed adjusts this if needed.)
+	#   (2) Placeholders in Caddy's `root` directive and in `file_server`'s
+	#       `root` config are stored as LITERAL strings — file_server
+	#       does NOT REPL-expand the root at request time. So we can't
+	#       put `{labels.N}` in `root` to get a per-subdomain static dir.
+	#
+	# The workaround is to encode the slug into the REQUEST PATH (which
+	# file_server DOES resolve at request time) via `rewrite`, then
+	# serve from a static base directory. `try_files` provides the SPA
+	# fallback to /<slug>/index.html.
+	handle {
+		rewrite * /{labels.3}{uri}
+		root * /opt/ojas-apps
+		try_files {path} /{labels.3}/index.html
+		file_server
+	}
 }
 
 ojas.example.com {
-    # The frontend's built static files. The install script copies them here.
-    root * /opt/ojas/web/dist
-    encode gzip
+	# The frontend's built static files. The install script copies them here.
+	root * /opt/ojas/web/dist
+	encode gzip
 
-    # API + WebSocket — proxy everything under /api/ to FastAPI. The
-    # WebSocket upgrade headers are handled automatically by Caddy's
-    # reverse_proxy directive.
-    @api path /api/* /api
-    handle @api {
-        reverse_proxy 127.0.0.1:8765
-    }
+	# API + WebSocket — proxy everything under /api/ to FastAPI. The
+	# WebSocket upgrade headers are handled automatically by Caddy's
+	# reverse_proxy directive.
+	@api path /api/* /api
+	handle @api {
+		reverse_proxy 127.0.0.1:8765
+	}
 
-    # (Per-session /preview/* removed — superseded by the Deploy button
-    # which produces stable subdomain URLs.)
+	# (Per-session /preview/* removed — superseded by the Deploy button
+	# which produces stable subdomain URLs.)
 
-    # Deployed apps — persistent installable PWAs at /apps/<slug>/.
-    # Proxied to FastAPI which static-serves the dist from
-    # /opt/ojas-apps/<slug>/ with SPA fallback + path-traversal defence.
-    handle /apps/* {
-        reverse_proxy 127.0.0.1:8765
-    }
+	# Deployed apps — persistent installable PWAs at /apps/<slug>/.
+	# Proxied to FastAPI which static-serves the dist from
+	# /opt/ojas-apps/<slug>/ with SPA fallback + path-traversal defence.
+	handle /apps/* {
+		reverse_proxy 127.0.0.1:8765
+	}
 
-    # SPA fallback — every non-file route returns index.html so React
-    # Router can take over client-side. file_server serves the asset if
-    # it exists; try_files falls back to index.html for routes like /s/xyz.
-    handle {
-        try_files {path} /index.html
-        file_server
-    }
+	# SPA fallback — every non-file route returns index.html so React
+	# Router can take over client-side. file_server serves the asset if
+	# it exists; try_files falls back to index.html for routes like /s/xyz.
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
 
-    # Sensible defaults. Adjust if you want stricter CSP / etc.
-    header {
-        # HSTS — once a browser sees this, it sticks with HTTPS forever.
-        # Comment out if you're still testing on http://.
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        Referrer-Policy "strict-origin-when-cross-origin"
-    }
-    # Hashed asset bundles live under /assets/ — safe to cache forever.
-    # Scoped to /assets/* so sw.js (no hash, must be checked every visit) is
-    # NOT matched. A cached sw.js would prevent browsers detecting SW updates.
-    @hashed path /assets/*
-    header @hashed Cache-Control "public, max-age=31536000, immutable"
-    # Service worker — must never be cached so browsers check it on every load.
-    @sw path /sw.js
-    header @sw Cache-Control "no-store"
-    # API responses must never be cached — browsers (esp. Safari) will serve
-    # stale session/event data if Cache-Control is missing or permissive.
-    @api_resp path /api/*
-    header @api_resp Cache-Control "no-store"
-    # HTML and the SPA root (/) — always revalidate so index.html updates
-    # propagate immediately. path_regexp matches "/" exactly and "*.html".
-    @html path_regexp ^\/$|\.html$
-    header @html Cache-Control "no-cache"
+	# Sensible defaults. Adjust if you want stricter CSP / etc.
+	header {
+		# HSTS — once a browser sees this, it sticks with HTTPS forever.
+		# Comment out if you're still testing on http://.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+	# Hashed asset bundles live under /assets/ — safe to cache forever.
+	# Scoped to /assets/* so sw.js (no hash, must be checked every visit) is
+	# NOT matched. A cached sw.js would prevent browsers detecting SW updates.
+	@hashed path /assets/*
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	# Service worker — must never be cached so browsers check it on every load.
+	@sw path /sw.js
+	header @sw Cache-Control "no-store"
+	# API responses must never be cached — browsers (esp. Safari) will serve
+	# stale session/event data if Cache-Control is missing or permissive.
+	@api_resp path /api/*
+	header @api_resp Cache-Control "no-store"
+	# HTML and the SPA root (/) — always revalidate so index.html updates
+	# propagate immediately. path_regexp matches "/" exactly and "*.html".
+	@html path_regexp ^\/$|\.html$
+	header @html Cache-Control "no-cache"
 }
