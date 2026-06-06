@@ -77,6 +77,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from server import auth, db
 from server.git_autocommit import get_git_info, push_to_remote
 from server.reporter import WebReporter, get_bus
+from pydantic import BaseModel
 from server.schemas import (
     AuthStatusResponse, DeployRequest, DeployResponse, DeployedAppResponse,
     EventResponse, GitInfoResponse, LoginRequest,
@@ -1453,6 +1454,106 @@ def _session_preview_dir(
     return base / "dist"
 
 
+# Directories the agent scaffold script creates that the deploy detector
+# must NOT consider as a "sub-app" — they're build artefacts, not user apps.
+_DEPLOY_IGNORE_DIRS = frozenset({
+    "node_modules", ".git", ".claude", ".cache", "dist", "build",
+    ".next", ".nuxt", ".svelte-kit", ".vite", "coverage", ".turbo",
+    ".parcel-cache", ".gradle", "target", "__pycache__", ".venv", "venv",
+})
+
+
+def _session_workspace_root(session_id: str) -> Path | None:
+    """Return the session's per-session workspace dir (parent of any
+    sub-apps the agent may have scaffolded). The session root contains
+    `dist/` only if the agent built AT the root; the typical case is
+    that the agent built inside a sub-app folder like `my-app/dist/`."""
+    session = db.get_session(session_id)
+    if session is None:
+        return None
+    project = db.get_project(session["project_id"])
+    if project is None:
+        return None
+    base = Path(project["workspace_path"])
+    if session.get("workspace_subdir"):
+        base = base / session["workspace_subdir"]
+    return base
+
+
+def _detect_dist_candidates(session_id: str) -> list[dict]:
+    """Scan the session workspace for built dist/ folders. Returns a
+    list of candidates with project_dir, absolute path, mtime, and size,
+    sorted by mtime descending (most recent build first). The session
+    root's own dist/ is represented as project_dir="". Used by the
+    deploy dialog to pre-fill (and lock) the Sub-app folder field, and
+    by sessions_deploy as a fallback when the client doesn't specify
+    a project_dir.
+
+    Skips noise dirs (node_modules, .git, etc.) so a Vite-installed
+    `node_modules/some-pkg/dist/` doesn't pollute the list. The session
+    root's own dist/ is always considered (it's not a "subdir")."""
+    base = _session_workspace_root(session_id)
+    if base is None or not base.exists():
+        return []
+
+    cands: list[dict] = []
+
+    # 1) Session root dist/ (project_dir="") — only if it's a *real*
+    #    user build, i.e. there's a package.json alongside. Without one
+    #    we treat root as "no app at root" so we don't suggest an empty
+    #    dist/ the agent never wrote.
+    root_dist = base / "dist" / "index.html"
+    if root_dist.exists() and (base / "package.json").exists():
+        try:
+            st = (base / "dist").stat()
+            cands.append({
+                "project_dir": "",
+                "abs_path": str(base / "dist"),
+                "mtime": int(st.st_mtime),
+                "index_size": root_dist.stat().st_size,
+            })
+        except OSError:
+            pass
+
+    # 2) Sub-app folders (any direct child that's a directory, not in
+    #    the noise set, and contains dist/index.html).
+    try:
+        children = sorted(base.iterdir(), key=lambda p: p.name)
+    except OSError:
+        children = []
+    for child in children:
+        if not child.is_dir():
+            continue
+        if child.name in _DEPLOY_IGNORE_DIRS or child.name.startswith("."):
+            continue
+        dist_idx = child / "dist" / "index.html"
+        if not dist_idx.exists():
+            continue
+        try:
+            st = (child / "dist").stat()
+            cands.append({
+                "project_dir": child.name,
+                "abs_path": str(child / "dist"),
+                "mtime": int(st.st_mtime),
+                "index_size": dist_idx.stat().st_size,
+            })
+        except OSError:
+            continue
+
+    cands.sort(key=lambda c: c["mtime"], reverse=True)
+    return cands
+
+
+def _auto_pick_project_dir(session_id: str) -> str | None:
+    """Pick the most likely project_dir for a session: the only candidate
+    if there's exactly one, else None. Returns "" (empty string) for the
+    session root dist/. None means 'ambiguous — caller must decide'."""
+    cands = _detect_dist_candidates(session_id)
+    if len(cands) == 1:
+        return cands[0]["project_dir"]
+    return None
+
+
 # /preview/{session_id}/* was removed: it generated temporary URLs tied
 # to a session ID that the user (rightly) found unreliable — they were
 # half-broken without a service worker scope, and disappeared on session
@@ -1581,7 +1682,28 @@ def sessions_deploy(
     # session's own dist/; a value like "todo-app" deploys <subdir>/todo-app/dist/.
     # The resolver blocks ".." segments and absolute paths.
     project_dir = (req.project_dir or "").strip() or None
-    # 1. Need a built dist/
+    # 1. Need a built dist/. If the client didn't tell us which sub-app
+    #    to deploy, auto-detect: pick the only candidate if there's just
+    #    one, otherwise return a 400 with a list so the user can choose
+    #    (this is the common path — the dialog sends the pre-filled
+    #    value from /detected-dist, so this fallback mostly hits the
+    #    API-only case).
+    if project_dir is None:
+        cands = _detect_dist_candidates(session_id)
+        if len(cands) == 1:
+            project_dir = cands[0]["project_dir"]
+        elif len(cands) == 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "no built dist/ yet — ask the agent to run `npm run build` first",
+            )
+        else:
+            names = [c["project_dir"] or "<session root>" for c in cands]
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"multiple sub-apps found in this session: {', '.join(names)}. "
+                "Specify which one to deploy (advanced).",
+            )
     dist = _session_preview_dir(session_id, project_dir=project_dir)
     if dist is None:
         raise HTTPException(
@@ -1719,6 +1841,61 @@ def session_deployed_apps_list(
         if a.get("source_session_id") == session_id
     ]
     return [DeployedAppResponse(**a) for a in rows]
+
+
+# ---- Dist auto-detection --------------------------------------------------
+#
+# The chat UI's deploy dialog has a "Sub-app folder" field that the user
+# should never have to type: the agent knows what it built and the
+# server can find it on disk. This endpoint is what the dialog calls
+# when it opens, to pre-fill (and lock) the field. It returns ALL
+# detected candidates so the UI can show what was found and disable
+# Deploy when it's ambiguous (multiple sub-apps) or absent (no build).
+
+class DistCandidate(BaseModel):
+    project_dir: str          # "" = session root; otherwise sub-app folder name
+    abs_path: str
+    mtime: int                # epoch seconds; useful for "built 3m ago"
+    index_size: int           # bytes in dist/index.html
+
+
+class DetectedDistResponse(BaseModel):
+    candidates: list[DistCandidate]
+    # "single"     → exactly one dist, deploy can proceed with this value
+    # "multiple"   → 2+ candidates; UI must ask the user which one
+    # "none"       → no build found; UI should tell the user to build
+    status: str
+    # The pick the deploy endpoint would use by default (== candidates[0]
+    # if status=="single", else None). UI can also pre-fill this.
+    auto_pick: str | None = None
+
+
+@app.get(
+    "/api/sessions/{session_id}/detected-dist",
+    response_model=DetectedDistResponse,
+)
+def sessions_detected_dist(
+    session_id: str,
+    user: dict = Depends(require_user),
+):
+    """Scan the session workspace for built `dist/` folders. Used by the
+    deploy dialog to pre-fill the Sub-app folder field (and to disable
+    Deploy when no build exists or multiple sub-apps are present)."""
+    _session_or_404(session_id, user)
+    cands = _detect_dist_candidates(session_id)
+    if len(cands) == 0:
+        return DetectedDistResponse(candidates=[], status="none", auto_pick=None)
+    if len(cands) == 1:
+        return DetectedDistResponse(
+            candidates=[DistCandidate(**c) for c in cands],
+            status="single",
+            auto_pick=cands[0]["project_dir"],
+        )
+    return DetectedDistResponse(
+        candidates=[DistCandidate(**c) for c in cands],
+        status="multiple",
+        auto_pick=cands[0]["project_dir"],  # newest as best guess
+    )
 
 
 @app.delete("/api/deployed-apps/{slug}")

@@ -27,7 +27,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useOutletContext } from "react-router-dom";
 import type { Project as ProjectType } from "@/lib/types";
 import { sessionApi, sessionsApi, deployedAppsApi } from "@/lib/api";
-import type { DeployedApp } from "@/lib/api";
+import type { DeployedApp, DetectedDist } from "@/lib/api";
 import { openEventStream } from "@/lib/ws";
 import { useTheme } from "@/lib/theme";
 import { useSessions } from "@/lib/sessionContext";
@@ -2087,15 +2087,49 @@ function DeployModal({
   onDeployed: (result: { slug: string; url: string; app: DeployedApp }) => void;
 }) {
   const [slug, setSlug] = useState(slugifyName(defaultName));
+  // Sub-app folder is auto-detected from the agent's build. The field
+  // is locked (read-only) — the user only chooses a slug. The backend's
+  // /detected-dist endpoint figures out which sub-app folder contains
+  // the dist. If the user genuinely has multiple sub-apps in one
+  // session, the dialog shows a small list so they know which one
+  // will be deployed.
+  const [detected, setDetected] = useState<DetectedDist | null>(null);
+  const [detecting, setDetecting] = useState(true);
   const [projectDir, setProjectDir] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  // Fetch the detected dist on mount. If there's exactly one, we lock
+  // the field to its value. If there are 0, we show a "no build" hint
+  // and disable Deploy. If there are 2+, we show them as a list so the
+  // user knows which one will be deployed (we still pick the newest).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const d = await sessionApi.detectedDist(sessionId);
+        if (cancelled) return;
+        setDetected(d);
+        if (d.auto_pick !== null) setProjectDir(d.auto_pick);
+      } catch (e: any) {
+        if (cancelled) return;
+        setErr(e?.message ?? "could not detect build");
+      } finally {
+        if (!cancelled) setDetecting(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sessionId]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr(null);
     setBusy(true);
     try {
+      // project_dir is read-only in the UI; the backend's `detected`
+      // is the source of truth. We still pass it explicitly so the
+      // server's view stays consistent (and a future "edit" toggle
+      // can re-use this).
       const result = await sessionApi.deploy(sessionId, {
         slug: slug || undefined,
         project_dir: projectDir || undefined,
@@ -2107,6 +2141,15 @@ function DeployModal({
       setBusy(false);
     }
   };
+
+  const noBuild = !detecting && detected?.status === "none";
+  const multiple = detected?.status === "multiple";
+  const ready = !detecting && !noBuild && !!slug;
+
+  // Pretty label for the locked field: "" → "session root", else the
+  // folder name.
+  const subdirLabel = projectDir === "" ? "<session root>" : projectDir;
+  const inputDisplay = projectDir;  // backend stores "" for root
 
   return (
     <div
@@ -2134,30 +2177,51 @@ function DeployModal({
             URL: <span className="font-mono">https://{slug || "<slug>"}.{hostApps()}/</span>
           </span>
         </label>
-        <label className="block">
+
+        <div className="block">
           <span className="text-tx-xs font-medium text-muted">
             Sub-app folder{" "}
-            <span className="text-subtle">
-              (the folder containing the agent's <code className="font-mono">dist/</code>{" "}
-              — e.g. <code className="font-mono">my-app</code> if the agent built{" "}
-              <code className="font-mono">my-app/dist/</code>)
-            </span>
+            <span className="text-subtle">(auto-detected from the agent's build — locked)</span>
           </span>
-          <input
-            type="text" value={projectDir}
-            onChange={(e) => setProjectDir(e.target.value)}
-            className="field mt-1 font-mono"
-            placeholder="my-app"
-          />
-        </label>
-        {err && (
+          {detecting ? (
+            <div className="field mt-1 flex items-center gap-2 text-tx-xs text-muted">
+              <span className="inline-block size-3 animate-spin rounded-full border-2 border-muted border-t-transparent" />
+              Detecting build…
+            </div>
+          ) : (
+            <>
+              <div className="field mt-1 flex items-center gap-2 font-mono text-tx-sm">
+                <span aria-hidden className="text-muted">🔒</span>
+                <span data-testid="detected-subdir" className="flex-1">{subdirLabel || "—"}</span>
+                {inputDisplay === "" && (
+                  <span className="rounded bg-surface-2 px-1.5 py-0.5 text-tx-xs text-muted">root</span>
+                )}
+              </div>
+              {multiple && (
+                <p className="mt-1 text-tx-xs text-muted">
+                  Multiple sub-apps in this session — deploying{" "}
+                  <code className="font-mono">{subdirLabel}</code>{" "}
+                  (newest). Delete the other build(s) to narrow it down.
+                </p>
+              )}
+            </>
+          )}
+        </div>
+
+        {noBuild && (
+          <div className="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-tx-xs text-danger">
+            No built <code className="font-mono">dist/</code> found in this session. Ask the agent to run{" "}
+            <code className="font-mono">npm run build</code> and try again.
+          </div>
+        )}
+        {err && !noBuild && (
           <div className="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-tx-xs text-danger">
             {err}
           </div>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button type="button" onClick={onClose} className="btn-ghost">Cancel</button>
-          <button type="submit" disabled={busy || !slug} className="btn-primary">
+          <button type="submit" disabled={busy || !ready} className="btn-primary">
             {busy ? "Deploying…" : "Deploy"}
           </button>
         </div>

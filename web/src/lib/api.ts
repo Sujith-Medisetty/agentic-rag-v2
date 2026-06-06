@@ -193,6 +193,23 @@ export interface DeployedApp {
   app_dir: string;
   deployed_at: number;
   last_redeploy_at: number;
+  project_dir: string | null;
+}
+
+// The dist-auto-detection endpoint. The dialog pre-fills and locks the
+// Sub-app folder from this so the user only has to pick a slug.
+export interface DistCandidate {
+  project_dir: string;   // "" = session root; otherwise sub-app folder name
+  abs_path: string;
+  mtime: number;          // epoch seconds — used for "built 3m ago"
+  index_size: number;     // bytes in dist/index.html
+}
+export interface DetectedDist {
+  candidates: DistCandidate[];
+  status: "single" | "multiple" | "none";
+  // The server's best guess (== candidates[0] when single). The dialog
+  // pre-fills from this when present.
+  auto_pick: string | null;
 }
 
 export interface DeployResult {
@@ -317,10 +334,9 @@ export const sessionApi = {
   // Promote a session's built dist/ to a permanent subdomain URL.
   //   slug         — leftmost label of the public URL. Server slugifies
   //                  and -2/-3 suffixes on collision. Optional.
-  //   project_dir  — which subfolder under the session's workspace_subdir
-  //                  to deploy. Lets a single session host multiple apps
-  //                  (e.g. session contains `calorie-tracker/` AND
-  //                  `weather/` — deploy each as its own URL).
+  //   project_dir  — usually set automatically from `detectedDist()`;
+  //                  callers shouldn't need to pass it. Pass it manually
+  //                  only when you want to override the server's pick.
   deploy: (sessionId: string, opts: { slug?: string; project_dir?: string } = {}) =>
     request<DeployResult>(
       `/api/sessions/${encodeURIComponent(sessionId)}/deploy`,
@@ -331,6 +347,14 @@ export const sessionApi = {
           project_dir: opts.project_dir ?? null,
         }),
       },
+    ),
+  // Scan the session workspace for built dist/ folders. The deploy
+  // dialog calls this on open to pre-fill (and lock) the Sub-app
+  // folder field. Returns all candidates sorted newest-first; the
+  // `auto_pick` is what the deploy endpoint would use by default.
+  detectedDist: (sessionId: string) =>
+    request<DetectedDist>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/detected-dist`,
     ),
   // Just the deploys made from THIS session — chat strip renders these
   // as pills with Open / Delete controls.
