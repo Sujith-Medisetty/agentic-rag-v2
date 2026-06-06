@@ -29,8 +29,10 @@ export function InstallAppButton() {
   }
 
   const onClick = async () => {
-    if (pwa.supported) {
-      // Native install dialog — Chrome / Edge / Samsung / etc.
+    if (pwa.hasSavedPrompt) {
+      // Native install dialog — Chrome / Edge / Samsung / etc. The
+      // prompt was captured at module scope (see useInstallPWA.ts)
+      // so it survives re-renders, HMR, and route changes.
       await pwa.install();
       return;
     }
