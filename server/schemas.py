@@ -168,6 +168,11 @@ class DeployRequest(BaseModel):
  # Optional user-chosen slug. If omitted, server slugifies session name.
  # If the requested slug already exists, server appends -2, -3, etc.
  slug: str | None = None
+ # Optional subfolder under the session's workspace_subdir whose `dist/`
+ # should be promoted. Lets a single session host multiple apps (e.g.
+ # session contains `calorie-tracker/` AND `weather/` — deploy each as
+ # its own URL). Empty/omitted deploys the session root's `dist/`.
+ project_dir: str | None = None
 
 class DeployedAppResponse(BaseModel):
  slug: str
@@ -178,6 +183,9 @@ class DeployedAppResponse(BaseModel):
  app_dir: str
  deployed_at: int
  last_redeploy_at: int
+ # Subfolder of the source session that was promoted (None for the
+ # session root). Lets the UI pre-fill the Sub-app field on re-deploy.
+ project_dir: str | None = None
 
 class DeployResponse(BaseModel):
  # The slug we actually allocated (may differ from request if collision).

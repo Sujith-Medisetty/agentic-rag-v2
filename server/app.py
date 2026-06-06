@@ -1419,10 +1419,19 @@ async def stream(websocket: WebSocket, session_id: str):
 # Preview — serve the session's built PWA so it can be installed on any device.
 # ============================================================================
 
-def _session_preview_dir(session_id: str) -> Path | None:
+def _session_preview_dir(
+    session_id: str,
+    project_dir: str | None = None,
+) -> Path | None:
     """Resolve the session's `dist/` folder, or None if the session/project
-    can't be found. Used by both the static-serve route AND the build
-    watcher that emits preview_ready events."""
+    can't be found (or the project_dir is unsafe). Used by the build watcher
+    that emits preview_ready events AND by the deploy endpoint to find the
+    files to copy.
+
+    `project_dir` lets a single session host multiple apps — the session
+    workspace might contain `calorie-tracker/dist/`, `weather/dist/`, etc.,
+    and each can be deployed as its own slug. Empty/None → session root.
+    """
     session = db.get_session(session_id)
     if session is None:
         return None
@@ -1432,6 +1441,15 @@ def _session_preview_dir(session_id: str) -> Path | None:
     base = Path(project["workspace_path"])
     if session.get("workspace_subdir"):
         base = base / session["workspace_subdir"]
+    if project_dir:
+        # Sanitize: no traversal, no absolute paths, no NULs. Empty segments
+        # are tolerated (e.g. "calorie-tracker/") but we collapse them so
+        # the resolver stays predictable.
+        parts = [p for p in project_dir.replace("\x00", "").split("/") if p]
+        if any(p == ".." for p in parts):
+            return None
+        for p in parts:
+            base = base / p
     return base / "dist"
 
 
@@ -1559,12 +1577,22 @@ def sessions_deploy(
     (atomic in-place swap); re-deploying without a slug picks a fresh one."""
     import shutil
     session = _session_or_404(session_id, user)
+    # Normalize the optional sub-app folder. Empty/None deploys the
+    # session's own dist/; a value like "todo-app" deploys <subdir>/todo-app/dist/.
+    # The resolver blocks ".." segments and absolute paths.
+    project_dir = (req.project_dir or "").strip() or None
     # 1. Need a built dist/
-    dist = _session_preview_dir(session_id)
-    if dist is None or not dist.exists():
+    dist = _session_preview_dir(session_id, project_dir=project_dir)
+    if dist is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "no built dist/ yet — ask the agent to run `npm run build` first",
+            "invalid sub-app folder — paths with '..' or absolute paths are not allowed",
+        )
+    if not dist.exists():
+        hint = f" (looked in {dist})" if project_dir else ""
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"no built dist/ yet — ask the agent to run `npm run build` first{hint}",
         )
 
     # 2. Pick a slug. If user supplied one, slugify it; if it collides AND
@@ -1604,7 +1632,10 @@ def sessions_deploy(
 
     # 4. Insert or touch the DB row
     if in_place:
-        db.touch_deployed_app(slug)
+        # Re-deploying the same slug: refresh the recorded subfolder too,
+        # so a re-deploy that switches from session-root to a sub-app (or
+        # vice versa) actually repoints the live URL.
+        db.touch_deployed_app(slug, project_dir=project_dir)
         app_row = db.get_deployed_app(slug) or {}
     else:
         app_row = db.create_deployed_app(
@@ -1614,6 +1645,7 @@ def sessions_deploy(
             source_session_id=session_id,
             source_project_id=session.get("project_id"),
             owner_user_id=user["id"],
+            project_dir=project_dir,
         )
 
     # 5. Build the URL. Prefer the canonical subdomain form

@@ -933,29 +933,43 @@ def create_deployed_app(
     source_session_id: str | None = None,
     source_project_id: str | None = None,
     owner_user_id: str | None = None,
+    project_dir: str | None = None,
 ) -> dict:
     """Insert a new deployed-app row. Caller has already copied files to
-    `app_dir` and verified the slug is free."""
+    `app_dir` and verified the slug is free. `project_dir` records which
+    subfolder of the source session was promoted (for re-deploys and UI
+    display); nullable for legacy callers."""
     now = int(time.time())
     with _connect() as cx:
         cx.execute(
             "INSERT INTO deployed_apps "
             "(slug, name, source_session_id, source_project_id, owner_user_id, "
-            "app_dir, deployed_at, last_redeploy_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "app_dir, deployed_at, last_redeploy_at, project_dir) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (slug, name, source_session_id, source_project_id, owner_user_id,
-             app_dir, now, now),
+             app_dir, now, now, project_dir),
         )
     return get_deployed_app(slug) or {}
 
 
-def touch_deployed_app(slug: str) -> None:
-    """Bump last_redeploy_at after an in-place re-promote of the same slug."""
+def touch_deployed_app(slug: str, project_dir: str | None = None) -> None:
+    """Bump last_redeploy_at after an in-place re-promote of the same slug.
+    When `project_dir` is provided, also update the recorded subfolder so a
+    re-deploy can repoint the app at a different build without allocating
+    a new slug. Pass `project_dir=None` (default) to leave the existing
+    value untouched."""
     with _connect() as cx:
-        cx.execute(
-            "UPDATE deployed_apps SET last_redeploy_at = ? WHERE slug = ?",
-            (int(time.time()), slug),
-        )
+        if project_dir is not None:
+            cx.execute(
+                "UPDATE deployed_apps "
+                "SET last_redeploy_at = ?, project_dir = ? WHERE slug = ?",
+                (int(time.time()), project_dir, slug),
+            )
+        else:
+            cx.execute(
+                "UPDATE deployed_apps SET last_redeploy_at = ? WHERE slug = ?",
+                (int(time.time()), slug),
+            )
 
 
 def get_deployed_app(slug: str) -> dict | None:
