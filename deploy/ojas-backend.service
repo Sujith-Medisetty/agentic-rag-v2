@@ -24,12 +24,26 @@ WorkingDirectory=/opt/ojas
 EnvironmentFile=/opt/ojas/.env
 
 # Use the venv's uvicorn so we don't depend on system Python paths.
+#
+# WebSocket tuning for production resilience:
+#   --ws-ping-interval 20   send a ping every 20s so intermediate proxies
+#                             (mobile carrier NATs, corporate firewalls)
+#                             don't silently kill the idle socket
+#   --ws-ping-timeout 20     close the connection if no pong within 20s
+#                             (the client receives the close and its
+#                             exponential-backoff reconnect kicks in)
+#   --ws max_size 16MiB      cap individual message size; LLM tool
+#                             results can occasionally be larger than the
+#                             uvicorn default (2MiB)
 ExecStart=/opt/ojas/.venv/bin/uvicorn server.app:app \
     --host 127.0.0.1 \
     --port 8765 \
     --log-level info \
     --proxy-headers \
-    --forwarded-allow-ips 127.0.0.1
+    --forwarded-allow-ips 127.0.0.1 \
+    --ws-ping-interval 20 \
+    --ws-ping-timeout 20 \
+    --ws-max-size 16777216
 
 # Restart on crash with a small back-off so a tight crash loop doesn't
 # spin up the box.

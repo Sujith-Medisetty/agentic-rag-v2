@@ -37,7 +37,24 @@ from server import db
 
 class SessionBus:
     """Per-session pub/sub. Thread-safe enqueue from the agent thread, async
-    dequeue + fan-out from the FastAPI event loop."""
+    dequeue + fan-out from the FastAPI event loop.
+
+    Production backpressure: a single slow client must not be able
+    to back the bus up indefinitely while the agent publishes. The
+    queue is bounded at MAX_QUEUE; when full we DROP the oldest
+    queued event (the new event still goes to the DB via
+    append_event, so a reconnect with `?since=<ts>` will replay
+    the gap). Subscribers that are themselves slow to consume
+    (e.g. a stalled network) will see the bus drop events on
+    their behalf — exactly the right behavior, since they're
+    going to refetch from the DB on reconnect anyway."""
+
+    # Cap on the in-memory fan-out queue. The agent publishes one event
+    # per token (~50-100/s for a streaming response), so 1000 events
+    # = ~10-20s of buffering — plenty for any normal slow client. A
+    # client slower than that is effectively disconnected anyway and
+    # will re-subscribe from the DB.
+    MAX_QUEUE = 1000
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
@@ -46,6 +63,10 @@ class SessionBus:
         self._subscribers: set = set()
         self._lock = threading.Lock()
         self._fanout_task: asyncio.Task | None = None
+        # Diagnostic — number of events dropped by backpressure since
+        # the bus was created. Visible in /api/admin/services so
+        # operators can spot clients that are too slow to keep up.
+        self.dropped_count = 0
 
     # ---- wiring (called from the event loop) ----------------------------
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -55,7 +76,7 @@ class SessionBus:
             if self._loop is not None:
                 return
             self._loop = loop
-            self._queue = asyncio.Queue()
+            self._queue = asyncio.Queue(maxsize=self.MAX_QUEUE)
             self._fanout_task = loop.create_task(self._fanout())
 
     def is_bound(self) -> bool:
@@ -114,6 +135,19 @@ class SessionBus:
                 pass
         if self._loop is not None and self._queue is not None:
             try:
+                # Backpressure: if the queue is full, evict the OLDEST
+                # event to make room for the new one. The dropped
+                # event was already persisted to SQLite (above) so
+                # a reconnect with `?since=<ts>` will replay the gap.
+                # Net effect: a stuck client drops the OLDEST buffered
+                # event while the persisted DB history stays intact.
+                if self._queue.full():
+                    try:
+                        dropped = self._queue.get_nowait()
+                        self.dropped_count += 1
+                        del dropped
+                    except Exception:
+                        pass
                 self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
             except RuntimeError:
                 # Loop is closed (server shutting down); drop the event.
@@ -154,6 +188,26 @@ class SessionBus:
 
 _buses: dict[str, SessionBus] = {}
 _registry_lock = threading.Lock()
+
+
+def bus_stats() -> list[dict]:
+    """Operator-facing snapshot of every active session bus. Used by the
+    admin panel so we can spot clients that are too slow to keep up
+    (dropped_count > 0) or sessions that have wedged subscribers
+    (queue full, subscribers = 0). Returns a list of small dicts —
+    no PII, just the session_id + counters."""
+    out = []
+    for sid, bus in _buses.items():
+        qsize = bus._queue.qsize() if bus._queue is not None else 0
+        out.append({
+            "session_id":     sid,
+            "subscribers":    len(bus._subscribers),
+            "queue_size":     qsize,
+            "queue_max":      bus.MAX_QUEUE,
+            "dropped_count":  bus.dropped_count,
+            "is_bound":       bus.is_bound(),
+        })
+    return out
 
 
 def get_bus(session_id: str) -> SessionBus:

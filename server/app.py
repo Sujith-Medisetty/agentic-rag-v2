@@ -1813,6 +1813,16 @@ def admin_services_list(_root: dict = Depends(require_root)):
     return [OjasServiceResponse(**r) for r in rows]
 
 
+@app.get("/api/admin/buses")
+def admin_buses_list(_root: dict = Depends(require_root)):
+    """Snapshot of every active session bus — queue depth, subscriber
+    count, dropped-event count. Helps operators spot clients too slow
+    to keep up (dropped_count > 0) or sessions with wedged
+    subscribers (queue full, no one draining it)."""
+    from server.reporter import bus_stats
+    return {"buses": bus_stats()}
+
+
 @app.get("/api/admin/users", response_model=list[UserResponse])
 def admin_users_list(_root: dict = Depends(require_root)):
     """List every account on this VM. Strips password hashes."""
