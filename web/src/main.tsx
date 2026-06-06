@@ -3,6 +3,11 @@ import ReactDOM from "react-dom/client";
 import App from "@/App";
 import { registerSW } from "@/pwa/registerSW";
 import { initThemeBeforeRender } from "@/lib/theme";
+import "@/lib/installPrompt";   // module-load side-effect: register the
+                                 // `beforeinstallprompt` + `appinstalled`
+                                 // window listeners BEFORE React mounts.
+                                 // Otherwise we miss the event on returning
+                                 // visits where Chrome fires it immediately.
 import "@/index.css";
 
 // Apply the stored theme BEFORE React renders so the first paint is in the

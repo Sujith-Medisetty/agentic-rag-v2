@@ -12,6 +12,7 @@ import type { AuthUser } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import type { Project, Session } from "@/lib/types";
 import { useSessions } from "@/lib/sessionContext";
+import InstallButton from "@/components/InstallButton";
 
 export default function Workspace() {
   const navigate = useNavigate();
@@ -349,6 +350,8 @@ export default function Workspace() {
               {project.workspace_path}
             </div>
           )}
+          {/* Install Ojas as PWA — renders nothing once standalone. */}
+          <div className="mb-2 empty:hidden"><InstallButton variant="primary" /></div>
           {me?.role === "root" && (
             <Link
               to="/admin"

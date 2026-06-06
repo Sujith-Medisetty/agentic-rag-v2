@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { authApi } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
+import InstallButton from "@/components/InstallButton";
 
 // Top chrome shown above non-chat pages. ChatPage renders full-screen so it
 // has its own header. Designed mobile-first: compact on phones, generous on
@@ -50,6 +51,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               Ojas
             </span>
           </Link>
+          {/* Install Ojas as PWA — renders nothing once already installed. */}
+          <InstallButton variant="ghost" />
           <button
             onClick={toggle}
             className="btn-icon"
