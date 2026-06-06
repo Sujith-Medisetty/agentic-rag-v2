@@ -3,14 +3,13 @@ import { useEffect, useState } from "react";
 import { authApi } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
-import { useInstallPWA } from "@/lib/useInstallPWA";
+import { InstallAppButton } from "@/components/InstallAppButton";
 
 // Top chrome shown above non-chat pages. ChatPage renders full-screen so it
 // has its own header. Designed mobile-first: compact on phones, generous on
 // tablet+ (max-w-5xl). All controls hit ≥44pt targets.
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { effective, toggle } = useTheme();
-  const pwa = useInstallPWA();
 
   // "New version available" toast. The SW registration code in
   // src/pwa/registerSW.ts dispatches `ojas:sw-update` when a new service
@@ -48,33 +47,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               Ojas
             </span>
           </Link>
-          {/* PWA install — explicit button in the header, always visible
-              when the browser says the app is installable. The browser's
-              own little install chip in the URL bar is too easy to miss,
-              especially on mobile. Clicking this triggers Chrome/Edge's
-              native install dialog (handled by the deferred prompt). */}
-          {pwa.supported && (
-            <button
-              type="button"
-              onClick={() => void pwa.install()}
-              className="inline-flex h-8 items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-2.5 text-xs font-semibold text-accent transition-colors hover:bg-accent/20 hover:border-accent/60"
-              title="Install Ojas as a desktop / home-screen app"
-              aria-label="Install Ojas as an app"
-            >
-              <DownloadIcon />
-              <span>Install app</span>
-            </button>
-          )}
-          {pwa.installed && (
-            <span
-              className="inline-flex h-8 items-center gap-1 rounded-md border border-success/40 bg-success/10 px-2.5 text-xs font-medium text-success"
-              title="Ojas is installed as an app"
-              aria-label="Ojas is installed"
-            >
-              <CheckIcon />
-              <span className="hidden sm:inline">Installed</span>
-            </span>
-          )}
+          {/* PWA install — always visible in the header. Uses the native
+              browser install dialog when available; otherwise opens a
+              platform-specific instructions modal (iOS, Android, Firefox,
+              etc). The button shows "Installed" once the app is
+              running in standalone mode. */}
+          <InstallAppButton />
           <button
             onClick={toggle}
             className="btn-icon"
@@ -189,20 +167,6 @@ function DownloadIcon() {
       aria-hidden
     >
       <path d="M12 4v12M6 12l6 6 6-6M5 20h14" />
-    </svg>
-  );
-}
-function CheckIcon() {
-  return (
-    <svg
-      width="14" height="14" viewBox="0 0 24 24"
-      fill="none" stroke="currentColor"
-      strokeWidth="2.2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M5 12l4 4L19 6" />
     </svg>
   );
 }

@@ -36,16 +36,23 @@ export function useInstallPWA() {
       (window.matchMedia?.("(display-mode: standalone)").matches ||
         // iOS Safari: navigator.standalone is the legacy check
         (window.navigator as any).standalone === true);
-    if (isStandalone) setInstalled(true);
+    if (isStandalone) {
+      setInstalled(true);
+      console.info("[pwa] Running in standalone mode — app is already installed");
+    } else {
+      console.info("[pwa] Not in standalone mode — install button can show");
+    }
 
     const onBeforeInstall = (e: Event) => {
       // Chrome requires us to preventDefault() to keep the event
       // around (otherwise Chrome shows its own banner immediately
       // and we can't show ours).
       e.preventDefault();
+      console.info("[pwa] beforeinstallprompt fired — install button will show");
       setDeferredPrompt(e as BeforeInstallPromptEvent);
     };
     const onInstalled = () => {
+      console.info("[pwa] appinstalled — app is now installed");
       setInstalled(true);
       setDeferredPrompt(null);
     };
