@@ -49,6 +49,10 @@ export function useInstallPWA() {
       // and we can't show ours).
       e.preventDefault();
       console.info("[pwa] beforeinstallprompt fired — install button will show");
+      // Stash on window so the diagnostics modal can show "yes/no
+      // has this event fired in this session" without needing to
+      // duplicate the listener.
+      (window as any).__pwa_prompt_seen = true;
       setDeferredPrompt(e as BeforeInstallPromptEvent);
     };
     const onInstalled = () => {

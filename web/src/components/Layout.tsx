@@ -4,6 +4,7 @@ import { authApi } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
 import { InstallAppButton } from "@/components/InstallAppButton";
+import { PWADiagnosticsButton } from "@/components/PWADiagnostics";
 
 // Top chrome shown above non-chat pages. ChatPage renders full-screen so it
 // has its own header. Designed mobile-first: compact on phones, generous on
@@ -61,6 +62,13 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           >
             {effective === "dark" ? <SunIcon /> : <MoonIcon />}
           </button>
+          {/* PWA diagnostics — opens a modal that shows what Chrome
+              actually sees (SW state, manifest reachability, install
+              eligibility) + a one-click "Reset PWA" that unregisters
+              the SW + clears all caches. The most common reason the
+              install button doesn't show is a stale SW from a prior
+              version, which this fixes. */}
+          <PWADiagnosticsButton />
           <button
             onClick={logout}
             className="hidden text-xs text-muted transition-colors hover:text-danger sm:inline"
