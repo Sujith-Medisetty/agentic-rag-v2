@@ -2137,13 +2137,17 @@ function DeployModal({
         <label className="block">
           <span className="text-tx-xs font-medium text-muted">
             Sub-app folder{" "}
-            <span className="text-subtle">(optional — leave empty for the session root)</span>
+            <span className="text-subtle">
+              (the folder containing the agent's <code className="font-mono">dist/</code>{" "}
+              — e.g. <code className="font-mono">my-app</code> if the agent built{" "}
+              <code className="font-mono">my-app/dist/</code>)
+            </span>
           </span>
           <input
             type="text" value={projectDir}
             onChange={(e) => setProjectDir(e.target.value)}
             className="field mt-1 font-mono"
-            placeholder="calorie-tracker"
+            placeholder="my-app"
           />
         </label>
         {err && (
