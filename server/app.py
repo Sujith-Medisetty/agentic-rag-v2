@@ -1435,39 +1435,13 @@ def _session_preview_dir(session_id: str) -> Path | None:
     return base / "dist"
 
 
-@app.get("/preview/{session_id}")
-@app.get("/preview/{session_id}/")
-@app.get("/preview/{session_id}/{file_path:path}")
-def preview_serve(session_id: str, file_path: str = ""):
-    """Static-serve the session's `<workspace>/dist/` at a public URL.
-    NO auth — the URL is shareable to your phone so a PWA can install
-    itself. session_id is a uuid hex; guessing one is impractical, and the
-    preview only exists if the agent built one.
-
-    SPA fallback: missing assets resolve to `index.html` so client-side
-    React Router takes over."""
-    from fastapi.responses import FileResponse
-    dist_dir = _session_preview_dir(session_id)
-    if dist_dir is None or not dist_dir.exists():
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            "preview not built yet — the agent needs to run `npm run build` first",
-        )
-    dist_resolved = dist_dir.resolve()
-    requested = file_path or "index.html"
-    target = (dist_dir / requested).resolve()
-    # Path traversal defence — target MUST be inside dist_dir.
-    try:
-        target.relative_to(dist_resolved)
-    except ValueError:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
-    if not target.exists() or not target.is_file():
-        target = dist_dir / "index.html"
-        if not target.exists():
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "preview index.html missing",
-            )
-    return FileResponse(target)
+# /preview/{session_id}/* was removed: it generated temporary URLs tied
+# to a session ID that the user (rightly) found unreliable — they were
+# half-broken without a service worker scope, and disappeared on session
+# delete. The Deploy button → `<slug>.<apps-root>/` flow replaces it with
+# a stable, installable URL the user controls. The dist-dir resolver
+# (`_session_preview_dir`) is kept because the deploy endpoint still uses
+# it to find the built files to copy.
 
 
 # ============================================================================
@@ -1692,6 +1666,27 @@ def deployed_apps_list(user: dict = Depends(require_user)):
     """List deployed apps. Root sees all; everyone else sees their own."""
     owner = None if user["role"] == "root" else user["id"]
     return [DeployedAppResponse(**a) for a in db.list_deployed_apps(owner_user_id=owner)]
+
+
+@app.get(
+    "/api/sessions/{session_id}/deployed-apps",
+    response_model=list[DeployedAppResponse],
+)
+def session_deployed_apps_list(
+    session_id: str,
+    user: dict = Depends(require_user),
+):
+    """Just the apps deployed FROM this session — used by the chat UI to
+    render the deploy strip with `<slug>.<apps-root>/` URLs inline. Same
+    ownership rules as everywhere else (root sees all)."""
+    _session_or_404(session_id, user)
+    # Filter from the full list so we reuse the existing ownership logic.
+    owner = None if user["role"] == "root" else user["id"]
+    rows = [
+        a for a in db.list_deployed_apps(owner_user_id=owner)
+        if a.get("source_session_id") == session_id
+    ]
+    return [DeployedAppResponse(**a) for a in rows]
 
 
 @app.delete("/api/deployed-apps/{slug}")

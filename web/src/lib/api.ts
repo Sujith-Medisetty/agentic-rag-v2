@@ -314,13 +314,28 @@ export const sessionApi = {
       `/api/sessions/${encodeURIComponent(sessionId)}/compact`,
       { method: "POST" },
     ),
-  // Promote the session's built dist/ to a persistent installable URL
-  // at /apps/<slug>/. Slug is optional — server slugifies the session
-  // name and appends -2/-3 on collision. Re-deploying to the same slug
-  // (same owner) atomically swaps the files.
-  deploy: (sessionId: string, slug?: string) =>
+  // Promote a session's built dist/ to a permanent subdomain URL.
+  //   slug         — leftmost label of the public URL. Server slugifies
+  //                  and -2/-3 suffixes on collision. Optional.
+  //   project_dir  — which subfolder under the session's workspace_subdir
+  //                  to deploy. Lets a single session host multiple apps
+  //                  (e.g. session contains `calorie-tracker/` AND
+  //                  `weather/` — deploy each as its own URL).
+  deploy: (sessionId: string, opts: { slug?: string; project_dir?: string } = {}) =>
     request<DeployResult>(
       `/api/sessions/${encodeURIComponent(sessionId)}/deploy`,
-      { method: "POST", body: JSON.stringify({ slug: slug ?? null }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          slug: opts.slug ?? null,
+          project_dir: opts.project_dir ?? null,
+        }),
+      },
+    ),
+  // Just the deploys made from THIS session — chat strip renders these
+  // as pills with Open / Delete controls.
+  deployedApps: (sessionId: string) =>
+    request<DeployedApp[]>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/deployed-apps`,
     ),
 };

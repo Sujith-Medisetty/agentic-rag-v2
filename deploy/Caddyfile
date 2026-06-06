@@ -78,10 +78,8 @@ ojas.example.com {
         reverse_proxy 127.0.0.1:8765
     }
 
-    # Per-session preview serving — proxied to FastAPI.
-    handle /preview/* {
-        reverse_proxy 127.0.0.1:8765
-    }
+    # (Per-session /preview/* removed — superseded by the Deploy button
+    # which produces stable subdomain URLs.)
 
     # Deployed apps — persistent installable PWAs at /apps/<slug>/.
     # Proxied to FastAPI which static-serves the dist from

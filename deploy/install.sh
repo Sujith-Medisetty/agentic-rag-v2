@@ -145,12 +145,15 @@ install -o root -g root -m 644 "${OJAS_DIR}/deploy/ojas-backend.service" \
 ok "Unit file installed"
 
 banner "Installing Caddyfile"
-# Two substitutions: the apex domain + the apps-root domain (may be
-# the same). The Caddyfile template has `ojas.example.com` for the apex
-# AND `*.ojas.example.com` for the wildcard subdomain block; we sed
-# both to the configured values.
-sed -e "s/ojas\\.example\\.com/${OJAS_DOMAIN}/g" \
-    -e "s|\\*\\.ojas\\.example\\.com|\\*.${OJAS_APPS_ROOT_DOMAIN}|g" \
+# Two substitutions: the wildcard apps-root block AND the apex Ojas block.
+# ORDER MATTERS — we substitute the SPECIFIC pattern (`*.ojas.example.com`)
+# BEFORE the generic one (`ojas.example.com`). If we did it the other way
+# round, the generic sed would rewrite the `*.ojas.example.com` lines into
+# `*.${OJAS_DOMAIN}` first, and then the wildcard sed would find nothing
+# to match — so the apex and apps-root would always end up identical
+# regardless of OJAS_APPS_ROOT_DOMAIN.
+sed -e "s|\\*\\.ojas\\.example\\.com|\\*.${OJAS_APPS_ROOT_DOMAIN}|g" \
+    -e "s/ojas\\.example\\.com/${OJAS_DOMAIN}/g" \
     "${OJAS_DIR}/deploy/Caddyfile" > /etc/caddy/Caddyfile
 ok "Caddyfile installed — apex: ${OJAS_DOMAIN}, apps: *.${OJAS_APPS_ROOT_DOMAIN}"
 

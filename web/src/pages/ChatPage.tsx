@@ -26,7 +26,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useOutletContext } from "react-router-dom";
 import type { Project as ProjectType } from "@/lib/types";
-import { sessionApi, sessionsApi } from "@/lib/api";
+import { sessionApi, sessionsApi, deployedAppsApi } from "@/lib/api";
+import type { DeployedApp } from "@/lib/api";
 import { openEventStream } from "@/lib/ws";
 import { useTheme } from "@/lib/theme";
 import { useSessions } from "@/lib/sessionContext";
@@ -97,10 +98,10 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Preview state — populated when a `preview_ready` event arrives from the
-  // backend's build watcher. The URL is relative; we resolve it to the
-  // current origin when rendering the banner so it works on any deployment.
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  // Deployed apps from THIS session — populated on mount from
+  // /api/sessions/<id>/deployed-apps, refreshed when the user deploys a
+  // new sub-app via the Deploy button or deletes one from the strip.
+  const [deployedApps, setDeployedApps] = useState<DeployedApp[]>([]);
   // Follow-mode for the chat scroll: stick to bottom while new events
   // arrive UNLESS the user scrolls up to read. If they do, leave them where
   // they are and pop a floating "↓" button so they can catch back up on a
@@ -161,7 +162,7 @@ export default function ChatPage() {
     setCurrentTurn(null);
     setPlan([]);
     setGit(null);
-    setPreviewUrl(null);
+    setDeployedApps([]);   // wipe previous session's deploy strip
     setSending(false);
     setLoadErr(null);
     setDebugEvents([]);
@@ -182,7 +183,7 @@ export default function ChatPage() {
         // currentTurn from the rebuild is what makes streaming RESUME on
         // refresh / session-switch — live WS events arriving after this
         // point have a non-null target to update.
-        const { turns: rebuilt, currentTurn: rebuiltCurrent, plan: replayedPlan, previewUrl: replayedPreview } = rebuildTranscript(
+        const { turns: rebuilt, currentTurn: rebuiltCurrent, plan: replayedPlan } = rebuildTranscript(
           events.map((e) => ({
             kind: e.kind, payload: e.payload, ts: e.created_at * 1000,
           })),
@@ -190,7 +191,10 @@ export default function ChatPage() {
         setTurns(rebuilt);
         setCurrentTurn(rebuiltCurrent);
         setPlan(replayedPlan);
-        if (replayedPreview) setPreviewUrl(replayedPreview);
+        // Load this session's deployed apps so the strip renders correctly
+        // on every mount (refresh / session switch). Failure is non-fatal —
+        // strip just shows empty.
+        sessionApi.deployedApps(sessionId!).then(setDeployedApps).catch(() => {});
         // Record the watermark for the WS catchup. Use the latest event's
         // created_at in SECONDS (backend's column unit) so the next
         // ?since=<ts> query returns ONLY events newer than what we already
@@ -300,16 +304,6 @@ export default function ChatPage() {
       case "todo_update": {
         const items = Array.isArray(p.items) ? (p.items as TodoItem[]) : [];
         setPlan(items);
-        return;
-      }
-
-      // --- Preview ready / updated ---
-      // Emitted by the backend's build watcher whenever
-      // `<session_workspace>/dist/index.html` lands or its mtime changes.
-      // We just store the URL; the PreviewBanner below renders the install card.
-      case "preview_ready": {
-        const url = typeof p.url === "string" ? p.url : "";
-        if (url) setPreviewUrl(url);
         return;
       }
 
@@ -1004,7 +998,20 @@ export default function ChatPage() {
 
       {/* Sticky plan panel — turn-independent state */}
       <PlanPanel items={plan} />
-      {previewUrl && <PreviewBanner url={previewUrl} sessionId={sessionId ?? ""} sessionName={turns[0]?.userPrompt ?? "app"} turnInProgress={!!currentTurn?.isStreaming} onDismiss={() => setPreviewUrl(null)} />}
+
+      {/* Deploy strip — sits between PlanPanel and chat scroll, shows
+          deploys made from this session + a "Deploy" button to add more.
+          Renders nothing when the session has produced no buildable
+          dist/ yet AND has no prior deploys. */}
+      <DeployStrip
+        sessionId={sessionId ?? ""}
+        sessionName={turns[0]?.userPrompt ?? "app"}
+        apps={deployedApps}
+        onDeployed={(app) => setDeployedApps((prev) => [
+          app, ...prev.filter((a) => a.slug !== app.slug),
+        ])}
+        onDeleted={(slug) => setDeployedApps((prev) => prev.filter((a) => a.slug !== slug))}
+      />
 
       {/* Debug stream — floating raw WS event log. Use to diagnose live-event
           delivery: if events appear here in real time but the transcript
@@ -1274,12 +1281,11 @@ function _replaceLastTextBlock(
 // Replay an event log into turns + final plan. Pure function, used both on
 // mount (to restore state) and is the model the live handler emulates.
 function rebuildTranscript(events: LiveEvent[]): {
-  turns: Turn[]; currentTurn: Turn | null; plan: TodoItem[]; previewUrl: string | null;
+  turns: Turn[]; currentTurn: Turn | null; plan: TodoItem[];
 } {
   const completed: Turn[] = [];
   let curr: Turn | null = null;
   let plan: TodoItem[] = [];
-  let previewUrl: string | null = null;
 
   for (const ev of events) {
     const p = ev.payload as Record<string, any>;
@@ -1475,11 +1481,6 @@ function rebuildTranscript(events: LiveEvent[]): {
       case "todo_update":
         plan = Array.isArray(p.items) ? (p.items as TodoItem[]) : [];
         break;
-      case "preview_ready": {
-        const url = typeof p.url === "string" ? p.url : "";
-        if (url) previewUrl = url;
-        break;
-      }
     }
   }
   // If the log ended mid-turn, return the in-progress turn as `currentTurn`
@@ -1490,7 +1491,7 @@ function rebuildTranscript(events: LiveEvent[]): {
   // silently no-op'd — the Stop button stayed hidden and streaming text
   // never appeared. Keeping isStreaming=true here is what unlocks the Stop
   // button rendering condition and the live spinner.
-  return { turns: completed, currentTurn: curr, plan, previewUrl };
+  return { turns: completed, currentTurn: curr, plan };
 }
 
 // ============================================================================
@@ -1982,296 +1983,199 @@ function DebugStream({
   );
 }
 
+
+
 // ============================================================================
-// PreviewBanner — sticky card shown above the chat once the agent's build
-// produces a `dist/` directory. Open / Install / Dismiss controls.
-//
-// "Install" delegates to the platform:
-//   - Android Chrome: opens the URL in a new tab; the PWA's own install
-//     banner (BeforeInstallPromptEvent) fires there.
-//   - iOS Safari: same; user uses Share → Add to Home Screen (Apple
-//     offers no API). We show a short hint for them.
-//   - Desktop Chromium: install icon appears in the address bar.
+// DeployStrip — sticky horizontal strip between the plan panel and the chat
+// scroll area. Shows every app deployed FROM this session as a pill (slug +
+// open + delete) plus a "Deploy" button that opens the modal.
 // ============================================================================
 
-function PreviewBanner({
-  url, sessionId, sessionName, turnInProgress, onDismiss,
+function DeployStrip({
+  sessionId, sessionName, apps, onDeployed, onDeleted,
 }: {
-  url: string; sessionId: string; sessionName: string;
-  turnInProgress: boolean; onDismiss: () => void;
+  sessionId: string;
+  sessionName: string;
+  apps: DeployedApp[];
+  onDeployed: (app: DeployedApp) => void;
+  onDeleted: (slug: string) => void;
 }) {
-  // Resolve relative URLs to the current origin so the banner works on
-  // any deployment (localhost dev, forge.karmacode.cloud, etc.).
-  const fullUrl = url.startsWith("http")
-    ? url
-    : `${window.location.origin}${url.startsWith("/") ? "" : "/"}${url}`;
-  const isIOS = typeof navigator !== "undefined"
-    && /iPhone|iPad|iPod/i.test(navigator.userAgent);
-
-  // ---- Deploy ("promote to permanent URL") state ------------------------
-  // Suggested slug = first 32 chars of the session-first-prompt slugified
-  // down to [a-z0-9-]. The user can tweak before submitting.
-  const suggestedSlug = (sessionName || "app")
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/-{2,}/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 32) || "app";
-
-  // Remember the LAST slug this session was deployed to, so when the agent
-  // rebuilds (user asked for changes) we offer "Update <slug>" instead of
-  // a fresh deploy. Keyed per session in localStorage so the memory survives
-  // page reloads. Cleared on take-down (handled by Admin page).
-  const LAST_SLUG_KEY = `ojas.last-deployed-slug:${sessionId}`;
-  const initialLastSlug = (() => {
-    try { return localStorage.getItem(LAST_SLUG_KEY) || ""; }
-    catch { return ""; }
-  })();
-  const [lastDeployedSlug, setLastDeployedSlug] = useState<string>(initialLastSlug);
-
-  const [picking, setPicking] = useState(false);
-  const [slugInput, setSlugInput] = useState(suggestedSlug);
-  const [deploying, setDeploying] = useState(false);
-  const [deployedUrl, setDeployedUrl] = useState<string | null>(null);
-  const [deployedSlug, setDeployedSlug] = useState<string | null>(null);
-  const [deployErr, setDeployErr] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-
-  // When a fresh build lands AFTER a prior deploy, the deployed URL out
-  // there is stale. Clear the "deployed" success state so the banner
-  // surfaces the Update button again. Triggered whenever url (preview
-  // path mtime) changes.
-  useEffect(() => {
-    setDeployedUrl(null);
-    setDeployedSlug(null);
-    setDeployErr(null);
-  }, [url]);
-
-  const doDeploy = async (overrideSlug?: string) => {
-    if (!sessionId || deploying) return;
-    setDeploying(true);
-    setDeployErr(null);
-    try {
-      const res = await (await import("@/lib/api")).sessionApi.deploy(
-        sessionId, overrideSlug ?? (slugInput.trim() || undefined),
-      );
-      setDeployedSlug(res.slug);
-      setDeployedUrl(res.url);
-      setLastDeployedSlug(res.slug);
-      try { localStorage.setItem(LAST_SLUG_KEY, res.slug); } catch {}
-      setPicking(false);
-    } catch (e: any) {
-      setDeployErr(e?.message ?? "deploy failed");
-    } finally {
-      setDeploying(false);
-    }
-  };
-
-  const copyDeployedUrl = async () => {
-    const u = deployedUrl ?? (lastDeployedSlug
-      ? `${window.location.origin}/apps/${lastDeployedSlug}/` : null);
-    if (!u) return;
-    try {
-      await navigator.clipboard.writeText(u);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {}
-  };
-
-  // The big gating rule: Deploy/Update is offered ONLY when the turn has
-  // ended. While the agent is still streaming, the dist/ on disk may be a
-  // mid-build state (vite writes assets, then index.html, then sw.js — a
-  // partial copy at any moment is a broken app). Showing the button only
-  // after isStreaming flips to false guarantees TWO signals agree:
-  //   1. backend watcher: 'dist/index.html exists' (already emitted url)
-  //   2. agent: 'turn complete' (no more events coming)
-  const buildReady = !turnInProgress;
-
-  // What primary action to show:
-  //   - Already deployed this session AND a fresh build is ready → "Update <slug>"
-  //   - Never deployed yet OR took-down → "Deploy"
-  //   - Just deployed in this turn (deployedUrl set) → Copy + Open
-  const showUpdate = buildReady && !deployedUrl && lastDeployedSlug;
-  const showDeploy = buildReady && !deployedUrl && !lastDeployedSlug;
+  const [showModal, setShowModal] = useState(false);
 
   return (
-    <div className="border-b border-accent/25 bg-accent/10 px-4 py-2.5">
-      <div className="mx-auto flex max-w-4xl flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          <span
-            aria-hidden
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-accent text-white"
-          >
-            ↗
-          </span>
-          <div className="min-w-0">
-            <div className="text-sm font-semibold text-text">
-              {deployedUrl
-                ? "App deployed"
-                : (turnInProgress
-                    ? "Build in progress…"
-                    : (lastDeployedSlug
-                        ? "New build ready — Update to push it live"
-                        : "Preview ready"))}
-            </div>
-            <div
-              className="truncate font-mono text-tx-xs text-muted"
-              title={deployedUrl
-                ?? (lastDeployedSlug
-                  ? `${window.location.origin}/apps/${lastDeployedSlug}/`
-                  : fullUrl)}
-            >
-              {deployedUrl
-                ?? (lastDeployedSlug
-                  ? `${window.location.origin}/apps/${lastDeployedSlug}/`
-                  : fullUrl)}
-            </div>
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {deployedUrl ? (
-            <>
-              <button
-                type="button"
-                onClick={copyDeployedUrl}
-                className="btn-ghost min-h-touch"
-                title="Copy the permanent URL"
-              >
-                {copied ? "✓ Copied" : "Copy"}
-              </button>
-              <a
-                href={deployedUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="btn-primary min-h-touch"
-                title="Open the deployed app"
-              >
-                Open
-              </a>
-            </>
+    <>
+      <div className="border-b border-border bg-elevated/40">
+        <div className="mx-auto flex max-w-4xl flex-wrap items-center gap-2 px-4 py-2">
+          {apps.length === 0 ? (
+            <span className="flex-1 text-tx-xs text-muted">
+              Once a build is ready, tap Deploy to publish at{" "}
+              <span className="font-mono">&lt;slug&gt;.{hostApps()}</span>.
+            </span>
           ) : (
-            <>
-              <a
-                href={fullUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="btn-ghost min-h-touch"
-                title="Open the live preview (this URL is tied to this session)"
-              >
-                Preview
-              </a>
-              {showUpdate && (
-                <button
-                  type="button"
-                  disabled={!sessionId || deploying}
-                  onClick={() => doDeploy(lastDeployedSlug)}
-                  className="btn-primary min-h-touch"
-                  title={`Atomically swap the live app at /apps/${lastDeployedSlug}/ with this build`}
-                >
-                  {deploying ? "Updating…" : `🔄 Update ${lastDeployedSlug}`}
-                </button>
-              )}
-              {showDeploy && (
-                <button
-                  type="button"
-                  disabled={!sessionId || deploying}
-                  onClick={() => setPicking(true)}
-                  className="btn-primary min-h-touch"
-                  title="Promote this build to a permanent installable URL at /apps/<slug>/."
-                >
-                  🚀 Deploy
-                </button>
-              )}
-              {turnInProgress && (
-                <span
-                  className="text-tx-xs text-muted"
-                  title="Deploy is disabled until the agent finishes the current turn — partial builds can produce broken apps."
-                >
-                  Build in progress…
-                </span>
-              )}
-            </>
+            apps.map((a) => (
+              <DeployedAppPill key={a.slug} app={a} onDeleted={onDeleted} />
+            ))
           )}
           <button
             type="button"
-            onClick={onDismiss}
-            className="btn-icon"
-            title="Hide this banner"
-            aria-label="Dismiss preview banner"
+            onClick={() => setShowModal(true)}
+            disabled={!sessionId}
+            className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/15 px-3 py-1.5 text-tx-sm font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
           >
-            ✕
+            <UploadIcon /> Deploy
           </button>
         </div>
       </div>
+      {showModal && (
+        <DeployModal
+          sessionId={sessionId}
+          defaultName={sessionName}
+          onClose={() => setShowModal(false)}
+          onDeployed={(result) => {
+            onDeployed(result.app);
+            setShowModal(false);
+          }}
+        />
+      )}
+    </>
+  );
+}
 
-      {/* Slug picker — inline form that appears when user clicks Deploy.
-          Two-column on desktop, stacked on mobile. */}
-      {picking && (
-        <div className="mx-auto mt-2 max-w-4xl rounded-md border border-accent/40 bg-surface p-3">
-          <label className="block text-xs font-medium text-muted">
-            Pick a slug for the URL (we'll auto-suffix if it's taken)
-          </label>
-          <div className="mt-1.5 flex flex-col gap-2 sm:flex-row sm:items-center">
-            <div className="flex flex-1 items-center gap-1 rounded-md border border-border bg-elevated px-2 py-1.5 font-mono text-sm">
-              <span className="text-muted">{window.location.origin}/apps/</span>
-              <input
-                value={slugInput}
-                onChange={(e) => setSlugInput(e.target.value)}
-                className="min-w-0 flex-1 bg-transparent outline-none"
-                placeholder="my-app"
-                autoFocus
-              />
-              <span className="text-muted">/</span>
-            </div>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => setPicking(false)}
-                className="btn-ghost min-h-touch"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                disabled={deploying}
-                onClick={() => doDeploy()}
-                className="btn-primary min-h-touch"
-              >
-                {deploying ? "Deploying…" : "Deploy"}
-              </button>
-            </div>
+function hostApps(): string {
+  // Best-effort hint for the URL placeholder — we assume the current host
+  // IS the apps root (most common setup). Real URL comes from the deploy
+  // response which knows the server-side resolved root.
+  if (typeof window === "undefined") return "your-domain";
+  return window.location.host;
+}
+
+function DeployedAppPill({
+  app, onDeleted,
+}: { app: DeployedApp; onDeleted: (slug: string) => void }) {
+  const url = `${window.location.protocol}//${app.slug}.${window.location.host}/`;
+  const remove = async () => {
+    if (!confirm(`Take down ${app.slug}? The public URL will stop working.`)) return;
+    try {
+      await deployedAppsApi.delete(app.slug);
+      onDeleted(app.slug);
+    } catch (e: any) {
+      alert(`Delete failed: ${e?.message ?? "unknown"}`);
+    }
+  };
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-success/30 bg-success/10 px-2 py-1 text-tx-xs">
+      <span className="font-mono text-success" title={url}>{app.slug}</span>
+      <a
+        href={url} target="_blank" rel="noreferrer"
+        className="text-text hover:text-accent" title="Open"
+      >↗</a>
+      <button
+        type="button" onClick={remove}
+        className="text-muted hover:text-danger"
+        title="Delete" aria-label="Delete app"
+      >✕</button>
+    </span>
+  );
+}
+
+function DeployModal({
+  sessionId, defaultName, onClose, onDeployed,
+}: {
+  sessionId: string;
+  defaultName: string;
+  onClose: () => void;
+  onDeployed: (result: { slug: string; url: string; app: DeployedApp }) => void;
+}) {
+  const [slug, setSlug] = useState(slugifyName(defaultName));
+  const [projectDir, setProjectDir] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr(null);
+    setBusy(true);
+    try {
+      const result = await sessionApi.deploy(sessionId, {
+        slug: slug || undefined,
+        project_dir: projectDir || undefined,
+      });
+      onDeployed(result);
+    } catch (e: any) {
+      setErr(e?.message ?? "deploy failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      role="dialog" aria-modal onClick={onClose}
+      className="fixed inset-0 z-40 flex items-end justify-center bg-black/45 backdrop-blur-sm sm:items-center"
+    >
+      <form
+        onSubmit={submit} onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-md space-y-3 rounded-t-2xl border border-border bg-surface p-5 shadow-lift sm:rounded-2xl"
+      >
+        <h3 className="font-serif text-xl font-semibold tracking-tight">Deploy this build</h3>
+        <p className="text-tx-xs text-muted">
+          The build's <code className="font-mono">dist/</code> will be copied
+          to a permanent location and served at the URL below.
+        </p>
+        <label className="block">
+          <span className="text-tx-xs font-medium text-muted">Slug</span>
+          <input
+            type="text" value={slug}
+            onChange={(e) => setSlug(slugifyName(e.target.value))}
+            className="field mt-1 font-mono"
+            placeholder="weather-app" required autoFocus
+          />
+          <span className="mt-1 block text-tx-xs text-subtle">
+            URL: <span className="font-mono">https://{slug || "<slug>"}.{hostApps()}/</span>
+          </span>
+        </label>
+        <label className="block">
+          <span className="text-tx-xs font-medium text-muted">
+            Sub-app folder{" "}
+            <span className="text-subtle">(optional — leave empty for the session root)</span>
+          </span>
+          <input
+            type="text" value={projectDir}
+            onChange={(e) => setProjectDir(e.target.value)}
+            className="field mt-1 font-mono"
+            placeholder="calorie-tracker"
+          />
+        </label>
+        {err && (
+          <div className="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-tx-xs text-danger">
+            {err}
           </div>
-          {deployErr && (
-            <div className="mt-2 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
-              {deployErr}
-            </div>
-          )}
+        )}
+        <div className="flex justify-end gap-2 pt-1">
+          <button type="button" onClick={onClose} className="btn-ghost">Cancel</button>
+          <button type="submit" disabled={busy || !slug} className="btn-primary">
+            {busy ? "Deploying…" : "Deploy"}
+          </button>
         </div>
-      )}
-
-      {/* After deploy — show a one-liner confirming it's permanent + install hint. */}
-      {deployedUrl && (
-        <div className="mx-auto mt-1.5 max-w-4xl text-tx-xs text-muted">
-          Permanent URL — survives session delete. Slug: <span className="font-mono">{deployedSlug}</span>.
-          {isIOS
-            ? " On iOS, open the URL in Safari → Share → Add to Home Screen."
-            : " Open the URL in Chrome/Edge to install as a PWA."}
-        </div>
-      )}
-
-      {showUpdate && deployErr && (
-        <div className="mx-auto mt-1.5 max-w-4xl rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
-          {deployErr}
-        </div>
-      )}
-
-      {!deployedUrl && !showDeploy && !showUpdate && !turnInProgress && isIOS && (
-        <div className="mx-auto mt-1.5 max-w-4xl text-tx-xs text-muted">
-          iOS: after opening, tap the Share icon at the bottom, then
-          “Add to Home Screen”.
-        </div>
-      )}
+      </form>
     </div>
+  );
+}
+
+function slugifyName(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40);
+}
+
+function UploadIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
+    </svg>
   );
 }
 
