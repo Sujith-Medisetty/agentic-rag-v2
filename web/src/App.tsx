@@ -6,6 +6,7 @@ import ChatPage from "@/pages/ChatPage";
 import ProjectList from "@/pages/ProjectList";
 import SessionList from "@/pages/SessionList";
 import Admin from "@/pages/Admin";
+import Settings from "@/pages/Settings";
 import { SessionProvider } from "@/lib/sessionContext";
 import { GlobalToast } from "@/components/GlobalToast";
 
@@ -40,6 +41,14 @@ export default function App() {
                 check + redirects non-root users to /, so an accidental link
                 tap doesn't leak the page. */}
             <Route path="/admin" element={<Layout><Admin /></Layout>} />
+
+            {/* Settings: pause/resume toggles for all the user's deployed
+                apps, grouped by source session. Root sees every app;
+                non-root sees their own + orphans. */}
+            <Route
+              path="/settings"
+              element={<Layout><Settings /></Layout>}
+            />
 
             <Route
               path="/projects"

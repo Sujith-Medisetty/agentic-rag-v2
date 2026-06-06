@@ -99,7 +99,39 @@ async def lifespan(app: FastAPI):
     db.init_db()
     await _configure_runtime_singletons()
     _register_ojas_services()
+    _reconcile_deployed_apps_on_boot()
     yield
+
+
+def _reconcile_deployed_apps_on_boot() -> None:
+    """Bring the on-disk state of every deployed app in line with the
+    DB's `state` column. Runs once on Ojas startup.
+
+    Why this exists: a previous boot may have been killed mid-toggle,
+    leaving a deployed app's dir at the wrong path (e.g. a paused
+    app's dir still at the live path because the rename to .stopped
+    never completed). Caddy will then serve the wrong content. The
+    reconciliation is idempotent — for each row we just call
+    _apply_app_state_to_disk() which is a no-op if the dir is already
+    in the right place.
+    """
+    try:
+        with db._connect() as cx:   # noqa: SLF001
+            rows = cx.execute("SELECT slug, state FROM deployed_apps").fetchall()
+    except Exception:
+        return
+    reconciled = 0
+    for r in rows:
+        try:
+            _apply_app_state_to_disk(r["slug"], r["state"] or "running")
+            reconciled += 1
+        except Exception:
+            # One bad app shouldn't block the rest. Logged elsewhere
+            # (the toggle endpoint will surface the real error to the
+            # user when they next try to use the app).
+            pass
+    if reconciled:
+        print(f"[ojas] reconciled {reconciled} deployed app(s) to match DB state on boot")
 
 
 def _register_ojas_services() -> None:

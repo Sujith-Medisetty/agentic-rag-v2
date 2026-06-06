@@ -1011,6 +1011,9 @@ export default function ChatPage() {
           app, ...prev.filter((a) => a.slug !== app.slug),
         ])}
         onDeleted={(slug) => setDeployedApps((prev) => prev.filter((a) => a.slug !== slug))}
+        onToggled={(slug, state) => setDeployedApps((prev) =>
+          prev.map((a) => (a.slug === slug ? { ...a, state } : a))
+        )}
       />
 
       {/* Debug stream — floating raw WS event log. Use to diagnose live-event
@@ -1992,13 +1995,14 @@ function DebugStream({
 // ============================================================================
 
 function DeployStrip({
-  sessionId, sessionName, apps, onDeployed, onDeleted,
+  sessionId, sessionName, apps, onDeployed, onDeleted, onToggled,
 }: {
   sessionId: string;
   sessionName: string;
   apps: DeployedApp[];
   onDeployed: (app: DeployedApp) => void;
   onDeleted: (slug: string) => void;
+  onToggled: (slug: string, state: string) => void;
 }) {
   const [showModal, setShowModal] = useState(false);
 
@@ -2013,7 +2017,7 @@ function DeployStrip({
             </span>
           ) : (
             apps.map((a) => (
-              <DeployedAppPill key={a.slug} app={a} onDeleted={onDeleted} />
+              <DeployedAppPill key={a.slug} app={a} onDeleted={onDeleted} onToggled={onToggled} />
             ))
           )}
           <button
@@ -2050,9 +2054,12 @@ function hostApps(): string {
 }
 
 function DeployedAppPill({
-  app, onDeleted,
-}: { app: DeployedApp; onDeleted: (slug: string) => void }) {
+  app, onDeleted, onToggled,
+}: { app: DeployedApp; onDeleted: (slug: string) => void; onToggled: (slug: string, state: string) => void }) {
   const url = `${window.location.protocol}//${app.slug}.${window.location.host}/`;
+  const [busy, setBusy] = useState(false);
+  const state = app.state ?? "running";
+  const isOff = state === "stopped" || state === "error";
   const remove = async () => {
     if (!confirm(`Take down ${app.slug}? The public URL will stop working.`)) return;
     try {
@@ -2062,12 +2069,47 @@ function DeployedAppPill({
       alert(`Delete failed: ${e?.message ?? "unknown"}`);
     }
   };
+  const toggle = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const next = isOff
+        ? await deployedAppsApi.start(app.slug)
+        : await deployedAppsApi.stop(app.slug);
+      onToggled(app.slug, next.state);
+    } catch (e: any) {
+      alert(`Toggle failed: ${e?.message ?? "unknown"}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  // State dot colour mirrors the Settings page badge so the user
+  // gets the same vocabulary across both surfaces.
+  const dotClass =
+    state === "running"  ? "bg-emerald-500" :
+    state === "starting" ? "bg-amber-500" :
+    state === "error"    ? "bg-rose-500" :
+                           "bg-zinc-500";
+  const pillClass =
+    state === "running"  ? "border-success/30 bg-success/10 text-success" :
+    state === "stopped"  ? "border-border bg-elevated text-muted" :
+                           "border-border bg-elevated text-muted";
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-md border border-success/30 bg-success/10 px-2 py-1 text-tx-xs">
-      <span className="font-mono text-success" title={url}>{app.slug}</span>
+    <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-tx-xs ${pillClass}`}>
+      <button
+        type="button"
+        onClick={toggle}
+        disabled={busy || state === "starting"}
+        aria-label={isOff ? "Bring online" : "Pause"}
+        title={isOff ? "Paused — click to bring online" : "Running — click to pause"}
+        className="inline-flex items-center"
+      >
+        <span className={`inline-block size-2 rounded-full transition-opacity ${dotClass} ${busy ? "opacity-50" : ""}`} />
+      </button>
+      <span className="font-mono" title={url}>{app.slug}</span>
       <a
         href={url} target="_blank" rel="noreferrer"
-        className="text-text hover:text-accent" title="Open"
+        className="hover:text-accent" title="Open"
       >↗</a>
       <button
         type="button" onClick={remove}

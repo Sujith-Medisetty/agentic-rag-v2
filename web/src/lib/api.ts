@@ -194,6 +194,27 @@ export interface DeployedApp {
   deployed_at: number;
   last_redeploy_at: number;
   project_dir: string | null;
+  // State machine: running | stopped | starting | error.
+  state: string;
+  last_state_at: number | null;
+  last_health_at: number | null;
+  error_message: string | null;
+  service_name: string | null;
+  port: number | null;
+}
+
+export interface DeployState {
+  slug: string;
+  state: string;
+  last_state_at: number | null;
+  last_health_at: number | null;
+  error_message: string | null;
+}
+
+export interface DeployedAppsBySession {
+  session_id: string | null;
+  session_name: string;
+  deployed_apps: DeployedApp[];
 }
 
 // The dist-auto-detection endpoint. The dialog pre-fills and locks the
@@ -225,6 +246,26 @@ export const deployedAppsApi = {
       `/api/deployed-apps/${encodeURIComponent(slug)}`,
       { method: "DELETE" },
     ),
+  // Pause / resume. Static apps (the only kind in v1) just swap a
+  // directory on disk; v1.1 fullstack apps will additionally start/stop
+  // a per-app systemd unit (transparent to the UI).
+  start: (slug: string) =>
+    request<DeployState>(
+      `/api/deployed-apps/${encodeURIComponent(slug)}/start`,
+      { method: "POST" },
+    ),
+  stop: (slug: string) =>
+    request<DeployState>(
+      `/api/deployed-apps/${encodeURIComponent(slug)}/stop`,
+      { method: "POST" },
+    ),
+  state: (slug: string) =>
+    request<DeployState>(
+      `/api/deployed-apps/${encodeURIComponent(slug)}/state`,
+    ),
+  // Grouped by source session for the Settings page.
+  mine: () =>
+    request<DeployedAppsBySession[]>("/api/users/me/deployed-apps"),
   // Deploy is per-session — convenience method lives on sessionApi below.
 };
 
