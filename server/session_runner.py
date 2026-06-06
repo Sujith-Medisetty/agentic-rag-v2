@@ -540,7 +540,13 @@ async def _maybe_auto_rename(session_id: str) -> None:
     """If the session is still on a default name, ask the LLM for a
     descriptive title and rename. Idempotent: runs at most once per
     session (tracked in _AUTO_RENAME_HISTORY so we don't burn tokens
-    on every subsequent turn if the rename failed)."""
+    on every subsequent turn if the rename failed).
+
+    Cost guarantee: the LLM is ONLY called when the session name
+    still looks like a default placeholder ("Chat <date>, <time>" or
+    "Session <date>, <time>"). If the user has already given the
+    session a custom name (e.g. "Fix login bug"), this is a no-op —
+    the user's intent is preserved."""
     if session_id in _AUTO_RENAME_HISTORY:
         return
     _AUTO_RENAME_HISTORY.add(session_id)
