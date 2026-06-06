@@ -11,6 +11,7 @@ import { projectsApi, sessionsApi, sessionApi, authApi, ApiError } from "@/lib/a
 import type { AuthUser } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import type { Project, Session } from "@/lib/types";
+import { useSessions } from "@/lib/sessionContext";
 
 export default function Workspace() {
   const navigate = useNavigate();
@@ -20,7 +21,12 @@ export default function Workspace() {
   const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
   activeSessionIdRef.current = activeSessionId;
   const [project, setProject] = useState<Project | null>(null);
-  const [sessions, setSessions] = useState<Session[]>([]);
+  // Sessions live in a shared Context (see lib/sessionContext.tsx) so the
+  // chat page can update the sidebar's view of the same list — no prop
+  // drilling, no window events, just React. We read from
+  // sessionsStore.list(project.id) for the render and call
+  // sessionsStore.setAll / add / remove / rename for writes.
+  const sessionsStore = useSessions();
   const [me, setMe] = useState<AuthUser | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
@@ -43,55 +49,12 @@ export default function Workspace() {
     existingId: string;
     existingName: string;
   } | null>(null);
-  // Toast for auto-suffix notifications ("renamed to X because Y was
-  // taken"). Auto-dismisses after 4s. Used by both user-driven and
-  // agent-driven renames.
-  const [toast, setToast] = useState<{ kind: "info" | "warn"; message: string } | null>(null);
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(null), 4000);
-    return () => clearTimeout(t);
-  }, [toast]);
-
   useEffect(() => {
     if (editingId && editInputRef.current) {
       editInputRef.current.focus();
       editInputRef.current.select();
     }
   }, [editingId]);
-
-  // Live session name sync. ChatPage dispatches a window CustomEvent
-  // `ojas:session-renamed` whenever the server reports a rename (either
-  // from the user's inline PATCH or the background LLM-suggested
-  // rename). We update our local sessions list so the sidebar reflects
-  // the new name WITHOUT the user having to navigate away + back.
-  // Also shows a toast for the auto-suffix case (matches the inline
-  // rename UX in SessionList.tsx).
-  useEffect(() => {
-    const onRenamed = (ev: Event) => {
-      const detail = (ev as CustomEvent<{
-        session_id: string;
-        new_name: string;
-        previous_name: string;
-        was_suffixed: boolean;
-      }>).detail;
-      if (!detail?.session_id) return;
-      setSessions((cur) =>
-        cur.map((s) =>
-          s.id === detail.session_id ? { ...s, name: detail.new_name } : s,
-        ),
-      );
-      if (detail.was_suffixed && detail.new_name !== detail.previous_name) {
-        setToast({
-          kind: "info",
-          message: `Renamed to "${detail.new_name}" — "${detail.previous_name}" was already taken.`,
-        });
-      }
-    };
-    window.addEventListener("ojas:session-renamed", onRenamed);
-    return () => window.removeEventListener("ojas:session-renamed", onRenamed);
-  }, []);
-
 
   // Bootstrap: resolve default project + its sessions + the logged-in user.
   // The /me lookup is what tells the sidebar whether to show the Admin link.
@@ -108,18 +71,20 @@ export default function Workspace() {
         setMe(user);
         const ss = await sessionsApi.list(p.id);
         if (cancelled) return;
-        // Merge: if startNew() ran while we were loading, the new session is
-        // already in local state but not in `ss` (which is a stale snapshot).
-        // Keep locally-added sessions so they don't vanish from the sidebar.
-        setSessions(prev => {
-          const apiIds = new Set(ss.map(s => s.id));
-          const localOnly = prev.filter(s => !apiIds.has(s.id));
+        // Merge: if startNew() ran while we were loading, the new session
+        // is already in the context (from sessions.add()) but not in
+        // `ss` (a stale snapshot). Keep locally-added sessions so they
+        // don't vanish from the sidebar.
+        sessionsStore.setAll(p.id, (() => {
+          const apiIds = new Set(ss.map((s) => s.id));
+          const localOnly = sessionsStore.list(p.id).filter(
+            (s) => !apiIds.has(s.id),
+          );
           return localOnly.length > 0 ? [...localOnly, ...ss] : ss;
-        });
+        })());
         // Auto-open the most recent session when the user lands with no
         // session selected (e.g. logging in on a new device). Use the ref
-        // so we read the *current* URL param, not the stale closure value
-        // (which would be wrong if startNew() navigated while we were loading).
+        // so we read the *current* URL param, not the stale closure value.
         if (ss.length > 0 && !activeSessionIdRef.current) {
           navigate(`/s/${ss[0].id}`, { replace: true });
         }
@@ -128,6 +93,7 @@ export default function Workspace() {
       }
     })();
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const startNew = async () => {
@@ -137,7 +103,7 @@ export default function Workspace() {
         project.id,
         `Chat ${new Date().toLocaleString()}`,
       );
-      setSessions((prev) => [s, ...prev]);
+      sessionsStore.add(project.id, s);
       navigate(`/s/${s.id}`);
       // On mobile auto-close the sidebar after picking a session.
       if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
@@ -156,7 +122,7 @@ export default function Workspace() {
     try {
       await sessionApi.cancel(sid).catch(() => {});
       await sessionsApi.remove(sid);
-      setSessions((prev) => prev.filter((s) => s.id !== sid));
+      sessionsStore.remove(sid);
       if (activeSessionId === sid) navigate("/");
     } catch (e: any) {
       setLoadErr(e?.message ?? "delete failed");
@@ -181,10 +147,9 @@ export default function Workspace() {
     try {
       const { session, wasSuffixed, actualName } =
         await sessionsApi.renameWithSufStatus(s.id, trimmed);
-      setSessions((cur) => cur.map((x) => (x.id === s.id ? session : x)));
+      sessionsStore.rename(s.id, session.name);
       if (wasSuffixed && actualName !== trimmed) {
-        setToast({
-          kind: "info",
+        sessionsStore.setToast({
           message: `Renamed to "${actualName}" — "${trimmed}" was already taken.`,
         });
       }
@@ -266,8 +231,14 @@ export default function Workspace() {
         </div>
 
         {/* Sessions list — clean single-line rows under a small "Recents"
-            label so the section reads at a glance, Claude-style. */}
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
+            label so the section reads at a glance, Claude-style. The list
+            itself is read from the shared SessionContext so updates from
+            the chat page (LLM rename, auto-suffix) flow in here without
+            any prop drilling or window events. */}
+        {project && (() => {
+          const sessions = sessionsStore.list(project.id);
+          return (
+            <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
           {loadErr && (
             <div className="mx-1 mb-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-tx-xs text-danger">
               {loadErr}
@@ -365,6 +336,8 @@ export default function Workspace() {
             </ul>
           )}
         </div>
+          );
+        })()}
 
         {/* Footer — workspace path, optional Admin link for root, Log out. */}
         <div className="border-t border-border px-3 py-3">
@@ -497,19 +470,6 @@ export default function Workspace() {
           existingId={conflict.existingId}
           onClose={() => setConflict(null)}
         />
-      )}
-
-      {/* Auto-suffix toast — informs the user the server picked X-2/X-3
-          because their desired name was already taken. */}
-      {toast && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-info/40 bg-info/10 px-4 py-2 text-sm text-text shadow-lg backdrop-blur"
-        >
-          <span aria-hidden="true" className="mr-2">ℹ️</span>
-          {toast.message}
-        </div>
       )}
     </div>
   );

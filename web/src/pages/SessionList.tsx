@@ -3,12 +3,16 @@ import { Link, useParams, useNavigate } from "react-router-dom";
 import { projectsApi, sessionsApi, ApiError } from "@/lib/api";
 import type { Project, Session } from "@/lib/types";
 import ProjectSettings from "@/components/ProjectSettings";
+import { useSessions } from "@/lib/sessionContext";
 
 export default function SessionList() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
   const [project, setProject] = useState<Project | null>(null);
-  const [sessions, setSessions] = useState<Session[]>([]);
+  // Sessions live in the shared SessionContext — same one the chat page
+  // writes to. We just read here; the chat page's WS handler does the
+  // writes via context.
+  const sessionsStore = useSessions();
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -30,15 +34,6 @@ export default function SessionList() {
     existingId: string;
     existingName: string;
   } | null>(null);
-  // Toast for auto-suffix notifications ("renamed to X because Y was
-  // taken"). Auto-dismisses after 4s.
-  const [toast, setToast] = useState<{ kind: "info" | "warn"; message: string } | null>(null);
-  useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(null), 4000);
-    return () => clearTimeout(t);
-  }, [toast]);
-
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
@@ -52,7 +47,7 @@ export default function SessionList() {
         ]);
         if (cancelled) return;
         setProject(p);
-        setSessions(ss);
+        sessionsStore.setAll(projectId, ss);
       } catch (e: any) {
         if (!cancelled) setErr(e?.message ?? "failed to load");
       } finally {
@@ -71,35 +66,6 @@ export default function SessionList() {
       editInputRef.current.select();
     }
   }, [editingId]);
-
-  // Live session name sync — ChatPage dispatches a window CustomEvent
-  // `ojas:session-renamed` whenever the server reports a rename
-  // (background LLM-suggested rename or inline PATCH). Update the list
-  // row in place + show a toast for the auto-suffix case.
-  useEffect(() => {
-    const onRenamed = (ev: Event) => {
-      const detail = (ev as CustomEvent<{
-        session_id: string;
-        new_name: string;
-        previous_name: string;
-        was_suffixed: boolean;
-      }>).detail;
-      if (!detail?.session_id) return;
-      setSessions((cur) =>
-        cur.map((s) =>
-          s.id === detail.session_id ? { ...s, name: detail.new_name } : s,
-        ),
-      );
-      if (detail.was_suffixed && detail.new_name !== detail.previous_name) {
-        setToast({
-          kind: "info",
-          message: `Renamed to "${detail.new_name}" — "${detail.previous_name}" was already taken.`,
-        });
-      }
-    };
-    window.addEventListener("ojas:session-renamed", onRenamed);
-    return () => window.removeEventListener("ojas:session-renamed", onRenamed);
-  }, []);
 
   const startNew = async () => {
     if (!projectId) return;
@@ -141,12 +107,11 @@ export default function SessionList() {
     try {
       const { session, wasSuffixed, actualName } =
         await sessionsApi.renameWithSufStatus(s.id, trimmed);
-      setSessions((cur) => cur.map((x) => (x.id === s.id ? session : x)));
+      sessionsStore.rename(s.id, session.name);
       if (wasSuffixed && actualName !== trimmed) {
         // Server auto-suffixed the name to avoid a collision (X → X-2,
         // X-3, …). Show a small toast telling the user what happened.
-        setToast({
-          kind: "info",
+        sessionsStore.setToast({
           message: `Renamed to "${actualName}" — "${trimmed}" was already taken.`,
         });
       }
@@ -164,7 +129,7 @@ export default function SessionList() {
     )) return;
     try {
       await sessionsApi.remove(s.id);
-      setSessions((prev) => prev.filter((x) => x.id !== s.id));
+      sessionsStore.remove(s.id);
     } catch (e: any) {
       setErr(e?.message ?? "delete failed");
     }
@@ -221,7 +186,7 @@ export default function SessionList() {
         </div>
       )}
 
-      {!loading && !err && sessions.length === 0 && (
+      {!loading && !err && (projectId ? sessionsStore.list(projectId) : []).length === 0 && (
         <div className="glass-card-soft p-10 text-center">
           <div className="text-base text-text">No sessions yet</div>
           <div className="mt-1 text-sm text-muted">
@@ -231,7 +196,7 @@ export default function SessionList() {
       )}
 
       <div className="grid gap-2.5">
-        {sessions.map((s) => {
+        {(projectId ? sessionsStore.list(projectId) : []).map((s) => {
           const isEditing = editingId === s.id;
           return (
             <div
@@ -334,19 +299,6 @@ export default function SessionList() {
           projectId={projectId ?? ""}
           onClose={() => setConflict(null)}
         />
-      )}
-
-      {/* Auto-suffix toast — informs the user the server picked X-2/X-3
-          because their desired name was already taken. */}
-      {toast && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-info/40 bg-info/10 px-4 py-2 text-sm text-text shadow-lg backdrop-blur"
-        >
-          <span aria-hidden="true" className="mr-2">ℹ️</span>
-          {toast.message}
-        </div>
       )}
     </div>
   );
