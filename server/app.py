@@ -236,13 +236,19 @@ def _register_ojas_services() -> None:
     #    dev mode). Re-register every row on disk so the panel stays
     #    accurate even if the backend was restarted.
     OJAS_APPS_ROOT.mkdir(parents=True, exist_ok=True)
+    # Resolve the apps root domain once. Apps live at <slug>.<apps_root>
+    # — separate from the apex (the Ojas main URL) so users can host
+    # apps on a different domain if they want.
+    apps_root = _resolve_apps_root_domain() or public_domain
     for app_row in db.list_deployed_apps(owner_user_id=None):
         slug = app_row["slug"]
-        # Build a clickable public URL using the resolved public domain.
-        # Falls back to the bare path if we can't determine the domain.
+        # Build a clickable public URL using the resolved apps root.
+        # Falls back to the legacy /apps/<slug>/ subpath when no
+        # public domain is resolved (e.g. local dev). Same backend
+        # serves both routes so old links don't break.
         deployed_url: str | None = None
-        if public_domain:
-            deployed_url = f"https://{public_domain}/apps/{slug}/"
+        if apps_root:
+            deployed_url = f"https://{slug}.{apps_root}/"
         else:
             deployed_url = f"/apps/{slug}/"
         db.upsert_ojas_service(
@@ -1485,6 +1491,27 @@ OJAS_APPS_ROOT = Path("/opt/ojas-apps")
 OJAS_DOMAIN: str | None = None
 OJAS_DOMAIN_OVERRIDE: str | None = os.getenv("OJAS_DOMAIN", "").strip() or None
 
+# Root domain for deployed-app subdomains. Each deployed app gets its own
+# subdomain at https://<slug>.<OJAS_APPS_ROOT_DOMAIN>/ (e.g.
+# https://weather.ojas.karmacode.cloud/). Caddy uses the on-demand TLS
+# ask endpoint to validate and provision certs for these subdomains.
+#
+# IMPORTANT: this is NOT auto-derived from OJAS_DOMAIN. A user might run
+# the Ojas apex at `ojas.karmacode.cloud` (the standard) but want apps at
+# `ojas.karmacode.cloud` (apps live alongside the apex) OR at
+# `karmacode.cloud` (apps live on the bare domain). The right answer
+# depends on the user's DNS + Caddyfile, so we make it explicit.
+#
+# Resolution order:
+#   1. OJAS_APPS_ROOT_DOMAIN env var (set by install.sh)
+#   2. Auto-derive: if OJAS_DOMAIN is set, assume apps live at the
+#      same domain. (Override if your setup differs.)
+#   3. None (caller falls back to <slug>.<OJAS_DOMAIN> or request host)
+OJAS_APPS_ROOT_DOMAIN: str | None = None
+OJAS_APPS_ROOT_DOMAIN_OVERRIDE: str | None = (
+    os.getenv("OJAS_APPS_ROOT_DOMAIN", "").strip() or None
+)
+
 
 def _resolve_public_domain() -> str | None:
     """Find the public hostname the user reaches Ojas at. Order:
@@ -1509,6 +1536,22 @@ def _resolve_public_domain() -> str | None:
                             return host
         except OSError:
             continue
+    return None
+
+
+def _resolve_apps_root_domain() -> str | None:
+    """Find the root domain under which deployed apps are served at
+    https://<slug>.<root>/. Order:
+    1. OJAS_APPS_ROOT_DOMAIN env var (explicit override)
+    2. Fall back to OJAS_DOMAIN — if apps live alongside the apex
+       (the most common setup), they share the same root.
+    3. None (caller will use a sensible default like <slug>.<OJAS_DOMAIN>).
+    """
+    if OJAS_APPS_ROOT_DOMAIN_OVERRIDE:
+        return OJAS_APPS_ROOT_DOMAIN_OVERRIDE
+    apex = _resolve_public_domain()
+    if apex:
+        return apex
     return None
 
 
@@ -1600,14 +1643,18 @@ def sessions_deploy(
         )
 
     # 5. Build the URL. Prefer the canonical subdomain form
-    # `https://<slug>.<root>/` — that's the user-facing URL the deploy
-    # button shows in the chat. Fall back to the legacy `/apps/<slug>/`
-    # subpath when no public domain is resolved (e.g. local dev). Same
-    # backend serves both routes so old links don't break.
+    # `https://<slug>.<apps_root>/` — that's the user-facing URL the
+    # deploy button shows in the chat. The apps_root domain is
+    # separately configurable from OJAS_DOMAIN so users can host apps
+    # on a different domain than the apex (e.g. apex at
+    # ojas.karmacode.cloud but apps at apps.karmacode.cloud). Falls
+    # back to the legacy `/apps/<slug>/` subpath when no public
+    # domain is resolved (e.g. local dev). Same backend serves both
+    # routes so old links don't break.
     scheme = "https"
-    resolved = _resolve_public_domain()
-    if resolved:
-        subdomain_url = f"{scheme}://{slug}.{resolved}/"
+    apps_root = _resolve_apps_root_domain() or _resolve_public_domain()
+    if apps_root:
+        subdomain_url = f"{scheme}://{slug}.{apps_root}/"
         deployed_service_url = subdomain_url
     else:
         host = request.headers.get("host", request.url.netloc)
@@ -2068,13 +2115,16 @@ def health():
 @app.get("/internal/caddy-ask")
 def caddy_ask(domain: str = Query(...)):
     """Caddy hits us with ?domain=<host>. We accept only registered slugs
-    on the configured public domain. 200 = OK to mint cert, 404 = decline."""
+    on the configured apps root domain. 200 = OK to mint cert, 404 = decline."""
     if not domain:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no domain")
     domain = domain.strip().lower()
-    root = (_resolve_public_domain() or "").lower()
+    # Apps-root domain. Apps live at <slug>.<apps_root>. The apex
+    # (OJAS_DOMAIN) is a separate thing — apps may share it OR live
+    # on a different domain entirely.
+    root = (_resolve_apps_root_domain() or _resolve_public_domain() or "").lower()
     if root and not domain.endswith("." + root):
-        # Not under our root — reject.
+        # Not under our apps root — reject.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not our domain")
     # Extract the slug (the leftmost label).
     slug = domain.split(".", 1)[0]

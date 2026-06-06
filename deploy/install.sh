@@ -26,6 +26,11 @@ OJAS_BRANCH="${OJAS_BRANCH:-master}"
 OJAS_DIR="${OJAS_DIR:-/opt/ojas}"
 OJAS_USER="${OJAS_USER:-ojas}"
 OJAS_DOMAIN="${OJAS_DOMAIN:-ojas.example.com}"
+# Root domain under which deployed apps are served at <slug>.<apps_root>/.
+# Defaults to the apex (most common setup) but can be different — e.g.
+# apex at ojas.example.com but apps at apps.example.com. If you set this
+# explicitly, also set the matching `*.apps_root` DNS A record.
+OJAS_APPS_ROOT_DOMAIN="${OJAS_APPS_ROOT_DOMAIN:-$OJAS_DOMAIN}"
 
 # ---- Style ----------------------------------------------------------------
 
@@ -140,9 +145,14 @@ install -o root -g root -m 644 "${OJAS_DIR}/deploy/ojas-backend.service" \
 ok "Unit file installed"
 
 banner "Installing Caddyfile"
-sed "s/ojas\\.example\\.com/${OJAS_DOMAIN}/g" \
+# Two substitutions: the apex domain + the apps-root domain (may be
+# the same). The Caddyfile template has `ojas.example.com` for the apex
+# AND `*.ojas.example.com` for the wildcard subdomain block; we sed
+# both to the configured values.
+sed -e "s/ojas\\.example\\.com/${OJAS_DOMAIN}/g" \
+    -e "s|\\*\\.ojas\\.example\\.com|\\*.${OJAS_APPS_ROOT_DOMAIN}|g" \
     "${OJAS_DIR}/deploy/Caddyfile" > /etc/caddy/Caddyfile
-ok "Caddyfile installed for domain: ${OJAS_DOMAIN}"
+ok "Caddyfile installed — apex: ${OJAS_DOMAIN}, apps: *.${OJAS_APPS_ROOT_DOMAIN}"
 
 # ---- 7. .env reminder -----------------------------------------------------
 
