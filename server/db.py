@@ -142,25 +142,28 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
 );
 
 -- Deployed apps: a session's built dist/ "promoted" to a persistent location
--- under /opt/ojas-apps/<slug>/. Decoupled from the session — when the source
--- session is deleted, the deployed app survives (owner_user_id falls back
--- via ON DELETE SET NULL). Slug is the public URL component
--- (https://<host>/apps/<slug>/), unique across the install.
+-- under /opt/ojas-apps/<slug>/. Slug is the public URL component AND now
+-- the subdomain (https://<slug>.<root-domain>/). Lifecycle is tied to
+-- the source session: deleting that session removes the deployed app
+-- (DB row + on-disk files) — user explicitly asked for this so an app
+-- never outlives the chat that produced it.
 CREATE TABLE IF NOT EXISTS deployed_apps (
     slug                 TEXT    PRIMARY KEY,
     name                 TEXT    NOT NULL,
-    -- Source session is kept ONLY as a back-reference for the UI ("you
-    -- deployed this from session X"); nullable so deleting the source
-    -- session doesn't cascade-kill the deployed app.
-    source_session_id    TEXT,
+    source_session_id    TEXT             REFERENCES sessions(id) ON DELETE CASCADE,
     source_project_id    TEXT,
     owner_user_id        TEXT             REFERENCES users(id) ON DELETE SET NULL,
+    -- Sub-app folder name within the session's workspace_subdir. Lets a
+    -- single chat session deploy multiple apps independently.
+    project_dir          TEXT,
     app_dir              TEXT    NOT NULL,
     deployed_at          INTEGER NOT NULL,
     last_redeploy_at     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_deployed_apps_owner
     ON deployed_apps(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_deployed_apps_session
+    ON deployed_apps(source_session_id);
 """
 
 
@@ -172,12 +175,28 @@ def init_db() -> None:
         _migrate_projects(cx)
         _migrate_sessions(cx)
         _migrate_auth_tokens(cx)
+        _migrate_deployed_apps(cx)
         # Indexes that reference columns added in migrations must be created
         # AFTER those columns exist on legacy DBs.
         cx.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_user "
             "ON sessions(user_id, last_active_at DESC)"
         )
+        cx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deployed_apps_session "
+            "ON deployed_apps(source_session_id)"
+        )
+
+
+def _migrate_deployed_apps(cx: sqlite3.Connection) -> None:
+    """Add `project_dir` column to legacy deployed_apps tables. SQLite can't
+    change a column's REFERENCES clause via ALTER, so the cascade-on-session
+    behaviour only applies to NEW rows; pre-existing rows fall back to the
+    old SET NULL semantics (still purged on explicit session-delete via the
+    `_purge_deployed_apps_for_session` helper)."""
+    cols = {row["name"] for row in cx.execute("PRAGMA table_info(deployed_apps)")}
+    if "project_dir" not in cols:
+        cx.execute("ALTER TABLE deployed_apps ADD COLUMN project_dir TEXT")
 
 
 def _migrate_projects(cx: sqlite3.Connection) -> None:

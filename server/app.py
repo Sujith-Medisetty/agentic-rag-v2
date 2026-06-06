@@ -823,12 +823,43 @@ def _kill_session_processes(session_id: str) -> None:
         db.unregister_process(pid)
 
 
+def _purge_deployed_apps_for_session(session_id: str) -> None:
+    """SIGTERM-nothing, but rmtree every deployed_apps `app_dir` rooted in
+    this session AND delete the DB rows so the public subdomain stops
+    resolving. Best-effort. The schema's ON DELETE CASCADE (on new rows
+    only) also handles the row drop; we explicitly delete here so the
+    semantics are identical for legacy rows too."""
+    import shutil
+    try:
+        # Inline SQL because db.list_deployed_apps doesn't filter by session.
+        with db._connect() as cx:   # noqa: SLF001 — internal helper, fine here
+            rows = cx.execute(
+                "SELECT slug, app_dir FROM deployed_apps "
+                "WHERE source_session_id = ?",
+                (session_id,),
+            ).fetchall()
+        for row in rows:
+            app_dir = row["app_dir"]
+            if app_dir:
+                try:
+                    shutil.rmtree(app_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            try:
+                db.delete_deployed_app(row["slug"])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _purge_session_everything(session: dict) -> None:
     """One-stop cleanup for everything tied to a session OUTSIDE the main
     SQLite (which CASCADE handles). Idempotent + best-effort — none of
     these can fail the API call."""
     sid = session["id"]
     _kill_session_processes(sid)
+    _purge_deployed_apps_for_session(sid)
     _purge_session_workspace_subdir(session)
     _purge_session_state_dir(sid)
     _purge_langgraph_checkpoint(sid)
@@ -1568,19 +1599,20 @@ def sessions_deploy(
             owner_user_id=user["id"],
         )
 
-    # 5. Build the URL. Use the request's scheme + host so it works behind
-    # Caddy (forwarded headers handled by the uvicorn --proxy-headers flag).
-    scheme = request.url.scheme
-    host = request.headers.get("host", request.url.netloc)
-    # 6. Register the new app in ojas_services so the admin panel sees it
-    #    immediately (no need to wait for a backend restart). Prefer the
-    #    resolved public domain for the clickable URL so the admin panel
-    #    always shows the canonical link, not a localhost.
-    resolved = _resolve_public_domain() or host
-    if resolved and not resolved.startswith("http"):
-        deployed_service_url = f"{scheme}://{resolved}/apps/{slug}/"
+    # 5. Build the URL. Prefer the canonical subdomain form
+    # `https://<slug>.<root>/` — that's the user-facing URL the deploy
+    # button shows in the chat. Fall back to the legacy `/apps/<slug>/`
+    # subpath when no public domain is resolved (e.g. local dev). Same
+    # backend serves both routes so old links don't break.
+    scheme = "https"
+    resolved = _resolve_public_domain()
+    if resolved:
+        subdomain_url = f"{scheme}://{slug}.{resolved}/"
+        deployed_service_url = subdomain_url
     else:
-        deployed_service_url = f"/apps/{slug}/"
+        host = request.headers.get("host", request.url.netloc)
+        deployed_service_url = f"{request.url.scheme}://{host}/apps/{slug}/"
+        subdomain_url = deployed_service_url
     db.upsert_ojas_service(
         id=f"deployed:{slug}",
         source="ojas-deployed",
@@ -1600,7 +1632,7 @@ def sessions_deploy(
     )
     return DeployResponse(
         slug=slug,
-        url=f"{scheme}://{host}/apps/{slug}/",
+        url=subdomain_url,
         app=DeployedAppResponse(**app_row),
     )
 
@@ -2023,6 +2055,32 @@ def _listening_ports_system_wide() -> list[tuple[int, str, int | None]]:
 @app.get("/api/health")
 def health():
     return {"ok": True, "needs_setup": auth.needs_setup()}
+
+
+# ============================================================================
+# Caddy on-demand TLS ask endpoint.
+# Caddy calls this for every NEW hostname before fetching a Let's Encrypt
+# cert. We say "yes" only for slugs we've actually deployed, so typo'd /
+# malicious subdomains can't burn through Let's Encrypt rate limits.
+# Bound to 127.0.0.1 in the Caddyfile, no auth needed.
+# ============================================================================
+
+@app.get("/internal/caddy-ask")
+def caddy_ask(domain: str = Query(...)):
+    """Caddy hits us with ?domain=<host>. We accept only registered slugs
+    on the configured public domain. 200 = OK to mint cert, 404 = decline."""
+    if not domain:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no domain")
+    domain = domain.strip().lower()
+    root = (_resolve_public_domain() or "").lower()
+    if root and not domain.endswith("." + root):
+        # Not under our root — reject.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not our domain")
+    # Extract the slug (the leftmost label).
+    slug = domain.split(".", 1)[0]
+    if not slug or not db.get_deployed_app(slug):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such app")
+    return {"ok": True}
 
 
 @app.get("/api/debug/whoami")

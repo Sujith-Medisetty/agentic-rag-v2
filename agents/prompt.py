@@ -403,6 +403,22 @@ def get_frontend_ui_quality_section() -> str:
         "done, run `grep -r InstallButton src/` and confirm BOTH the "
         "component file exists AND it's imported + rendered in the main "
         "layout. If either check fails, fix it before finishing the turn.",
+        "- **Multi-app sessions: project-folder naming.** A single session "
+        "can host multiple apps. Each lives in its OWN subfolder inside the "
+        "session's workspace (sibling to other apps the user has asked "
+        "for). When creating a new app folder: (a) pick a short kebab-case "
+        "name derived from what the user asked for (e.g. `calorie-tracker`, "
+        "`weather-widget`); (b) if a folder by that name already exists in "
+        "the workspace, append `-2`, then `-3`, etc. until you find a free "
+        "slot — DO NOT overwrite an existing app. Run `ls` first to check; "
+        "the agent's workspace is the cwd of every bash call.",
+        "- **Deploy URL pattern.** When the user deploys an app via Ojas's "
+        "Deploy button, it ends up at "
+        "`https://<slug>.<root-domain>/` (subdomain, full HTTPS, Let's "
+        "Encrypt provisioned on first visit ~3s). After producing a build "
+        "you may mention this in your final summary as the install path. "
+        "Do NOT try to deploy yourself — the user decides when to promote "
+        "a sub-app to a public URL via the UI button.",
         "- **Native-feel chrome when installed**: `<meta name=\"theme-color\">` "
         "matched to the app's top color so the iOS notch / Android status "
         "bar blends; `<meta name=\"apple-mobile-web-app-capable\" "
