@@ -75,11 +75,14 @@
 	# The workaround is to encode the slug into the REQUEST PATH (which
 	# file_server DOES resolve at request time) via `rewrite`, then
 	# serve from a static base directory. `try_files` provides the SPA
-	# fallback to /<slug>/index.html.
+	# fallback to /<slug>/index.html. The third fallback `/.paused/index.html`
+	# kicks in when the slug's dir has been renamed to `/opt/ojas-apps/.stopped/<slug>/`
+	# by the toggle endpoint in server/app.py (deployed_app_stop), so
+	# paused apps serve a friendly "this app is paused" page instead of 404.
 	handle {
 		rewrite * /{labels.3}{uri}
 		root * /opt/ojas-apps
-		try_files {path} /{labels.3}/index.html
+		try_files {path} /{labels.3}/index.html /.paused/index.html
 		file_server
 	}
 }

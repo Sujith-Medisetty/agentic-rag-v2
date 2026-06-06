@@ -80,6 +80,7 @@ from server.reporter import WebReporter, get_bus
 from pydantic import BaseModel
 from server.schemas import (
     AuthStatusResponse, DeployRequest, DeployResponse, DeployedAppResponse,
+    DeployStateResponse, DeployedAppsBySession,
     EventResponse, GitInfoResponse, LoginRequest,
     LoginResponse, MessagePostRequest, MessageResponse, OjasServiceResponse,
     ProcessResponse, ProjectCreateRequest, ProjectResponse, ProjectSettingsRequest,
@@ -846,14 +847,23 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
                 (session_id,),
             ).fetchall()
         for row in rows:
-            app_dir = row["app_dir"]
-            if app_dir:
-                try:
-                    shutil.rmtree(app_dir, ignore_errors=True)
-                except Exception:
-                    pass
+            slug = row["slug"]
+            # Stop the systemd unit first (v1.1 fullstack) so the
+            # process releases its files before we rmtree. v1 is
+            # static-only so this is a no-op; service_name is NULL.
+            row_full = db.get_deployed_app(slug) or {}
+            _stop_app_service(row_full)
+            # The app dir is at /opt/ojas-apps/<slug>/. If the app was
+            # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
+            # instead — wipe both.
+            for d in (row["app_dir"], str(OJAS_APPS_STOPPED_DIR / slug)):
+                if d and Path(d).exists():
+                    try:
+                        shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
             try:
-                db.delete_deployed_app(row["slug"])
+                db.delete_deployed_app(slug)
             except Exception:
                 pass
     except Exception:
@@ -913,14 +923,23 @@ def projects_delete(project_id: str, user: dict = Depends(require_user)):
 @app.delete("/api/sessions/{session_id}")
 def sessions_delete(session_id: str, user: dict = Depends(require_user)):
     """Delete one session AND its subdir + processes + agent state +
-    checkpoint + bus. Sibling sessions are untouched."""
+    checkpoint + bus. Sibling sessions are untouched.
+
+    Order matters: we run the filesystem purge FIRST (while deployed_apps
+    rows still exist so we can find their on-disk paths and rmtree
+    them), THEN delete the session row (which CASCADEs the deployed_apps
+    rows away). If we did it the other way, the cascade would wipe the
+    rows before we knew which dirs to clean up, and the .stopped/
+    fallback dirs would survive on disk forever."""
     session = _session_or_404(session_id, user)
     task = _active_turns.get(session_id)
     if task is not None and not task.done():
         task.cancel()
+    # 1. Filesystem cleanup while rows still exist
+    _purge_session_everything(session)
+    # 2. Session row → cascades to deployed_apps (rows gone after this)
     if not db.delete_session(session_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
-    _purge_session_everything(session)
     return {"ok": True}
 
 
@@ -1660,6 +1679,130 @@ def _deployed_app_or_404(slug: str, user: dict) -> dict:
     return app
 
 
+# ---- Systemd service helpers (v1.1 fullstack; stubs for v1) -------------
+#
+# These are placeholders that succeed for static apps and would shell out
+# to `systemctl` once the per-app backend process lands in v1.1. Keeping
+# the call sites in place now means toggling starts working as soon as the
+# toggle endpoints + Caddy regen land; the systemd paths light up
+# automatically when deploys start writing `service_name` and `port`.
+
+def _start_app_service(app: dict) -> bool:
+    """Start the systemd unit for a fullstack app. Returns True on
+    success. No-op for static apps (no service_name in the row)."""
+    svc = app.get("service_name")
+    if not svc:
+        return True
+    # v1.1: subprocess.run(["systemctl", "start", svc], check=True)
+    return True
+
+
+def _stop_app_service(app: dict) -> None:
+    """Stop the systemd unit for a fullstack app. Best-effort. No-op
+    for static apps."""
+    svc = app.get("service_name")
+    if not svc:
+        return
+    # v1.1: subprocess.run(["systemctl", "stop", svc], check=False)
+    return
+
+
+# ---- Caddy route regeneration (shared by toggle + boot + delete) --------
+#
+# We use a SIMPLER scheme than per-slug Caddy fragments: the wildcard
+# Caddy block stays static, and toggling is just a directory rename.
+# `*.ojas.karmacode.cloud` already serves from `/opt/ojas-apps/<slug>/`;
+# when the user pauses an app, we rename the dir to
+# `/opt/ojas-apps/.stopped/<slug>/`. The Caddy `try_files` chain ends
+# with a shared `/.paused/index.html` fallback, so any request for a
+# paused slug lands on a friendly "this app is paused" page instead of
+# a 404. No Caddy reload required — `file_server` re-stats per request.
+#
+# Layout while toggling:
+#   /opt/ojas-apps/
+#     <slug>/              ← live; served by the existing wildcard block
+#     .stopped/<slug>/     ← paused; falls through to /.paused/index.html
+#     .paused/index.html   ← shared paused page (created on first toggle)
+
+OJAS_APPS_STOPPED_DIR = Path("/opt/ojas-apps/.stopped")
+OJAS_APPS_PAUSED_DIR = Path("/opt/ojas-apps/.paused")
+
+
+def _apply_app_state_to_disk(slug: str, new_state: str) -> None:
+    """Move the app dir between `/opt/ojas-apps/<slug>/` (live) and
+    `/opt/ojas-apps/.stopped/<slug>/` (paused). Creates the paused
+    HTML on first run. Idempotent — calling with the already-applied
+    state is a no-op."""
+    OJAS_APPS_PAUSED_DIR.mkdir(parents=True, exist_ok=True)
+    OJAS_APPS_STOPPED_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_paused_page()
+    live = OJAS_APPS_ROOT / slug
+    stopped = OJAS_APPS_STOPPED_DIR / slug
+    # If the row exists but the dir was deleted out from under us,
+    # there's nothing to move — the next deploy will recreate it.
+    if new_state == "stopped":
+        if live.exists():
+            live.rename(stopped)
+    else:  # running | starting | error
+        if stopped.exists():
+            stopped.rename(live)
+
+
+def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
+    """Placeholder kept so the call sites in toggle/delete endpoints
+    still typecheck. The dir-rename scheme (see _apply_app_state_to_disk)
+    doesn't need any Caddy config regeneration; this function is a
+    no-op for now. Kept for v1.1 when fullstack apps will need per-slug
+    Caddy fragments to proxy /api/* to the running backend port."""
+    # No-op for v1 (static-only toggle). The Caddy wildcard block is
+    # static; toggle = dir rename. See deploy/Caddyfile.
+    return
+
+
+def _ensure_paused_page() -> None:
+    """Write the shared 'this app is paused' HTML if it isn't there.
+    One file, ~700 bytes. Re-runs are no-ops thanks to the content
+    equality check."""
+    target = OJAS_APPS_PAUSED_DIR / "index.html"
+    body = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>App paused</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+             margin: 0; min-height: 100vh; display: grid; place-items: center;
+             background: #0b0b0c; color: #e7e7ea; }
+      .card { max-width: 32rem; padding: 2.5rem; border-radius: 1.25rem;
+              background: #15151a; border: 1px solid #2a2a31; text-align: center; }
+      h1 { margin: 0 0 0.5rem; font-size: 1.5rem; font-weight: 600; }
+      p  { margin: 0; color: #9a9aa3; line-height: 1.55; }
+      .dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%;
+             background: #6b6b75; margin-right: 0.5rem; vertical-align: middle; }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1><span class="dot"></span>This app is paused</h1>
+      <p>The owner has temporarily stopped this deployment. Open the Ojas
+         settings page and toggle it back on to bring it back.</p>
+    </main>
+  </body>
+</html>
+"""
+    try:
+        existing = target.read_text() if target.exists() else None
+        if existing != body:
+            target.write_text(body)
+    except OSError:
+        # Paused-page creation isn't critical for the toggle to function;
+        # Caddy will 500 if the file's missing, but the toggle still
+        # updates state correctly.
+        pass
+
+
 @app.post(
     "/api/sessions/{session_id}/deploy",
     response_model=DeployResponse,
@@ -1731,9 +1874,14 @@ def sessions_deploy(
         in_place = False
 
     # 3. Copy files. Use a sibling temp dir + rename for atomicity (so the
-    # public URL never serves a half-copied build).
+    # public URL never serves a half-copied build). If the app was previously
+    # paused, the dir lives at /opt/ojas-apps/.stopped/<slug>/; we move it
+    # back to the live path before staging so the swap is a no-op-rename
+    # rather than a slow cross-tree copy.
     OJAS_APPS_ROOT.mkdir(parents=True, exist_ok=True)
     target = OJAS_APPS_ROOT / slug
+    stopped_target = OJAS_APPS_STOPPED_DIR / slug
+    _apply_app_state_to_disk(slug, "running")  # ensure live path is writable
     staging = OJAS_APPS_ROOT / f".staging-{slug}-{int(time.time())}"
     try:
         shutil.copytree(dist, staging)
@@ -1906,6 +2054,9 @@ def deployed_apps_delete(slug: str, user: dict = Depends(require_user)):
     import shutil
     app = _deployed_app_or_404(slug, user)
     target = Path(app["app_dir"])
+    # Stop the systemd unit (fullstack) before rmtree so we don't
+    # leave a zombie process holding files open.
+    _stop_app_service(app)
     if target.exists() and target.is_dir():
         try:
             shutil.rmtree(target)
@@ -1921,7 +2072,98 @@ def deployed_apps_delete(slug: str, user: dict = Depends(require_user)):
             )
     db.delete_deployed_app(slug)
     db.delete_ojas_service(f"deployed:{slug}")
+    # Drop the per-slug Caddy route so the subdomain stops resolving.
+    _regenerate_caddy_routes_for_user(app.get("owner_user_id"))
     return {"ok": True}
+
+
+# ---- Pause / resume (toggle) --------------------------------------------
+#
+# Each deployed app has a state in DB: running | stopped | starting | error.
+# For static apps, the toggle just swaps the Caddy route between live and
+# a shared paused page. For fullstack apps (v1.1), the toggle also starts/
+# stops the per-app systemd unit. Both paths are routed through these
+# endpoints; the static-only path is what v1 ships with.
+
+@app.post("/api/deployed-apps/{slug}/start")
+def deployed_app_start(slug: str, user: dict = Depends(require_user)):
+    """Bring a paused app back up. Idempotent. Marks the row 'starting'
+    then 'running' once any backend (v1.1) is healthy, or straight to
+    'running' for static apps (the dir rename is the only work)."""
+    app = _deployed_app_or_404(slug, user)
+    if app["state"] == "running":
+        return DeployStateResponse(
+            slug=slug, state="running", last_state_at=app.get("last_state_at"),
+            last_health_at=app.get("last_health_at"),
+            error_message=app.get("error_message"),
+        )
+    db.set_deployed_app_state(slug, "starting")
+    # Fullstack: start the systemd unit. v1 is static-only so this is
+    # a no-op for now; v1.1 will shell out to systemctl + healthcheck.
+    if app.get("service_name"):
+        ok = _start_app_service(app)
+        if not ok:
+            db.set_deployed_app_state(slug, "error", error_message="failed to start service")
+            raise HTTPException(500, "failed to start service")
+    # Move the app dir back to the live path. Caddy's `file_server`
+    # re-stats per request, so the new config takes effect on the
+    # very next request — no Caddy reload needed.
+    _apply_app_state_to_disk(slug, "running")
+    now = int(time.time())
+    db.set_deployed_app_state(slug, "running", last_health_at=now)
+    return DeployStateResponse(slug=slug, state="running", last_state_at=now, last_health_at=now)
+
+
+@app.post("/api/deployed-apps/{slug}/stop")
+def deployed_app_stop(slug: str, user: dict = Depends(require_user)):
+    """Take an app down without deleting it. State becomes 'stopped',
+    the app dir moves to /opt/ojas-apps/.stopped/<slug>/, and (v1.1)
+    the systemd unit is stopped. Re-deploy / re-toggle to bring back."""
+    app = _deployed_app_or_404(slug, user)
+    if app["state"] == "stopped":
+        return DeployStateResponse(
+            slug=slug, state="stopped", last_state_at=app.get("last_state_at"),
+            last_health_at=app.get("last_health_at"),
+            error_message=app.get("error_message"),
+        )
+    # Fullstack: stop the unit FIRST so the process releases its files
+    # before we rename the dir. v1 is static-only so this no-ops.
+    if app.get("service_name"):
+        _stop_app_service(app)
+    # Move the app dir aside. Caddy falls through to the shared
+    # /.paused/index.html page for any subsequent request.
+    _apply_app_state_to_disk(slug, "stopped")
+    db.set_deployed_app_state(slug, "stopped")
+    return DeployStateResponse(
+        slug=slug, state="stopped",
+        last_state_at=int(time.time()),
+        last_health_at=app.get("last_health_at"),
+        error_message=app.get("error_message"),
+    )
+
+
+@app.get("/api/deployed-apps/{slug}/state", response_model=DeployStateResponse)
+def deployed_app_state(slug: str, user: dict = Depends(require_user)):
+    """Return just the state for one app. Cheaper than a full listing —
+    used by the chat-strip pill to refresh the badge after a toggle."""
+    app = _deployed_app_or_404(slug, user)
+    return DeployStateResponse(
+        slug=slug,
+        state=app.get("state", "running"),
+        last_state_at=app.get("last_state_at"),
+        last_health_at=app.get("last_health_at"),
+        error_message=app.get("error_message"),
+    )
+
+
+@app.get("/api/users/me/deployed-apps", response_model=list[DeployedAppsBySession])
+def users_deployed_apps(user: dict = Depends(require_user)):
+    """All deployed apps the caller can see, grouped by source session.
+    Used by the Settings page. Root sees everything; non-root sees
+    their own + orphans (apps whose owner was deleted)."""
+    owner = None if user["role"] == "root" else user["id"]
+    rows = db.list_deployed_apps_grouped(owner_user_id=owner)
+    return [DeployedAppsBySession(**r) for r in rows]
 
 
 # Serve a deployed app's static files. Mirrors the /preview/* handler

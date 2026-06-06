@@ -158,12 +158,27 @@ CREATE TABLE IF NOT EXISTS deployed_apps (
     project_dir          TEXT,
     app_dir              TEXT    NOT NULL,
     deployed_at          INTEGER NOT NULL,
-    last_redeploy_at     INTEGER NOT NULL
+    last_redeploy_at     INTEGER NOT NULL,
+    -- State machine for pause/resume. Static apps are always "running"
+    -- (the toggle just swaps the Caddy route between live and paused).
+    -- Fullstack apps (v1.1+) flip systemd units on/off. Defaults to
+    -- running because v1 deploys have no service to stop.
+    state                TEXT    NOT NULL DEFAULT 'running'
+                                 CHECK (state IN ('running','stopped','starting','error')),
+    last_state_at        INTEGER,
+    last_health_at       INTEGER,
+    error_message        TEXT,
+    -- Per-app systemd unit (set by fullstack deploys; NULL for static).
+    -- Naming: "ojas-app-<slug>.service", slug-sanitised.
+    service_name         TEXT,
+    port                 INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_deployed_apps_owner
     ON deployed_apps(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_deployed_apps_session
     ON deployed_apps(source_session_id);
+-- idx_deployed_apps_state is created in init_db() AFTER the column
+-- migration runs (the column may not exist on legacy DBs).
 """
 
 
@@ -186,17 +201,38 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_deployed_apps_session "
             "ON deployed_apps(source_session_id)"
         )
+        # Same as above — depends on the `state` column added by
+        # _migrate_deployed_apps(). Idempotent because IF NOT EXISTS.
+        cx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deployed_apps_state "
+            "ON deployed_apps(state)"
+        )
 
 
 def _migrate_deployed_apps(cx: sqlite3.Connection) -> None:
-    """Add `project_dir` column to legacy deployed_apps tables. SQLite can't
-    change a column's REFERENCES clause via ALTER, so the cascade-on-session
-    behaviour only applies to NEW rows; pre-existing rows fall back to the
-    old SET NULL semantics (still purged on explicit session-delete via the
-    `_purge_deployed_apps_for_session` helper)."""
+    """Forward-migrate the deployed_apps table. Each ALTER is idempotent —
+    if the column already exists, we skip it. SQLite has no ADD COLUMN IF
+    NOT EXISTS, so we read PRAGMA table_info first.
+    """
     cols = {row["name"] for row in cx.execute("PRAGMA table_info(deployed_apps)")}
     if "project_dir" not in cols:
         cx.execute("ALTER TABLE deployed_apps ADD COLUMN project_dir TEXT")
+    if "state" not in cols:
+        # 'running' is the safe default — pre-existing deploys were
+        # implicitly running (static files served by Caddy).
+        cx.execute(
+            "ALTER TABLE deployed_apps ADD COLUMN state TEXT NOT NULL DEFAULT 'running'"
+        )
+    if "last_state_at" not in cols:
+        cx.execute("ALTER TABLE deployed_apps ADD COLUMN last_state_at INTEGER")
+    if "last_health_at" not in cols:
+        cx.execute("ALTER TABLE deployed_apps ADD COLUMN last_health_at INTEGER")
+    if "error_message" not in cols:
+        cx.execute("ALTER TABLE deployed_apps ADD COLUMN error_message TEXT")
+    if "service_name" not in cols:
+        cx.execute("ALTER TABLE deployed_apps ADD COLUMN service_name TEXT")
+    if "port" not in cols:
+        cx.execute("ALTER TABLE deployed_apps ADD COLUMN port INTEGER")
 
 
 def _migrate_projects(cx: sqlite3.Connection) -> None:
@@ -934,20 +970,26 @@ def create_deployed_app(
     source_project_id: str | None = None,
     owner_user_id: str | None = None,
     project_dir: str | None = None,
+    service_name: str | None = None,
+    port: int | None = None,
 ) -> dict:
     """Insert a new deployed-app row. Caller has already copied files to
     `app_dir` and verified the slug is free. `project_dir` records which
     subfolder of the source session was promoted (for re-deploys and UI
-    display); nullable for legacy callers."""
+    display); nullable for legacy callers. `service_name` and `port` are
+    set by fullstack deploys (v1.1); static deploys leave them NULL.
+    New rows default to state='running'."""
     now = int(time.time())
     with _connect() as cx:
         cx.execute(
             "INSERT INTO deployed_apps "
             "(slug, name, source_session_id, source_project_id, owner_user_id, "
-            "app_dir, deployed_at, last_redeploy_at, project_dir) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "app_dir, deployed_at, last_redeploy_at, project_dir, "
+            "state, last_state_at, service_name, port) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)",
             (slug, name, source_session_id, source_project_id, owner_user_id,
-             app_dir, now, now, project_dir),
+             app_dir, now, now, project_dir,
+             now, service_name, port),
         )
     return get_deployed_app(slug) or {}
 
@@ -970,6 +1012,61 @@ def touch_deployed_app(slug: str, project_dir: str | None = None) -> None:
                 "UPDATE deployed_apps SET last_redeploy_at = ? WHERE slug = ?",
                 (int(time.time()), slug),
             )
+
+
+# ---- Pause / resume ------------------------------------------------------
+#
+# State machine for deployed apps. Transitions:
+#   running  --toggle-off-->  stopped
+#   stopped  --toggle-on--->  running
+#   starting --health-ok---->  running
+#   starting --health-fail--> error
+#   error    --toggle-on----> starting  (retry)
+#
+# Static apps skip the systemd layer: toggling off just makes the
+# Caddy route point to a "paused" page. The Caddy route generator
+# in server/app.py reads `state` and writes the appropriate route.
+# Fullstack apps (v1.1+) additionally start/stop the systemd unit.
+
+_DEPLOYED_STATE_TRANSITIONS = {
+    "running":  {"stopped", "starting", "error"},
+    "stopped":  {"running", "starting"},
+    "starting": {"running", "error", "stopped"},
+    "error":    {"stopped", "starting"},
+}
+
+
+def set_deployed_app_state(
+    slug: str,
+    new_state: str,
+    error_message: str | None = None,
+    last_health_at: int | None = None,
+) -> bool:
+    """Update the state of a deployed app. Returns True on success, False
+    if the slug doesn't exist or the transition is illegal. `error_message`
+    is stored only when state='error' (cleared otherwise). `last_health_at`
+    is stored only when provided (callers pass it after a successful /api/health
+    check)."""
+    if new_state not in _DEPLOYED_STATE_TRANSITIONS:
+        return False
+    with _connect() as cx:
+        row = cx.execute(
+            "SELECT state FROM deployed_apps WHERE slug = ?", (slug,),
+        ).fetchone()
+        if row is None:
+            return False
+        current = row["state"]
+        if new_state != current and new_state not in _DEPLOYED_STATE_TRANSITIONS.get(current, set()):
+            return False
+        err = error_message if new_state == "error" else None
+        cx.execute(
+            "UPDATE deployed_apps "
+            "SET state = ?, last_state_at = ?, error_message = ?, "
+            "    last_health_at = COALESCE(?, last_health_at) "
+            "WHERE slug = ?",
+            (new_state, int(time.time()), err, last_health_at, slug),
+        )
+    return True
 
 
 def get_deployed_app(slug: str) -> dict | None:
@@ -1004,3 +1101,47 @@ def delete_deployed_app(slug: str) -> bool:
     with _connect() as cx:
         cur = cx.execute("DELETE FROM deployed_apps WHERE slug = ?", (slug,))
         return cur.rowcount > 0
+
+
+def list_deployed_apps_grouped(
+    owner_user_id: str | None = None,
+) -> list[dict]:
+    """List deployed apps grouped by source session for the settings page.
+    Returns a list of session-shaped dicts (one per session that has at
+    least one app), each with a `deployed_apps` sublist. Sessions are
+    sorted by the most recent app activity (last_redeploy_at desc).
+
+    owner_user_id=None means root scope (all users). Otherwise, the caller's
+    own apps + orphans (NULL owner, left behind when a user was deleted).
+    Sessions with no apps are NOT included — use the regular session list
+    for that.
+    """
+    with _connect() as cx:
+        if owner_user_id is None:
+            rows = cx.execute(
+                "SELECT a.*, s.name AS session_name "
+                "FROM deployed_apps a "
+                "LEFT JOIN sessions s ON s.id = a.source_session_id "
+                "ORDER BY a.last_redeploy_at DESC"
+            ).fetchall()
+        else:
+            rows = cx.execute(
+                "SELECT a.*, s.name AS session_name "
+                "FROM deployed_apps a "
+                "LEFT JOIN sessions s ON s.id = a.source_session_id "
+                "WHERE a.owner_user_id = ? OR a.owner_user_id IS NULL "
+                "ORDER BY a.last_redeploy_at DESC",
+                (owner_user_id,),
+            ).fetchall()
+    # Group by session
+    sessions: dict[str, dict] = {}
+    for r in rows:
+        r = dict(r)
+        sid = r.get("source_session_id") or "_orphan"
+        bucket = sessions.setdefault(sid, {
+            "session_id": r.get("source_session_id"),
+            "session_name": r.get("session_name") or "(deleted session)",
+            "deployed_apps": [],
+        })
+        bucket["deployed_apps"].append(r)
+    return list(sessions.values())

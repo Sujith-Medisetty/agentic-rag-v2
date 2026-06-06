@@ -186,6 +186,34 @@ class DeployedAppResponse(BaseModel):
  # Subfolder of the source session that was promoted (None for the
  # session root). Lets the UI pre-fill the Sub-app field on re-deploy.
  project_dir: str | None = None
+ # State machine: "running" | "stopped" | "starting" | "error". Toggled
+ # via the settings page. Static apps are always "running" (the toggle
+ # just swaps the Caddy route between live and paused).
+ state: str = "running"
+ last_state_at: int | None = None
+ last_health_at: int | None = None
+ error_message: str | None = None
+ # Fullstack-only fields (NULL for static apps).
+ service_name: str | None = None
+ port: int | None = None
+
+
+class DeployStateResponse(BaseModel):
+ """Returned by GET /api/deployed-apps/<slug>/state and the start/stop
+ endpoints so the UI can refresh the badge without re-listing everything.
+ """
+ slug: str
+ state: str
+ last_state_at: int | None = None
+ last_health_at: int | None = None
+ error_message: str | None = None
+
+
+class DeployedAppsBySession(BaseModel):
+ """One row in the settings page — a session with its deployed apps."""
+ session_id: str | None = None
+ session_name: str = "(deleted session)"
+ deployed_apps: list[DeployedAppResponse]
 
 class DeployResponse(BaseModel):
  # The slug we actually allocated (may differ from request if collision).
