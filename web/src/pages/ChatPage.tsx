@@ -293,6 +293,34 @@ export default function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
+  // Visibility catch-up. When the user comes back to the tab (or the
+  // PWA wakes from background on mobile), re-fetch the session so the
+  // sidebar reflects any rename that happened while we were hidden.
+  // This is the third safety net alongside the WS session_renamed
+  // event + the post-turn_summary poll: together they cover flaky
+  // mobile networks, PWA backgrounding, and slow LLM calls.
+  useEffect(() => {
+    if (!sessionId) return;
+    const sid = sessionId;
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      sessionsApi.get(sid).then((s) => {
+        window.dispatchEvent(
+          new CustomEvent("ojas:session-renamed", {
+            detail: {
+              session_id:    sid,
+              new_name:      s.name,
+              previous_name: "",
+              was_suffixed:  false,
+            },
+          }),
+        );
+      }).catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [sessionId]);
+
   // Apply ONE event to current state. Pure function over (turns, currentTurn,
   // plan) — but expressed as setter calls because React state is split.
   function handleEvent(ev: LiveEvent) {
@@ -425,31 +453,42 @@ export default function ChatPage() {
           return null;
         });
         // Belt-and-suspenders for the LLM-suggested rename. The session
-        // name can change ~1s after turn_summary via the background
-        // auto-rename, but the WS might be closing, reconnecting, or
-        // just slow on mobile. Polling the session's current name
-        // directly from the API 1.5s after the turn ends catches all
-        // those cases — if the name changed, dispatch the rename event
-        // so Workspace's sidebar updates no matter what.
+        // name can change ~1–6s after turn_summary via the background
+        // auto-rename (the LLM call has a 6s ceiling). The WS
+        // session_renamed event isn't 100% reliable — the WS may be
+        // mid-reconnect on mobile, the page may have been backgrounded,
+        // etc. So we poll the session's current name at multiple
+        // intervals after the turn. The Workspace listener compares the
+        // new_name with what's in state, so a no-op poll (no rename
+        // yet) is harmless.
         if (sessionId) {
           const sid = sessionId;
-          setTimeout(() => {
-            sessionsApi.get(sid).then((s) => {
-              // The session object has `name`; we don't have the previous
-              // name in scope, so just dispatch the new name. The listener
-              // only acts if the name is different from what's in state.
-              window.dispatchEvent(
-                new CustomEvent("ojas:session-renamed", {
-                  detail: {
-                    session_id:    sid,
-                    new_name:      s.name,
-                    previous_name: "",
-                    was_suffixed:  false,
-                  },
-                }),
-              );
-            }).catch(() => { /* ignore — best-effort */ });
-          }, 1500);
+          const lastSeenName = { current: "" };
+          const fireIfChanged = (newName: string) => {
+            if (!newName || newName === lastSeenName.current) return;
+            lastSeenName.current = newName;
+            window.dispatchEvent(
+              new CustomEvent("ojas:session-renamed", {
+                detail: {
+                  session_id:    sid,
+                  new_name:      newName,
+                  previous_name: "",
+                  was_suffixed:  false,
+                },
+              }),
+            );
+          };
+          // Prime the tracker with the first read so we only fire on
+          // ACTUAL changes (not on every poll).
+          sessionsApi.get(sid).then((s) => { lastSeenName.current = s.name; }).catch(() => {});
+          // Multiple retries: catches the 1–6s LLM call window on any
+          // connection speed. Each one is a cheap GET; we stop early if
+          // we already saw a change.
+          for (const delay of [1500, 3000, 5000, 8000]) {
+            setTimeout(() => {
+              sessionsApi.get(sid).then((s) => fireIfChanged(s.name)).catch(() => {});
+            }, delay);
+          }
         }
         return;
       }
