@@ -1,17 +1,31 @@
-// Manual SW registration via workbox-window.
+// Service-worker registration with AUTO update + reload.
 //
-// We could let vite-plugin-pwa do `injectRegister: 'auto'` and get a
-// 5-line auto-register, but doing it manually lets us:
-//   - Avoid throwing on dev (where the SW is disabled by devOptions)
-//   - Catch and log registration errors (Safari is fussy about scopes)
-//   - Surface "update available" to the UI instead of silently reloading
-//     (so the user knows their new code is live instead of wondering why
-//     the page just refreshed)
+// Earlier this dispatched a "ojas:sw-update" event for a UI toast asking
+// the user to click "Refresh to update". The toast lived in <Layout>,
+// which is NOT rendered on the main chat routes (Workspace). Result: SW
+// updates landed silently in "waiting" state and the user kept seeing old
+// code until they hard-refreshed. They almost always wanted the update
+// anyway — the toast was friction with no payoff.
 //
-// Called once from src/main.tsx. The update-available UI lives in
-// Layout.tsx and listens for the "ojas:sw-update" CustomEvent on window.
+// New flow:
+//   1. wb.register() installs the SW.
+//   2. New SW detected → `waiting` event → we immediately tell it to
+//      skipWaiting (no user click required).
+//   3. New SW takes control → `controlling` event → page reloads.
+//   4. We POLL for updates every 60s while the page is visible AND on
+//      `visibilitychange → visible`, so a user who keeps the PWA open
+//      for hours still gets the update within a minute of it being pushed.
+//
+// The reload is brief — current bundle is in memory so the new one paints
+// almost immediately. Cost: a user typing in the chat input at the exact
+// moment the SW activates loses their draft. Rare in practice; if it
+// becomes a problem we can defer reload until the input is empty.
+//
+// Called once from src/main.tsx.
 
 import { Workbox } from "workbox-window";
+
+const UPDATE_CHECK_INTERVAL_MS = 60_000;   // 1 minute
 
 export function registerSW(): void {
   if (!("serviceWorker" in navigator)) return;
@@ -19,31 +33,52 @@ export function registerSW(): void {
 
   const wb = new Workbox("/sw.js", { scope: "/" });
 
-  // A new SW has installed and is waiting. Notify the UI so it can show
-  // a "refresh to update" toast. We do NOT auto-skip-waiting here — the
-  // user clicking the toast is the explicit signal.
-  wb.addEventListener("waiting", (event) => {
-    const installing = (event as any).sw;
-    window.dispatchEvent(
-      new CustomEvent("ojas:sw-update", { detail: { sw: installing } }),
-    );
-  });
-
-  // User accepted the update (clicked the toast). Tell the waiting SW to
-  // skip waiting so it activates now. The `controlling` listener below
-  // will then reload the page to run the new bundle.
-  window.addEventListener("ojas:sw-apply", () => {
+  // Auto-accept new versions — no user toast, no waiting state lingering.
+  wb.addEventListener("waiting", () => {
     wb.messageSkipWaiting();
   });
 
-  // New SW took control — reload so the page runs the fresh bundle.
+  // New SW took control → reload silently so the page runs fresh code.
+  // The `reloaded` guard prevents the very rare double-reload edge case
+  // (multiple `controlling` fires) that Workbox documents.
+  let reloaded = false;
   wb.addEventListener("controlling", () => {
+    if (reloaded) return;
+    reloaded = true;
     window.location.reload();
   });
 
   wb.register().catch((err) => {
-    // SW registration failures are loud in dev tools but should never block
-    // the app — fall back to non-PWA mode silently.
     console.warn("[pwa] SW registration failed:", err);
   });
+
+  // Periodic update checks. Without this, the browser only checks for a
+  // new SW on full page navigation — users with the PWA open for hours
+  // miss updates entirely. We pause the interval when the page is hidden
+  // so we don't burn mobile battery polling in the background.
+  let interval: number | null = null;
+  const startPolling = () => {
+    if (interval !== null) return;
+    interval = window.setInterval(() => {
+      wb.update().catch(() => { /* network blip, retry next tick */ });
+    }, UPDATE_CHECK_INTERVAL_MS);
+  };
+  const stopPolling = () => {
+    if (interval !== null) {
+      window.clearInterval(interval);
+      interval = null;
+    }
+  };
+  const onVisibility = () => {
+    if (document.visibilityState === "visible") {
+      // Catch-up check on focus — covers "user closed laptop, opened
+      // hours later, an update was pushed in the meantime".
+      wb.update().catch(() => { /* ignore */ });
+      startPolling();
+    } else {
+      stopPolling();
+    }
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  if (document.visibilityState === "visible") startPolling();
 }
