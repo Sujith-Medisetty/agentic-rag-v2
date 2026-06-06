@@ -6,10 +6,19 @@ import ChatPage from "@/pages/ChatPage";
 import ProjectList from "@/pages/ProjectList";
 import SessionList from "@/pages/SessionList";
 import Admin from "@/pages/Admin";
-import InstallPrompt from "@/components/InstallPrompt";
-import IosInstallHint from "@/components/IosInstallHint";
 import { SessionProvider } from "@/lib/sessionContext";
 import { GlobalToast } from "@/components/GlobalToast";
+
+// No custom PWA install UI. Users install via the browser's native
+// flow (Chrome/Edge URL-bar install icon, iOS Share → Add to Home
+// Screen). The manifest + service worker are still served so the
+// browser CAN offer install — we just don't render our own banner
+// or button on top of it. Cleaner code, no React-state-vs-event
+// capture issues, no over-engineered diagnostics.
+//
+// The only "PWA UI" left is the service-worker-update toast (in
+// Layout), which is a different concern: telling the user when a
+// new build is available, not prompting install.
 
 export default function App() {
   return (
@@ -65,8 +74,6 @@ export default function App() {
               itself is rendered ONCE at the App level so it survives
               route changes. */}
           <GlobalToast />
-          <InstallPrompt />
-          <IosInstallHint />
         </SessionProvider>
       </AuthGate>
     </BrowserRouter>
