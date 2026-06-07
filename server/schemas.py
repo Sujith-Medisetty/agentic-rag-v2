@@ -222,3 +222,57 @@ class DeployResponse(BaseModel):
  url: str
  # The full DeployedAppResponse so the UI can immediately add it to its list.
  app: DeployedAppResponse
+
+
+
+class DeployStep(BaseModel):
+    # Machine-readable step name: "validate", "eager_caddy", "copy_dist",
+    # "copy_backend", "venv_create", "pip_install", "write_unit",
+    # "enable_service", "db_row", "caddy_regen", "start_service", "finalize".
+    name: str
+    # Human-readable label for the UI ("Copying build to /opt/ojas-apps").
+    label: str
+    # "pending" | "running" | "done" | "failed".
+    status: str
+    # Optional detail (e.g. pip stderr tail, error message on failure).
+    message: str | None = None
+    started_at: int | None = None
+    finished_at: int | None = None
+
+
+class DeployJobStartResponse(BaseModel):
+    # Returned by the async POST /deploy endpoint with 202 Accepted.
+    # The client polls GET /deploy-jobs/{job_id} for progress; the
+    # `result` field in DeployJobStatusResponse holds the canonical
+    # DeployResponse once status="succeeded".
+    job_id: str
+    slug: str
+    # The URL the deployed app will live at once the job finishes. The
+    # URL is hijacked by an eager "Deploying..." placeholder the moment
+    # the job starts (so the public hostname never 404s), then bound to
+    # the real /api/* reverse proxy in the caddy_regen step.
+    url: str
+    # Optimistic DeployedApp row the chat strip can render immediately
+    # (state="starting"). The canonical row overwrites this once the
+    # job succeeds; the strip will dedupe by slug.
+    placeholder_app: DeployedAppResponse
+
+
+class DeployJobStatusResponse(BaseModel):
+    job_id: str
+    session_id: str
+    slug: str
+    # "pending" | "running" | "succeeded" | "failed" | "cancelled".
+    status: str
+    # Human-readable current phase name (mirrors the running step's label).
+    phase: str
+    # Always 11 entries (one per step), in fixed order, so the UI
+    # checklist is stable across polls.
+    steps: list[DeployStep]
+    # Set on failed / cancelled. Truncated to 500 chars server-side.
+    error: str | None = None
+    # Populated only when status="succeeded". Same shape as the old
+    # synchronous 201 DeployResponse.
+    result: DeployResponse | None = None
+    created_at: int
+    updated_at: int
