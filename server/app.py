@@ -2022,6 +2022,52 @@ def _stop_app_service(app: dict) -> None:
         print(f"[ojas] helper stop {svc} failed: {e}")
 
 
+def _rmtree_with_symlinks(path: Path) -> None:
+    """Recursive delete that unlinks symlinks BEFORE recursing into
+    them. `shutil.rmtree(..., ignore_errors=True)` is the usual tool,
+    but it has a known wart with symlinked directories: when called
+    on a dir that contains symlinks-to-dirs, it follows the symlinks
+    and DELETES THE TARGET, leaving a dangling symlink that subsequent
+    copytree calls trip over with "File exists".
+
+    For a Python venv, many packages (passlib, bcrypt, cryptography,
+    numpy, etc.) install as symlinks to a shared site-packages elsewhere
+    on the system. Deleting the target would break other venvs. This
+    helper walks the tree and unlinks each symlink as a link first
+    (not its target), then recurses into real directories.
+
+    Best-effort: errors are swallowed (matches the previous rmtree
+    ignore_errors=True behaviour). Caller should treat the post-state
+    as "no path" — if a file survives, the next copytree will surface
+    a clean error.
+    """
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    if path.is_dir():
+        try:
+            for child in path.iterdir():
+                _rmtree_with_symlinks(child)
+        except OSError:
+            pass
+    try:
+        path.rmdir()
+    except OSError:
+        # File or non-empty dir we couldn't fully recurse into —
+        # fall back to unlink (for files / leftover symlinks) or
+        # ignore (for non-empty dirs we'd rather warn about).
+        try:
+            if not path.is_dir():
+                path.unlink()
+        except OSError:
+            pass
+
+
 def _pip_install_for_app(backend_dir: Path, requirements: Path) -> tuple[bool, str]:
     """Create a venv at backend_dir/.venv and pip install -r requirements.
     Returns (success, error_message). Runs as the `ojas` user so the
@@ -2400,8 +2446,18 @@ def sessions_deploy(
         backend_src = project_abs / "backend"
         backend_dst = target / "backend"
         if backend_src.exists():
-            if backend_dst.exists():
-                shutil.rmtree(backend_dst, ignore_errors=True)
+            if backend_dst.is_symlink():
+                # Symlink (often left over from a prior deploy) — unlink
+                # only the link, not the target, so we don't nuke the
+                # real venv.
+                backend_dst.unlink()
+            elif backend_dst.exists():
+                # The .venv inside the previous backend contains many
+                # symlinks (passlib, others) that shutil.rmtree can
+                # leave dangling. Use a symlink-aware recursive delete
+                # so copytree below doesn't fail with "File exists" on
+                # a half-removed symlinked dir.
+                _rmtree_with_symlinks(backend_dst)
             shutil.copytree(backend_src, backend_dst)
         # Create a venv + pip install
         ok, err = _pip_install_for_app(backend_dst, backend_src / "requirements.txt")
