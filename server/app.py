@@ -158,13 +158,36 @@ def _reconcile_deployed_apps_on_boot() -> None:
     #   2. Stale .staging-* dirs -- copytree staging dirs that were
     #      started but the rename never ran. Older than 1 hour so we
     #      don't disturb an in-flight deploy that just started.
+    #
+    #   3. Orphan systemd units -- ojas-app-<slug>.service files for
+    #      slugs that no longer have a deployed_apps row. The
+    #      deployed-app delete path stops+disables+rm's the unit, but
+    #      rows that predate that cleanup (or rows that were hand-
+    #      removed from the DB) leak the unit. A leaked unit holds
+    #      its TCP port forever, blocking the next deploy that
+    #      allocator gives the same port (the first free one, which
+    #      is always the lowest free port in 9100-9899). Symptoms:
+    #      a freshly deployed app's uvicorn crashes with
+    #      "Errno 98 address already in use" and the subdomain
+    #      quietly serves whatever stale backend was last holding
+    #      that port. We re-create the slug from the unit filename
+    #      (ojas-app-<slug>.service) and use the same
+    #      _remove_app_service_files() helper the live delete paths
+    #      use, so we get exactly the same stop+disable+rm+reload
+    #      sequence -- no duplicated logic.
     try:
         with db._connect() as cx:   # noqa: SLF001
-            live = {r["slug"] for r in cx.execute("SELECT slug FROM deployed_apps").fetchall()}
+            live_rows = cx.execute(
+                "SELECT slug, service_name FROM deployed_apps"
+            ).fetchall()
+        live_slugs = {r["slug"] for r in live_rows}
+        live_unit_names = {
+            r["service_name"] for r in live_rows if r["service_name"]
+        }
         reaped_fragments = 0
         if OJAS_CADDY_ROUTES_DIR.exists():
             for f in OJAS_CADDY_ROUTES_DIR.glob("*.caddy"):
-                if f.stem not in live:
+                if f.stem not in live_slugs:
                     try:
                         f.unlink()
                         reaped_fragments += 1
@@ -182,8 +205,29 @@ def _reconcile_deployed_apps_on_boot() -> None:
                         reaped_staging += 1
                 except OSError:
                     pass
-        if reaped_fragments or reaped_staging:
-            print(f"[ojas] boot orphan cleanup: reaped {reaped_fragments} Caddy fragments, {reaped_staging} stale staging dirs")
+        reaped_units = 0
+        if OJAS_APPS_UNIT_DIR.exists():
+            for unit_file in OJAS_APPS_UNIT_DIR.glob("ojas-app-*.service"):
+                unit_name = unit_file.name
+                # If the DB still has a row pointing at this unit, the
+                # unit belongs to a live app -- leave it alone. (We
+                # check unit_name, not slug, because a row's
+                # service_name is the authoritative unit name; the
+                # slug might have changed if someone hand-renamed.)
+                if unit_name in live_unit_names:
+                    continue
+                # Otherwise: derive the slug from the unit name and
+                # tear it down via the same helper the live delete
+                # path uses. The helper swallows per-step errors.
+                slug = unit_name[len("ojas-app-"):-len(".service")]
+                _remove_app_service_files(slug, None)
+                reaped_units += 1
+        if reaped_fragments or reaped_staging or reaped_units:
+            print(
+                f"[ojas] boot orphan cleanup: reaped {reaped_fragments} "
+                f"Caddy fragments, {reaped_staging} stale staging dirs, "
+                f"{reaped_units} orphan systemd units"
+            )
     except Exception:
         # Best-effort; if the reaper itself fails, the next deploy's
         # Caddy fragment gen will overwrite the orphan, and the user
@@ -910,11 +954,16 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
             ).fetchall()
         for row in rows:
             slug = row["slug"]
-            # Stop the systemd unit first (v1.1 fullstack) so the
-            # process releases its files before we rmtree. v1 is
-            # static-only so this is a no-op; service_name is NULL.
+            # Tear down the systemd unit (fullstack) so the process
+            # releases its files AND its bound port before we rmtree.
+            # _remove_app_service_files handles the case where the row
+            # predates the service_name column (derives the unit name
+            # from the slug), and also disables + removes the unit
+            # file so it doesn't come back on the next boot. v1 static
+            # apps have no service_name and no unit file, so this is
+            # effectively a no-op for them.
             row_full = db.get_deployed_app(slug) or {}
-            _stop_app_service(row_full)
+            _remove_app_service_files(slug, row_full)
             # The app dir is at /opt/ojas-apps/<slug>/. If the app was
             # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
             # instead -- wipe both.
@@ -2148,6 +2197,60 @@ def _stop_app_service(app: dict) -> None:
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"[ojas] helper stop {svc} failed: {e}")
 
+def _remove_app_service_files(slug: str, row: dict | None = None) -> None:
+    """Stop, disable, and remove the systemd unit for a fullstack app.
+
+    Single source of truth for "this deployed app is going away" -- used
+    by the API delete handler, the session-purge path, AND the boot-time
+    orphan reaper. Does nothing for static apps (no service_name, no
+    unit file).
+
+    Resolves the unit name two ways, in order:
+      1. row["service_name"] (the column written at deploy time).
+      2. f"ojas-app-{slug}.service" (the format _write_systemd_unit uses).
+    The fallback covers legacy rows that predate the service_name column
+    migration -- a row may be on disk with the right unit but no
+    service_name set, and we still want the unit cleaned up.
+
+    All steps are best-effort. `stop` may legitimately fail if the unit
+    isn't running; `disable` may fail if the symlink in
+    multi-user.target.wants is already gone; `rm-unit` may fail with
+    ENOENT. We log + swallow so one misstep doesn't block the rest of
+    the cleanup chain.
+
+    `daemon-reload` runs at the end so systemd forgets the unit name
+    the next time someone asks "is this enabled?". Without it, a
+    removed unit file can linger in systemd's internal cache and
+    re-appear in `systemctl list-unit-files` output.
+    """
+    svc = (row or {}).get("service_name") or f"ojas-app-{slug}.service"
+    helper = "/usr/local/sbin/ojas-systemd-helper"
+    unit_file = OJAS_APPS_UNIT_DIR / svc
+    # Order matters: stop the process first so the bind on its port is
+    # released, THEN remove the autostart symlink, THEN remove the file.
+    # Doing it the other way risks systemd respawning the unit on the
+    # next boot before we can `rm` the file.
+    for cmd in (
+        [helper, "systemctl", "stop", svc],
+        [helper, "systemctl", "disable", svc],
+    ):
+        try:
+            subprocess.run(cmd, check=False, timeout=5, capture_output=True)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"[ojas] helper {cmd[1:3]} {svc} failed: {e}")
+    try:
+        if unit_file.exists():
+            subprocess.run(
+                [helper, "rm-unit", svc],
+                check=False, timeout=5, capture_output=True,
+            )
+        subprocess.run(
+            [helper, "systemctl", "daemon-reload"],
+            check=False, timeout=5, capture_output=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[ojas] helper rm-unit/daemon-reload {svc} failed: {e}")
+
 def _rmtree_with_symlinks(path: Path) -> None:
     """Recursive delete that unlinks symlinks BEFORE recursing into
     them. `shutil.rmtree(..., ignore_errors=True)` is the usual tool,
@@ -3213,33 +3316,11 @@ def deployed_apps_delete(slug: str, user: dict = Depends(require_user)):
     import shutil
     app = _deployed_app_or_404(slug, user)
     target = Path(app["app_dir"])
-    # Stop the systemd unit (fullstack) before rmtree so we don't
-    # leave a zombie process holding files open.
-    _stop_app_service(app)
-    # Disable + remove the systemd unit file (fullstack)
-    svc = app.get("service_name")
-    if svc:
-        for cmd in (
-            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "disable", svc],
-            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "stop", svc],
-        ):
-            try:
-                subprocess.run(cmd, check=False, timeout=5, capture_output=True)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-        unit_file = Path("/etc/systemd/system") / svc
-        try:
-            if unit_file.exists():
-                subprocess.run(
-                    ["/usr/local/sbin/ojas-systemd-helper", "rm-unit", svc],
-                    check=False, timeout=5, capture_output=True,
-                )
-            subprocess.run(
-                ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "daemon-reload"],
-                check=False, timeout=5, capture_output=True,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    # Stop + disable + remove the systemd unit (fullstack) BEFORE rmtree
+    # so the process releases the files AND releases its bound port.
+    # _remove_app_service_files handles the legacy case where the row
+    # predates the service_name column (derives the name from the slug).
+    _remove_app_service_files(slug, app)
     if target.exists() and target.is_dir():
         try:
             shutil.rmtree(target)
