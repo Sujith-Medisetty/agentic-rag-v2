@@ -11,12 +11,18 @@ venv/
 # Node / Vite
 node_modules/
 web/dist/
+agents/templates/**/dist/
 .vite/
 # TypeScript incremental build cache
 web/tsconfig.tsbuildinfo
+agents/templates/**/tsconfig.tsbuildinfo
 # Stray compile artifacts that escape into src/ when `tsc` is run without
 # noEmit. The .tsx files are the source of truth — these are noise.
 web/src/**/*.js
+agents/templates/**/src/**/*.js
+# Backend venvs created by the agent for the fullstack template
+agents/templates/**/backend/.venv/
+agents/templates/**/backend/data/
 
 # Local state — never commit these
 .agent/                  # LangGraph SqliteSaver checkpoints (~/.agent shouldn't be here either)

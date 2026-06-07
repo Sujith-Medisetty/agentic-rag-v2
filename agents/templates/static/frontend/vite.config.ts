@@ -1,5 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // CRITICAL: `base: './'` (relative) makes asset URLs work under ANY
 // subpath. Ojas serves the built dist at https://<slug>.<host>/, so
@@ -8,6 +12,11 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   base: "./",
   plugins: [react()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
   build: {
     outDir: "dist",
     sourcemap: false,
