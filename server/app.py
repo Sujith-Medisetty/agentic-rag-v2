@@ -171,13 +171,7 @@ def _reconcile_deployed_apps_on_boot() -> None:
                     except OSError:
                         pass
         if reaped_fragments:
-            try:
-                subprocess.run(
-                    ["systemctl", "reload", "caddy"],
-                    check=False, timeout=5, capture_output=True,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+            _reload_caddy()
         reaped_staging = 0
         if OJAS_APPS_ROOT.exists():
             cutoff = time.time() - 3600
@@ -2271,6 +2265,23 @@ def _apply_app_state_to_disk(slug: str, new_state: str) -> None:
         if stopped.exists():
             stopped.rename(live)
 
+def _reload_caddy() -> None:
+    """Reload the Caddy server config so it picks up freshly-written
+    per-slug fragments from /etc/caddy/routes.d/. MUST go through the
+    setuid helper at /usr/local/sbin/ojas-systemd-helper — the ojas
+    user (which the backend runs as) cannot call /usr/bin/systemctl
+    directly. The helper's `systemctl` passthrough accepts any call
+    that doesn't have an ojas-app-* arg, so "reload caddy" is allowed
+    and runs as root via setuid."""
+    try:
+        subprocess.run(
+            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "reload", "caddy"],
+            check=False, timeout=5, capture_output=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
     """Re-emit per-slug Caddy fragments for FULLSTACK apps. Static apps
     don't need a fragment (the wildcard block handles them). Each
@@ -2383,14 +2394,8 @@ def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
     header @html Cache-Control "no-cache"
 }}
 """)
-    # Reload Caddy
-    try:
-        subprocess.run(
-            ["systemctl", "reload", "caddy"],
-            check=False, timeout=5, capture_output=True,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    # Reload Caddy so it picks up the new fragment on its next request
+    _reload_caddy()
 
 def _drop_caddy_fragment(slug: str) -> None:
     """Remove a single per-slug Caddy fragment. Used on app-delete."""
@@ -2400,13 +2405,7 @@ def _drop_caddy_fragment(slug: str) -> None:
             f.unlink()
     except OSError:
         pass
-    try:
-        subprocess.run(
-            ["systemctl", "reload", "caddy"],
-            check=False, timeout=5, capture_output=True,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    _reload_caddy()
 
 # Shared "Deploying..." placeholder directory. Holds a single index.html
 # served by the eager-Caddy fragment below. Idempotent: _ensure_deploying_page
@@ -2492,13 +2491,7 @@ def _write_caddy_deploying_fragment(slug: str) -> None:
         )
     except OSError:
         return
-    try:
-        subprocess.run(
-            ["systemctl", "reload", "caddy"],
-            check=False, timeout=5, capture_output=True,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    _reload_caddy()
 
 def _ensure_paused_page() -> None:
     """Write the shared `this app is paused` HTML if it is not there. One file, ~700 bytes. Re-runs are no-ops thanks to the content equality check."""
