@@ -27,7 +27,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useOutletContext } from "react-router-dom";
 import type { Project as ProjectType } from "@/lib/types";
 import { sessionApi, sessionsApi, deployedAppsApi } from "@/lib/api";
-import type { DeployedApp, DetectedDist } from "@/lib/api";
+import type { DeployedApp, DeployJobStatus, DetectedDist } from "@/lib/api";
 import { openEventStream } from "@/lib/ws";
 import { useTheme } from "@/lib/theme";
 import { useSessions } from "@/lib/sessionContext";
@@ -2234,27 +2234,31 @@ function DeployModal({
   sessionId: string;
   defaultName: string;
   onClose: () => void;
+  // The DeployResult from the OLD sync endpoint shape — ChatPage uses
+  // .app to splice the new app into the deployedApps array. We pass
+  // the canonical row from the job's `result` (or the placeholder
+  // app from the 202 if the user dismisses before the job finishes).
   onDeployed: (result: { slug: string; url: string; app: DeployedApp }) => void;
 }) {
+  // Phase machine. "config" is the initial slug+projectDir picker;
+  // "running" shows the step checklist and HARD-GATES every close
+  // affordance (backdrop click, ESC, Cancel button); "done" shows
+  // the URL + Open in new tab; "failed" shows the error + Dismiss.
+  type Phase = "config" | "running" | "done" | "failed";
+  const [phase, setPhase] = useState<Phase>("config");
   const [slug, setSlug] = useState(slugifyName(defaultName));
-  // Sub-app folder is auto-detected from the agent's build. The field
-  // is locked (read-only) — the user only chooses a slug. The backend's
-  // /detected-dist endpoint figures out which sub-app folder contains
-  // the dist. If the user genuinely has multiple sub-apps in one
-  // session, the dialog shows a small list so they know which one
-  // will be deployed.
   const [detected, setDetected] = useState<DetectedDist | null>(null);
   const [detecting, setDetecting] = useState(true);
   const [projectDir, setProjectDir] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
   const [slugError, setSlugError] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  // Job-state refs held across the running-phase polling loop.
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<DeployJobStatus | null>(null);
+  const [finalResult, setFinalResult] = useState<{ slug: string; url: string; app: DeployedApp } | null>(null);
+  const pollAbortRef = useRef<AbortController | null>(null);
 
-  // Fetch the detected dist on mount. If there's exactly one, we lock
-  // the field to its value. If there are 0, we show a "no build" hint
-  // and disable Deploy. If there are 2+, the dialog shows a <select>
-  // dropdown so the user picks which app to publish (we still pick
-  // the newest as the default).
+  // ---- Detect built dist on mount (same as the old modal).
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -2273,49 +2277,241 @@ function DeployModal({
     return () => { cancelled = true; };
   }, [sessionId]);
 
+  // ---- AbortController for the GET /deploy-jobs/{id} poll. We do
+  // NOT abort the POST itself on unmount — the deploy should keep
+  // running server-side so the user can come back and see the result.
+  // Only the polling is aborted (so a dead-tab doesn't keep pinging
+  // a finished job).
+  useEffect(() => {
+    return () => {
+      if (pollAbortRef.current) {
+        pollAbortRef.current.abort();
+        pollAbortRef.current = null;
+      }
+    };
+  }, []);
+
+  // ---- Polling loop. Starts on phase="running", stops on phase
+  // transition or unmount. 1.5s interval (matches the Admin page
+  // cadence for similar live-data surfaces).
+  useEffect(() => {
+    if (phase !== "running" || !jobId) return;
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled) return;
+      pollAbortRef.current = new AbortController();
+      try {
+        const s = await sessionApi.deployJobStatus(sessionId, jobId, {
+          signal: pollAbortRef.current.signal,
+        });
+        if (cancelled) return;
+        setJobStatus(s);
+        if (s.status === "succeeded") {
+          if (s.result) setFinalResult(s.result);
+          setPhase("done");
+        } else if (s.status === "failed" || s.status === "cancelled") {
+          setErr(s.error || (s.status === "cancelled" ? "Cancelled by you." : "Deploy failed."));
+          setPhase("failed");
+        }
+      } catch (e: any) {
+        if (cancelled) return;
+        // AbortError on unmount is fine — ignore it. Any other network
+        // error: keep polling (transient), don't flip the modal to failed.
+        if (e?.name === "AbortError") return;
+        // 404 means the job is gone (server restart, very old job) — show failed.
+        if (e?.status === 404) {
+          setErr("Deploy job not found on server. The backend may have restarted.");
+          setPhase("failed");
+        }
+      }
+    };
+    // Immediate first tick + 1.5s interval.
+    void tick();
+    const id = setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+      if (pollAbortRef.current) pollAbortRef.current.abort();
+    };
+  }, [phase, jobId, sessionId]);
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr(null);
     setSlugError(null);
-    setBusy(true);
+    // Submit the deploy. The POST returns 202 + a job_id immediately.
+    // We do NOT pass our own AbortSignal here — we want the deploy
+    // to keep running server-side even if the user closes the modal
+    // (they can come back and see the result via the deployed-apps
+    // strip, which re-fetches from /api/sessions/{id}/deployed-apps).
     try {
-      // project_dir is read-only in the UI; the backend's `detected`
-      // is the source of truth. We still pass it explicitly so the
-      // server's view stays consistent.
-      const result = await sessionApi.deploy(sessionId, {
+      const start = await sessionApi.deploy(sessionId, {
         slug: slug || undefined,
         project_dir: projectDir || undefined,
       });
-      onDeployed(result);
+      setJobId(start.job_id);
+      setJobStatus({
+        job_id: start.job_id, session_id: sessionId, slug: start.slug,
+        status: "pending", phase: "queued", steps: [], error: null,
+        result: null, created_at: Date.now() / 1000, updated_at: Date.now() / 1000,
+      });
+      setPhase("running");
     } catch (e: any) {
-      // 409 from the server = slug collision. The server does NOT
-      // auto-suffix with `-2`/`-3` anymore — the user has to pick a
-      // different slug. Surface it as a field-level error under the
-      // Slug input so it's impossible to miss.
       const msg = e?.message ?? "deploy failed";
       if (e?.status === 409 || /already taken/i.test(msg)) {
+        // 409: slug collision — surface as a field-level error so the
+        // user can fix it and re-submit. We stay in the config phase.
         setSlugError(msg.replace(/^409:\s*/, ""));
       } else {
         setErr(msg);
       }
-    } finally {
-      setBusy(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (!jobId) return;
+    try {
+      await sessionApi.cancelDeployJob(sessionId, jobId);
+      // The polling tick will pick up the "cancelled" status on the
+      // next iteration and flip to the failed view.
+    } catch {
+      // Best-effort. If the cancel request fails, the deploy will
+      // still complete on its own and the poll will surface it.
     }
   };
 
   const noBuild = !detecting && detected?.status === "none";
   const multiple = detected?.status === "multiple";
-  const ready = !detecting && !noBuild && !!slug;
+  const readyInConfig = !detecting && !noBuild && !!slug;
+  const isRunning = phase === "running";
+  const isDone = phase === "done";
+  const isFailed = phase === "failed";
 
-  return (
-    <div
-      role="dialog" aria-modal onClick={onClose}
-      className="fixed inset-0 z-40 flex items-end justify-center bg-black/45 backdrop-blur-sm sm:items-center"
-    >
-      <form
-        onSubmit={submit} onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-md space-y-3 rounded-t-2xl border border-border bg-surface p-5 shadow-lift sm:rounded-2xl"
-      >
+  // Backdrop click: hard no-op while running. Same for ESC.
+  const onBackdropClick = () => {
+    if (!isRunning) onClose();
+  };
+  useEffect(() => {
+    if (!isRunning) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") e.stopPropagation();
+    };
+    // Capture phase so we intercept ESC before any other handler.
+    window.addEventListener("keydown", onKey, { capture: true });
+    return () => window.removeEventListener("keydown", onKey, { capture: true });
+  }, [isRunning]);
+
+  // ---- Body content for each phase.
+  let body: JSX.Element;
+  if (isRunning || isDone || isFailed) {
+    body = (
+      <>
+        <h3 className="font-serif text-xl font-semibold tracking-tight">
+          {isDone ? "Deployment complete" : isFailed ? "Deployment failed" : "Deploying…"}
+        </h3>
+        {isRunning && (
+          <p className="text-tx-xs text-muted">
+            {jobStatus?.phase || "Starting…"} — keep this window open until it finishes.
+          </p>
+        )}
+        {/* Step checklist. 11 entries in a fixed order. We render them
+            by index so the UI is stable even if the server emits them
+            out of order (it shouldn't, but defensive). */}
+        <ol className="mt-1 space-y-1.5" data-testid="deploy-steps">
+          {Array.from({ length: 11 }).map((_, idx) => {
+            // Map index → label. The server emits the same 11 in the
+            // same order; we use the server's name/label when we have it.
+            const s = jobStatus?.steps?.[idx];
+            const label = s?.label ?? ["", "Validating", "Reserving URL", "Copying build",
+              "Copying backend", "Creating virtualenv", "Installing Python deps",
+              "Writing systemd unit", "Enabling service", "Recording deployment",
+              "Configuring proxy", "Starting service"][idx];
+            const status = s?.status ?? (isRunning ? "pending" : "pending");
+            const message = s?.message ?? null;
+            const isCurrent = status === "running";
+            const isDone_ = status === "done";
+            const isFailed_ = status === "failed";
+            return (
+              <li key={idx} className="flex items-start gap-2 text-tx-sm">
+                <span
+                  className={
+                    "mt-0.5 inline-flex size-4 shrink-0 items-center justify-center font-mono " +
+                    (isDone_ ? "text-success" :
+                     isFailed_ ? "text-danger" :
+                     isCurrent ? "text-accent" :
+                     "text-subtle")
+                  }
+                  aria-hidden
+                >
+                  {isDone_ ? "✓" :
+                   isFailed_ ? "✗" :
+                   isCurrent ? <span className="inline-block size-3 animate-spin rounded-full border-2 border-accent border-t-transparent" /> :
+                   "○"}
+                </span>
+                <div className="flex-1">
+                  <div className={
+                    isCurrent ? "font-medium text-text" :
+                    isDone_ ? "text-muted line-through opacity-70" :
+                    isFailed_ ? "text-danger" :
+                    "text-subtle"
+                  }>
+                    {label}
+                  </div>
+                  {message && (
+                    <div className={
+                      "mt-0.5 text-tx-xs " + (isFailed_ ? "text-danger" : "text-muted")
+                    }>
+                      {message}
+                    </div>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+        {isDone && finalResult && (
+          <div className="rounded-lg border border-success/30 bg-success/10 px-3 py-2 text-tx-sm">
+            <div className="text-success font-medium">Live now</div>
+            <a
+              href={finalResult.url}
+              target="_blank" rel="noreferrer"
+              className="mt-1 block break-all font-mono text-tx-xs text-accent hover:underline"
+            >
+              {finalResult.url}
+            </a>
+          </div>
+        )}
+        {isFailed && err && (
+          <div className="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-tx-xs text-danger">
+            {err}
+          </div>
+        )}
+        <div className="flex justify-end gap-2 pt-1">
+          {isRunning && (
+            <button type="button" onClick={cancel} className="btn-ghost" data-testid="deploy-cancel">
+              Stop deploy
+            </button>
+          )}
+          {isDone && (
+            <>
+              <a href={finalResult?.url ?? "#"} target="_blank" rel="noreferrer"
+                 className="btn-ghost">Open in new tab</a>
+              <button type="button" onClick={() => {
+                if (finalResult) onDeployed(finalResult);
+                onClose();
+              }} className="btn-primary">Done</button>
+            </>
+          )}
+          {isFailed && (
+            <button type="button" onClick={onClose} className="btn-primary">Dismiss</button>
+          )}
+        </div>
+      </>
+    );
+  } else {
+    // Config phase — the original UI.
+    body = (
+      <>
         <h3 className="font-serif text-xl font-semibold tracking-tight">Deploy this build</h3>
         <p className="text-tx-xs text-muted">
           The build's <code className="font-mono">dist/</code> will be copied
@@ -2339,7 +2535,6 @@ function DeployModal({
             </span>
           )}
         </label>
-
         <div className="block">
           <span className="text-tx-xs font-medium text-muted">
             Project{" "}
@@ -2382,7 +2577,6 @@ function DeployModal({
             </div>
           )}
         </div>
-
         {noBuild && (
           <div className="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-tx-xs text-danger">
             No built <code className="font-mono">dist/</code> found in this session. Ask the agent to run{" "}
@@ -2396,10 +2590,26 @@ function DeployModal({
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button type="button" onClick={onClose} className="btn-ghost">Cancel</button>
-          <button type="submit" disabled={busy || !ready} className="btn-primary">
-            {busy ? "Deploying…" : "Deploy"}
+          <button type="submit" disabled={!readyInConfig} className="btn-primary">
+            Deploy
           </button>
         </div>
+      </>
+    );
+  }
+
+  return (
+    <div
+      role="dialog" aria-modal
+      onClick={onBackdropClick}
+      className="fixed inset-0 z-40 flex items-end justify-center bg-black/45 backdrop-blur-sm sm:items-center"
+    >
+      <form
+        onSubmit={isRunning ? (e) => e.preventDefault() : submit}
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-md space-y-3 rounded-t-2xl border border-border bg-surface p-5 shadow-lift sm:rounded-2xl"
+      >
+        {body}
       </form>
     </div>
   );

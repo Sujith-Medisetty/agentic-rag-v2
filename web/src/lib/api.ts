@@ -246,6 +246,44 @@ export interface DeployResult {
   app: DeployedApp;
 }
 
+export type DeployStepStatus = "pending" | "running" | "done" | "failed";
+
+export interface DeployStep {
+  name: string;
+  label: string;
+  status: DeployStepStatus;
+  message: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export type DeployJobLifecycleStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface DeployJobStatus {
+  job_id: string;
+  session_id: string;
+  slug: string;
+  status: DeployJobLifecycleStatus;
+  phase: string;
+  steps: DeployStep[];
+  error: string | null;
+  result: DeployResult | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DeployJobStart {
+  job_id: string;
+  slug: string;
+  url: string;
+  placeholder_app: DeployedApp;
+}
+
 export const deployedAppsApi = {
   list: () => request<DeployedApp[]>("/api/deployed-apps"),
   delete: (slug: string) =>
@@ -380,13 +418,16 @@ export const sessionApi = {
       { method: "POST" },
     ),
   // Promote a session's built dist/ to a permanent subdomain URL.
-  //   slug         — leftmost label of the public URL. Server slugifies
-  //                  and -2/-3 suffixes on collision. Optional.
-  //   project_dir  — usually set automatically from `detectedDist()`;
-  //                  callers shouldn't need to pass it. Pass it manually
-  //                  only when you want to override the server's pick.
-  deploy: (sessionId: string, opts: { slug?: string; project_dir?: string } = {}) =>
-    request<DeployResult>(
+  // Returns 202 Accepted with a {job_id, slug, url, placeholder_app}
+  // envelope; the actual work runs in a background task and the
+  // client polls deployJobStatus() for per-step progress. Sync 4xx
+  // errors (no built dist, bad sub-app folder, slug collision) still
+  // come back as the corresponding status code from this same call
+  // (no job is created for those).
+  //   slug         — leftmost label of the public URL. Server slugifies.
+  //   project_dir  — usually set automatically from `detectedDist()`.
+  deploy: (sessionId: string, opts: { slug?: string; project_dir?: string } = {}, init?: { signal?: AbortSignal }) =>
+    request<DeployJobStart>(
       `/api/sessions/${encodeURIComponent(sessionId)}/deploy`,
       {
         method: "POST",
@@ -394,7 +435,24 @@ export const sessionApi = {
           slug: opts.slug ?? null,
           project_dir: opts.project_dir ?? null,
         }),
+        ...(init?.signal ? { signal: init.signal } : {}),
       },
+    ),
+  // Poll for the per-step status of an in-flight or recently-finished
+  // deploy. 404 if the job_id is unknown OR not owned by the caller
+  // (the server intentionally doesn't differentiate). 11 entries in
+  // `steps` in a fixed order so the UI checklist is stable.
+  deployJobStatus: (sessionId: string, jobId: string, init?: { signal?: AbortSignal }) =>
+    request<DeployJobStatus>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/deploy-jobs/${encodeURIComponent(jobId)}`,
+      init?.signal ? { signal: init.signal } : {},
+    ),
+  // Cooperative cancel of an in-flight deploy. Idempotent — returns
+  // {ok: false, reason: "job not running"} if the job is already done.
+  cancelDeployJob: (sessionId: string, jobId: string) =>
+    request<{ ok: boolean; reason?: string }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/deploy-jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
     ),
   // Scan the session workspace for built dist/ folders. The deploy
   // dialog calls this on open to pre-fill (and lock) the Sub-app
