@@ -536,7 +536,7 @@ export default function Admin() {
         </p>
         {apps.length === 0 ? (
           <div className="mt-3 rounded-md border border-border bg-elevated px-4 py-6 text-center text-sm text-muted">
-            No apps deployed yet. Click 🚀 Deploy next to a Preview banner in a chat.
+            No apps deployed yet. Build something in a chat session, then click the 🚀 Deploy button above the chat.
           </div>
         ) : (
           <div className="mt-3 max-h-[60vh] overflow-auto rounded-lg border border-border">

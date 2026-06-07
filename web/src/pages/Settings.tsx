@@ -106,7 +106,7 @@ export default function Settings() {
         <div className="rounded-2xl border border-border bg-surface p-8 text-center">
           <p className="text-tx-sm text-muted">No deployed apps yet.</p>
           <p className="mt-1 text-tx-xs text-subtle">
-            Build something in a chat session and click <span className="font-mono">🚀 Deploy</span> to see it here.
+            Build something in a chat session, then click the <span className="font-mono">🚀 Deploy</span> button above the chat to publish it. The dialog asks for a slug and shows the project to deploy.
           </p>
         </div>
       </div>

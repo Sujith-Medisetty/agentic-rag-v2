@@ -231,6 +231,13 @@ export interface DetectedDist {
   // The server's best guess (== candidates[0] when single). The dialog
   // pre-fills from this when present.
   auto_pick: string | null;
+  // True when the freshest dist in this session is newer than the
+  // most recent deploy FROM this session. Used by the chat to show
+  // a "Build ready" banner under the agent's last reply.
+  fresh_build: boolean;
+  // mtime (epoch seconds) of the freshest candidate, or 0 if none.
+  // Lets the UI show "built 3m ago" without re-fetching candidates.
+  fresh_mtime: number;
 }
 
 export interface DeployResult {

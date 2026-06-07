@@ -102,6 +102,14 @@ export default function ChatPage() {
   // /api/sessions/<id>/deployed-apps, refreshed when the user deploys a
   // new sub-app via the Deploy button or deletes one from the strip.
   const [deployedApps, setDeployedApps] = useState<DeployedApp[]>([]);
+  // "Build ready" detection — set when the session has a built dist
+  // newer than the most recent deploy FROM this session. The chat
+  // shows a banner under the agent's last turn when true, and the
+  // banner's Deploy button opens the same dialog as the strip's.
+  const [lastDetected, setLastDetected] = useState<DetectedDist | null>(null);
+  // The Deploy modal lives in the DeployStrip; this flag is what the
+  // build-ready banner flips on to open the same modal.
+  const [showDeployModal, setShowDeployModal] = useState(false);
   // Follow-mode for the chat scroll: stick to bottom while new events
   // arrive UNLESS the user scrolls up to read. If they do, leave them where
   // they are and pop a floating "↓" button so they can catch back up on a
@@ -195,6 +203,9 @@ export default function ChatPage() {
         // on every mount (refresh / session switch). Failure is non-fatal —
         // strip just shows empty.
         sessionApi.deployedApps(sessionId!).then(setDeployedApps).catch(() => {});
+        // Also load detected-dist so the build-ready banner knows whether
+        // to render. Same non-fatal failure mode.
+        sessionApi.detectedDist(sessionId!).then(setLastDetected).catch(() => {});
         // Record the watermark for the WS catchup. Use the latest event's
         // created_at in SECONDS (backend's column unit) so the next
         // ?since=<ts> query returns ONLY events newer than what we already
@@ -415,6 +426,13 @@ export default function ChatPage() {
           setTurns((ts) => [...ts, finished]);
           return null;
         });
+        // Re-poll detected-dist right after the turn ends so the
+        // build-ready banner appears under the new turn (the agent
+        // just finished writing files, the dist is fresh). Cheap
+        // call; the WS has no equivalent.
+        if (sessionId) {
+          sessionApi.detectedDist(sessionId).then(setLastDetected).catch(() => {});
+        }
         // Background auto-rename happens 0–6s after turn_summary. Refetch
         // the session once after a short delay so the sidebar picks up
         // the LLM-generated name without needing the WS event. Single
@@ -1007,9 +1025,20 @@ export default function ChatPage() {
         sessionId={sessionId ?? ""}
         sessionName={turns[0]?.userPrompt ?? "app"}
         apps={deployedApps}
-        onDeployed={(app) => setDeployedApps((prev) => [
-          app, ...prev.filter((a) => a.slug !== app.slug),
-        ])}
+        // Hoisted state so the build-ready banner can also open the
+        // modal (single source of truth — both the strip button and
+        // the banner button call setShowDeployModal(true)).
+        showModal={showDeployModal}
+        onShowModalChange={setShowDeployModal}
+        onDeployed={(app) => {
+          setDeployedApps((prev) => [
+            app, ...prev.filter((a) => a.slug !== app.slug),
+          ]);
+          // After a successful deploy, the dist is no longer "fresh" —
+          // re-fetch detected-dist so the banner disappears and
+          // fresh_mtime is fresh again for the next build.
+          sessionApi.detectedDist(sessionId!).then(setLastDetected).catch(() => {});
+        }}
         onDeleted={(slug) => setDeployedApps((prev) => prev.filter((a) => a.slug !== slug))}
         onToggled={(slug, state) => setDeployedApps((prev) =>
           prev.map((a) => (a.slug === slug ? { ...a, state } : a))
@@ -1054,6 +1083,18 @@ export default function ChatPage() {
           )}
           {turns.length === 0 && !currentTurn && !loadErr && (
             <EmptyState />
+          )}
+          {/* Build-ready banner — appears below the last finished turn
+              when a fresh build is detected (newer than the latest
+              deploy from this session, or no deploys yet). The user
+              clicks Deploy to open the same dialog as the strip's
+              button. The strip's "show modal" state is what we
+              trigger — keep them in sync. */}
+          {sessionId && lastDetected?.fresh_build && !currentTurn && (
+            <BuildReadyBanner
+              onDeploy={() => setShowDeployModal(true)}
+              mtime={lastDetected.fresh_mtime}
+            />
           )}
         </div>
         </div>
@@ -1989,6 +2030,61 @@ function DebugStream({
 
 
 // ============================================================================
+// BuildReadyBanner — small CTA that sits directly under the agent's last
+// finished turn when a fresh build is detected. The user reads the
+// agent's "Build complete." line, sees this right below it, and clicks
+// the button to open the same deploy modal as the strip.
+//
+// The banner is shown for builds that are NEWER than the most recent
+// deploy FROM this session (mtime > last_redeploy_at) — see
+// `fresh_build` in the /detected-dist response. After a successful
+// deploy the banner goes away on its own (we re-fetch detected-dist).
+// ============================================================================
+
+function timeAgoShort(epochSeconds: number): string {
+  if (!epochSeconds) return "";
+  const sec = Math.max(1, Math.floor(Date.now() / 1000 - epochSeconds));
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
+}
+
+function BuildReadyBanner({
+  onDeploy, mtime,
+}: {
+  onDeploy: () => void;
+  mtime: number;
+}) {
+  return (
+    <div
+      data-testid="build-ready-banner"
+      className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-accent/40 bg-accent/10 px-4 py-3"
+    >
+      <div className="flex items-center gap-2 text-tx-sm font-medium text-accent">
+        <span aria-hidden>✓</span>
+        Build complete
+        {mtime > 0 && (
+          <span className="font-normal text-tx-xs text-muted">
+            · built {timeAgoShort(mtime)}
+          </span>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={onDeploy}
+        className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/20 px-3 py-1.5 text-tx-sm font-medium text-accent hover:bg-accent/30"
+      >
+        <UploadIcon /> Deploy
+      </button>
+    </div>
+  );
+}
+
+
+// ============================================================================
 // DeployStrip — sticky horizontal strip between the plan panel and the chat
 // scroll area. Shows every app deployed FROM this session as a pill (slug +
 // open + delete) plus a "Deploy" button that opens the modal.
@@ -1996,6 +2092,7 @@ function DebugStream({
 
 function DeployStrip({
   sessionId, sessionName, apps, onDeployed, onDeleted, onToggled,
+  showModal: showModalProp, onShowModalChange,
 }: {
   sessionId: string;
   sessionName: string;
@@ -2003,8 +2100,19 @@ function DeployStrip({
   onDeployed: (app: DeployedApp) => void;
   onDeleted: (slug: string) => void;
   onToggled: (slug: string, state: string) => void;
+  // The build-ready banner also opens this dialog. State is hoisted
+  // to ChatPage so the banner and the strip share one source of
+  // truth. If the prop is omitted (e.g. in tests), we fall back to
+  // local state.
+  showModal?: boolean;
+  onShowModalChange?: (v: boolean) => void;
 }) {
-  const [showModal, setShowModal] = useState(false);
+  const [localShow, setLocalShow] = useState(false);
+  const showModal = showModalProp ?? localShow;
+  const setShowModal = (v: boolean) => {
+    if (onShowModalChange) onShowModalChange(v);
+    else setLocalShow(v);
+  };
 
   return (
     <>
@@ -2140,11 +2248,13 @@ function DeployModal({
   const [projectDir, setProjectDir] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [slugError, setSlugError] = useState<string | null>(null);
 
   // Fetch the detected dist on mount. If there's exactly one, we lock
   // the field to its value. If there are 0, we show a "no build" hint
-  // and disable Deploy. If there are 2+, we show them as a list so the
-  // user knows which one will be deployed (we still pick the newest).
+  // and disable Deploy. If there are 2+, the dialog shows a <select>
+  // dropdown so the user picks which app to publish (we still pick
+  // the newest as the default).
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -2166,19 +2276,28 @@ function DeployModal({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr(null);
+    setSlugError(null);
     setBusy(true);
     try {
       // project_dir is read-only in the UI; the backend's `detected`
       // is the source of truth. We still pass it explicitly so the
-      // server's view stays consistent (and a future "edit" toggle
-      // can re-use this).
+      // server's view stays consistent.
       const result = await sessionApi.deploy(sessionId, {
         slug: slug || undefined,
         project_dir: projectDir || undefined,
       });
       onDeployed(result);
     } catch (e: any) {
-      setErr(e?.message ?? "deploy failed");
+      // 409 from the server = slug collision. The server does NOT
+      // auto-suffix with `-2`/`-3` anymore — the user has to pick a
+      // different slug. Surface it as a field-level error under the
+      // Slug input so it's impossible to miss.
+      const msg = e?.message ?? "deploy failed";
+      if (e?.status === 409 || /already taken/i.test(msg)) {
+        setSlugError(msg.replace(/^409:\s*/, ""));
+      } else {
+        setErr(msg);
+      }
     } finally {
       setBusy(false);
     }
@@ -2187,11 +2306,6 @@ function DeployModal({
   const noBuild = !detecting && detected?.status === "none";
   const multiple = detected?.status === "multiple";
   const ready = !detecting && !noBuild && !!slug;
-
-  // Pretty label for the locked field: "" → "session root", else the
-  // folder name.
-  const subdirLabel = projectDir === "" ? "<session root>" : projectDir;
-  const inputDisplay = projectDir;  // backend stores "" for root
 
   return (
     <div
@@ -2211,42 +2325,61 @@ function DeployModal({
           <span className="text-tx-xs font-medium text-muted">Slug</span>
           <input
             type="text" value={slug}
-            onChange={(e) => setSlug(slugifyName(e.target.value))}
-            className="field mt-1 font-mono"
+            onChange={(e) => { setSlug(slugifyName(e.target.value)); setSlugError(null); }}
+            aria-invalid={!!slugError}
+            className={`field mt-1 font-mono ${slugError ? "border-danger/60" : ""}`}
             placeholder="weather-app" required autoFocus
           />
           <span className="mt-1 block text-tx-xs text-subtle">
             URL: <span className="font-mono">https://{slug || "<slug>"}.{hostApps()}/</span>
           </span>
+          {slugError && (
+            <span className="mt-1 block text-tx-xs text-danger" role="alert">
+              {slugError}
+            </span>
+          )}
         </label>
 
         <div className="block">
           <span className="text-tx-xs font-medium text-muted">
-            Sub-app folder{" "}
-            <span className="text-subtle">(auto-detected from the agent's build — locked)</span>
+            Project{" "}
+            <span className="text-subtle">
+              ({multiple ? "pick which app to publish" : "auto-detected from the agent's build"})
+            </span>
           </span>
           {detecting ? (
             <div className="field mt-1 flex items-center gap-2 text-tx-xs text-muted">
               <span className="inline-block size-3 animate-spin rounded-full border-2 border-muted border-t-transparent" />
               Detecting build…
             </div>
-          ) : (
+          ) : multiple ? (
             <>
-              <div className="field mt-1 flex items-center gap-2 font-mono text-tx-sm">
-                <span aria-hidden className="text-muted">🔒</span>
-                <span data-testid="detected-subdir" className="flex-1">{subdirLabel || "—"}</span>
-                {inputDisplay === "" && (
-                  <span className="rounded bg-surface-2 px-1.5 py-0.5 text-tx-xs text-muted">root</span>
-                )}
-              </div>
-              {multiple && (
-                <p className="mt-1 text-tx-xs text-muted">
-                  Multiple sub-apps in this session — deploying{" "}
-                  <code className="font-mono">{subdirLabel}</code>{" "}
-                  (newest). Delete the other build(s) to narrow it down.
-                </p>
-              )}
+              <select
+                value={projectDir}
+                onChange={(e) => setProjectDir(e.target.value)}
+                className="field mt-1 font-mono"
+                data-testid="detected-subdir"
+              >
+                {detected?.candidates.map((c) => (
+                  <option key={c.project_dir} value={c.project_dir}>
+                    {c.project_dir === "" ? "<session root>" : c.project_dir}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-tx-xs text-muted">
+                Multiple projects built in this session — pick the one to publish.
+              </p>
             </>
+          ) : (
+            <div className="field mt-1 flex items-center gap-2 font-mono text-tx-sm">
+              <span aria-hidden className="text-muted">🔒</span>
+              <span data-testid="detected-subdir" className="flex-1">
+                {projectDir === "" ? "<session root>" : (projectDir || "—")}
+              </span>
+              {projectDir === "" && (
+                <span className="rounded bg-surface-2 px-1.5 py-0.5 text-tx-xs text-muted">root</span>
+              )}
+            </div>
           )}
         </div>
 
