@@ -79,13 +79,31 @@
 	# kicks in when the slug's dir has been renamed to `/opt/ojas-apps/.stopped/<slug>/`
 	# by the toggle endpoint in server/app.py (deployed_app_stop), so
 	# paused apps serve a friendly "this app is paused" page instead of 404.
+	#
+	# Fullstack apps (v1.1+) have their static files at
+	# /opt/ojas-apps/<slug>/static/ (not directly under <slug>/). The
+	# try_files chain checks both locations: <slug>/index.html (static)
+	# or <slug>/static/index.html (fullstack). One of them will hit;
+	# the other 404s silently inside `try_files`. The `/api/*` proxy
+	# is added in the per-slug fragment in routes.d/ (see below).
 	handle {
 		rewrite * /{labels.3}{uri}
 		root * /opt/ojas-apps
-		try_files {path} /{labels.3}/index.html /.paused/index.html
+		try_files {path} /{labels.3}/index.html /{labels.3}/static/index.html /.paused/index.html
 		file_server
 	}
+	# Per-slug fragments for FULLSTACK apps are imported at the SERVER
+	# level (below) so they become separate site blocks that override
+	# this wildcard. Static apps don't have a fragment, so the
+	# wildcard block above handles them.
 }
+
+# Per-slug site blocks for fullstack apps. Imported at server level
+# (NOT inside the wildcard site block) so each one becomes its own
+# site block that takes precedence over `*.ojas.example.com` for
+# matching hostnames. server/app.py writes/refreshes these on every
+# fullstack deploy + toggle.
+import /etc/caddy/routes.d/*.caddy
 
 ojas.example.com {
 	# The frontend's built static files. The install script copies them here.
