@@ -1,5 +1,5 @@
 """
-FastAPI app — HTTP + WebSocket surface for the web backend.
+FastAPI app -- HTTP + WebSocket surface for the web backend.
 
 Run:  uvicorn server.app:app --host 127.0.0.1 --port 8765
 
@@ -60,13 +60,13 @@ logger = logging.getLogger("ojas.app")
 # Load .env at the project root BEFORE any other module reads os.getenv. The
 # file is owner-only by convention (`chmod 600 .env`) and is git-ignored, so
 # secrets stay out of the repo. python-dotenv silently no-ops if the file is
-# missing — production VMs can still set vars via systemd / docker env if
+# missing -- production VMs can still set vars via systemd / docker env if
 # they prefer.
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 except ImportError:
-    pass   # dotenv not installed — fall back to shell env only
+    pass   # dotenv not installed -- fall back to shell env only
 
 from fastapi import (
     Depends, FastAPI, HTTPException, Header, Query, Request, Response,
@@ -91,7 +91,7 @@ from server.session_runner import run_turn
 
 
 # ============================================================================
-# App lifecycle — bootstrap DB + safety singletons on startup
+# App lifecycle -- bootstrap DB + safety singletons on startup
 # ============================================================================
 
 @asynccontextmanager
@@ -111,7 +111,7 @@ def _reconcile_deployed_apps_on_boot() -> None:
     leaving a deployed app's dir at the wrong path (e.g. a paused
     app's dir still at the live path because the rename to .stopped
     never completed). Caddy will then serve the wrong content. The
-    reconciliation is idempotent — for each row we just call
+    reconciliation is idempotent -- for each row we just call
     _apply_app_state_to_disk() which is a no-op if the dir is already
     in the right place.
     """
@@ -141,12 +141,12 @@ def _register_ojas_services() -> None:
     are also created/refreshed here so the panel always reflects the
     truth on disk under /opt/ojas-apps/."""
     # 1) Drop any stale PID rows from a previous boot. Deployed-app port
-    #    rows (pid IS NULL) are kept — they're tied to on-disk files, not
+    #    rows (pid IS NULL) are kept -- they're tied to on-disk files, not
     #    a process. We'll re-add the still-running ones below.
     db.clear_ojas_services_with_pid()
 
     # 2) Main uvicorn process. PID of this process is the uvicorn worker
-    #    (the parent is whatever launched us — uvicorn / python -m / etc.).
+    #    (the parent is whatever launched us -- uvicorn / python -m / etc.).
     main_pid = os.getpid()
     bind_addr = "127.0.0.1"
     # Try to read the actual --port from the parent cmdline (works for the
@@ -176,7 +176,7 @@ def _register_ojas_services() -> None:
 
     # 3) Caddy reverse proxy (if installed). Caddy terminates 80/443 and
     #    forwards to this backend. Detect via PATH lookup; if missing,
-    #    skip — a developer running `uvicorn` directly won't have it.
+    #    skip -- a developer running `uvicorn` directly won't have it.
     caddy_path = shutil.which("caddy")
     if caddy_path:
         # Find caddy's pid + a list of ports it's actually bound to.
@@ -227,7 +227,7 @@ def _register_ojas_services() -> None:
         # Cache the discovered ports in the ojas-external reconcile step
         # too, so the /api/admin/services call returns them.
 
-    # 3b) Ojas web UI — the React/Vite build at /opt/ojas/web/dist. NOT a
+    # 3b) Ojas web UI -- the React/Vite build at /opt/ojas/web/dist. NOT a
     #     separate process: the static files are served by caddy's
     #     file_server directive (see deploy/Caddyfile). Registered as a
     #     port-only row pointing at the caddy URL so the admin panel
@@ -265,13 +265,13 @@ def _register_ojas_services() -> None:
                 },
             )
 
-    # 4) Deployed apps — port-only rows. Each deployed app is static
+    # 4) Deployed apps -- port-only rows. Each deployed app is static
     #    files served at /apps/<slug>/ via caddy (or by this backend in
     #    dev mode). Re-register every row on disk so the panel stays
     #    accurate even if the backend was restarted.
     OJAS_APPS_ROOT.mkdir(parents=True, exist_ok=True)
     # Resolve the apps root domain once. Apps live at <slug>.<apps_root>
-    # — separate from the apex (the Ojas main URL) so users can host
+    # -- separate from the apex (the Ojas main URL) so users can host
     # apps on a different domain if they want.
     apps_root = _resolve_apps_root_domain() or public_domain
     for app_row in db.list_deployed_apps(owner_user_id=None):
@@ -308,7 +308,7 @@ def _listening_ports_for_pids(pids: list[int]) -> list[int]:
     """Return the sorted list of ports any process in `pids` is currently
     listening on. Tries, in order:
       1. `ss -ltnp -H` (works fully when the process is owned by us;
-         partial — no pid info — for foreign-user processes)
+         partial -- no pid info -- for foreign-user processes)
       2. /proc/<pid>/fd + /proc/net/tcp inode walk (works fully only for
          same-user pids)
     For a non-root service like the Ojas backend (running as the `ojas`
@@ -344,7 +344,7 @@ def _listening_ports_for_pids(pids: list[int]) -> list[int]:
                     continue
             if ports:
                 return sorted(ports)
-    # Fallback — /proc scan. Works for the main backend (same user); fails
+    # Fallback -- /proc scan. Works for the main backend (same user); fails
     # for foreign-user processes like caddy running as the `caddy` user.
     inodes_for_pid: set[str] = set()
     try:
@@ -406,7 +406,7 @@ async def _configure_runtime_singletons() -> None:
     cfg = load_config(workspace=workspace, cli_model=None)
 
     perm_mode = cfg.permission_mode
-    # Web mode never prompts on stdin — sensitive ops should be approved via
+    # Web mode never prompts on stdin -- sensitive ops should be approved via
     # a UI modal in a later phase; for now we trust whatever the config sets.
     perm = PermissionPolicy(mode=perm_mode, prompter=None)
     sandbox = resolve_sandbox(
@@ -433,7 +433,7 @@ async def _configure_runtime_singletons() -> None:
         provider=cfg.provider,
     )
 
-    # MCP tools — empty `mcp_servers` config returns [] immediately, so this
+    # MCP tools -- empty `mcp_servers` config returns [] immediately, so this
     # is a no-op for fresh installs. Once the user adds entries to .agent.json
     # and restarts the backend, the loaded tools land here, get bound to the
     # agent's tool list, and are surfaced in the system prompt.
@@ -444,7 +444,7 @@ async def _configure_runtime_singletons() -> None:
 app = FastAPI(title="agentic-rag-v2", lifespan=lifespan)
 
 
-# CORS — the Vite dev server runs on a different port than the FastAPI app
+# CORS -- the Vite dev server runs on a different port than the FastAPI app
 # during development. In production the static build is served by FastAPI
 # itself so CORS isn't needed there.
 _DEFAULT_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
@@ -475,7 +475,7 @@ def require_token(authorization: str | None = Header(default=None)) -> str:
 def require_user(authorization: str | None = Header(default=None)) -> dict:
     """Like `require_token` but resolves the bearer to a full user dict
     (with `id`, `email`, `role`). Used by any handler that needs to know
-    WHO is calling — i.e. anything multi-user (project / session listing,
+    WHO is calling -- i.e. anything multi-user (project / session listing,
     creation, deletion) plus the admin endpoints."""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing bearer token")
@@ -487,7 +487,7 @@ def require_user(authorization: str | None = Header(default=None)) -> dict:
 
 
 def require_root(user: dict = Depends(require_user)) -> dict:
-    """Gate admin endpoints — caller must be the root user."""
+    """Gate admin endpoints -- caller must be the root user."""
     if user.get("role") != "root":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "root role required")
     return user
@@ -543,7 +543,7 @@ def auth_signup(req: SignupRequest):
     try:
         _bootstrap_default_project(user)
     except Exception:
-        # Project creation must not break signup itself — the user can
+        # Project creation must not break signup itself -- the user can
         # still trigger it via the Workspace flow on next visit. We log
         # with full traceback so a recurrence is debuggable instead of
         # silently leaving the user with a half-set-up account that
@@ -566,7 +566,7 @@ def auth_signup(req: SignupRequest):
 
 
 def _bootstrap_default_project(user: dict) -> None:
-    """Idempotent — create the calling user's default project if they don't
+    """Idempotent -- create the calling user's default project if they don't
     already have one. Shared between auth_signup and projects_default so
     both code paths behave identically."""
     if db.list_projects(user_id=user["id"]):
@@ -674,7 +674,7 @@ def _default_workspace_path() -> str:
     """Where should the default project live on disk?
 
     Resolution order:
-      1. `OJAS_DEFAULT_WORKSPACE` env var — explicit override, wins always.
+      1. `OJAS_DEFAULT_WORKSPACE` env var -- explicit override, wins always.
       2. Platform default:
          - macOS:    ~/Desktop/Ojas
          - Linux:    ~/ojas         (no Desktop folder convention)
@@ -706,7 +706,7 @@ def projects_default(user: dict = Depends(require_user)):
     # If the user already owns ANY project, reuse it. We used to require an
     # exact `workspace_path` match here, but path canonicalization differences
     # (symlinks / trailing slash / Path(...).resolve()) were producing one
-    # new orphan project per login on the VM — the old one's sessions then
+    # new orphan project per login on the VM -- the old one's sessions then
     # became unreachable. Returning the first owned project is robust to all
     # of that. Users only ever have one "default" in practice.
     existing = db.list_projects(user_id=user["id"])
@@ -759,7 +759,7 @@ def projects_get(project_id: str, user: dict = Depends(require_user)):
 
 def _purge_session_state_dir(session_id: str) -> None:
     """Best-effort removal of a session's private agent-state directory
-    (~/.agent/sessions/<id>/). Silently swallows errors — the DB row is
+    (~/.agent/sessions/<id>/). Silently swallows errors -- the DB row is
     already gone, so we don't want a stuck file to prevent the API call
     from succeeding."""
     import shutil
@@ -775,7 +775,7 @@ def _purge_session_state_dir(session_id: str) -> None:
 def _purge_langgraph_checkpoint(session_id: str) -> None:
     """Delete this session's LangGraph checkpoint rows from
     ~/.agent/checkpoints.db. Without this, the agent's compacted message
-    history persists forever even after the session is deleted — if the
+    history persists forever even after the session is deleted -- if the
     same session_id were ever reused (unlikely but possible), the new
     session would resume from the old conversation."""
     try:
@@ -784,7 +784,7 @@ def _purge_langgraph_checkpoint(session_id: str) -> None:
         if cp is not None and hasattr(cp, "delete_thread"):
             cp.delete_thread(session_id)
     except Exception:
-        # Fallback: raw SQL on the known SqliteSaver tables. Best-effort —
+        # Fallback: raw SQL on the known SqliteSaver tables. Best-effort --
         # if the schema changes in a future langgraph version, this just
         # leaves orphan rows (functionally harmless).
         import sqlite3
@@ -823,7 +823,7 @@ def _purge_session_bus(session_id: str) -> None:
 def _purge_session_workspace_subdir(session: dict) -> None:
     """Delete the session's private subdirectory under its project workspace.
     This is where the agent actually built files for this session, so on
-    session delete we want it gone. Best-effort — silently skips if the
+    session delete we want it gone. Best-effort -- silently skips if the
     project is gone (cascade may have happened first) or the subdir is missing."""
     import shutil
     try:
@@ -841,7 +841,7 @@ def _purge_session_workspace_subdir(session: dict) -> None:
             ws_resolved = Path(project["workspace_path"]).resolve()
             target_resolved.relative_to(ws_resolved)
         except (ValueError, OSError):
-            return  # subdir is suspiciously outside the workspace — skip
+            return  # subdir is suspiciously outside the workspace -- skip
         if target_resolved.exists():
             shutil.rmtree(target_resolved, ignore_errors=True)
     except Exception:
@@ -872,7 +872,7 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
     import shutil
     try:
         # Inline SQL because db.list_deployed_apps doesn't filter by session.
-        with db._connect() as cx:   # noqa: SLF001 — internal helper, fine here
+        with db._connect() as cx:   # noqa: SLF001 -- internal helper, fine here
             rows = cx.execute(
                 "SELECT slug, app_dir FROM deployed_apps "
                 "WHERE source_session_id = ?",
@@ -887,7 +887,7 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
             _stop_app_service(row_full)
             # The app dir is at /opt/ojas-apps/<slug>/. If the app was
             # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
-            # instead — wipe both.
+            # instead -- wipe both.
             for d in (row["app_dir"], str(OJAS_APPS_STOPPED_DIR / slug)):
                 if d and Path(d).exists():
                     try:
@@ -904,7 +904,7 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
 
 def _purge_session_everything(session: dict) -> None:
     """One-stop cleanup for everything tied to a session OUTSIDE the main
-    SQLite (which CASCADE handles). Idempotent + best-effort — none of
+    SQLite (which CASCADE handles). Idempotent + best-effort -- none of
     these can fail the API call."""
     sid = session["id"]
     _kill_session_processes(sid)
@@ -922,7 +922,7 @@ def _purge_user_everything(user_id: str) -> None:
     to SIGTERM the agent's spawned processes + rm workspace subdirs +
     drop langgraph checkpoints + clear the per-session event bus.
 
-    Deployed apps are NOT touched here — they have ON DELETE SET NULL on
+    Deployed apps are NOT touched here -- they have ON DELETE SET NULL on
     owner_user_id, so the DB row survives with owner_user_id=NULL. The
     on-disk files at /opt/ojas-apps/<slug>/ also stay; the apps remain
     live at https://<host>/apps/<slug>/ but become 'orphan' (visible
@@ -978,7 +978,7 @@ def sessions_delete(session_id: str, user: dict = Depends(require_user)):
 @app.get("/api/sessions/{session_id}", response_model=SessionResponse)
 def sessions_get(session_id: str, user: dict = Depends(require_user)):
     """Fetch a single session's current state. Used by the chat page
-    after turn_summary to re-read the (potentially LLM-renamed) name —
+    after turn_summary to re-read the (potentially LLM-renamed) name --
     the WS session_renamed event isn't 100% reliable on flaky mobile
     networks, so the frontend polls as a safety net."""
     session = _session_or_404(session_id, user)
@@ -1001,7 +1001,7 @@ def sessions_rename(
                       from `new_name` if auto-suffixed)
       X-Was-Suffixed: "true" if auto-suffix kicked in, "false" otherwise
 
-    The body is the same SessionResponse shape as a normal success — the
+    The body is the same SessionResponse shape as a normal success -- the
     `name` field already contains the actual final name."""
     session = _session_or_404(session_id, user)
     desired = req.new_name
@@ -1178,7 +1178,7 @@ def sessions_create(
     # never materialised. Previously a silent _bootstrap_default_project
     # failure during signup would leave the project row pointing at a path
     # that didn't exist (or got patched in as root and thus unwritable by
-    # the ojas service user) — sessions_create would then 500 with an
+    # the ojas service user) -- sessions_create would then 500 with an
     # opaque "Permission denied: <subdir>" error. Now we validate the
     # parent first, attempt to (re)create it with our own ownership, and
     # surface a much clearer error when even that fails.
@@ -1205,7 +1205,7 @@ def sessions_create(
             f"could not create session workspace: {e}",
         )
     # Update the DB row with the subdir we just created.
-    with db._connect() as cx:   # noqa: SLF001 — small helper, inline write
+    with db._connect() as cx:   # noqa: SLF001 -- small helper, inline write
         cx.execute(
             "UPDATE sessions SET workspace_subdir = ? WHERE id = ?",
             (subdir_slug, s["id"]),
@@ -1254,7 +1254,7 @@ async def messages_post(
         )
 
     # Make sure the bus is bound to THIS loop before the worker thread starts
-    # publishing — bind_loop is idempotent.
+    # publishing -- bind_loop is idempotent.
     bus = get_bus(session_id)
     if not bus.is_bound():
         bus.bind_loop(asyncio.get_running_loop())
@@ -1271,7 +1271,7 @@ async def messages_post(
     return {"accepted": True}
 
 
-# Per-session in-flight turn registry — used by the cancel endpoint to abort a
+# Per-session in-flight turn registry -- used by the cancel endpoint to abort a
 # running turn. Cleared when the task finishes naturally.
 _active_turns: dict[str, asyncio.Task] = {}
 
@@ -1282,7 +1282,7 @@ async def cancel_turn(
     user: dict = Depends(require_user),
 ):
     _session_or_404(session_id, user)
-    """Cancel the in-flight turn for this session, if any. Idempotent — if no
+    """Cancel the in-flight turn for this session, if any. Idempotent -- if no
     turn is running, returns ok=false rather than failing.
 
     The end-of-turn events (error + assistant_text(done=True) + turn_summary
@@ -1293,7 +1293,7 @@ async def cancel_turn(
 
     The in-flight worker thread is hard to interrupt (Python limitation), so
     late events from the LangGraph worker may still drip onto the bus for a
-    few seconds — the UI ignores them once turn_summary has arrived."""
+    few seconds -- the UI ignores them once turn_summary has arrived."""
     task = _active_turns.get(session_id)
     if task is None or task.done():
         return {"ok": False, "reason": "no active turn"}
@@ -1316,10 +1316,10 @@ async def compact_session(
     version: a SystemMessage summary + the last few messages verbatim. The
     `add_messages` reducer accepts `RemoveMessage(id=...)` for deletion, so
     we send removes for every existing message followed by the compacted
-    list — no orphans, no duplication.
+    list -- no orphans, no duplication.
     """
     if _active_turns.get(session_id) and not _active_turns[session_id].done():
-        return {"ok": False, "reason": "a turn is in flight — cancel it first"}
+        return {"ok": False, "reason": "a turn is in flight -- cancel it first"}
 
     from agents.graph import runner_graph
     from langchain_core.messages import RemoveMessage
@@ -1408,7 +1408,7 @@ async def sessions_push(session_id: str, user: dict = Depends(require_user)):
 
 
 # ============================================================================
-# WebSocket — live activity stream
+# WebSocket -- live activity stream
 # ============================================================================
 
 @app.websocket("/api/sessions/{session_id}/stream")
@@ -1445,7 +1445,7 @@ async def stream(websocket: WebSocket, session_id: str):
     if session is None:
         await websocket.close(code=4404, reason="session not found")
         return
-    # Ownership check — non-root users can only stream their own sessions.
+    # Ownership check -- non-root users can only stream their own sessions.
     if user["role"] != "root" and session.get("user_id") not in (None, user["id"]):
         await websocket.close(code=4404, reason="session not found")
         return
@@ -1468,7 +1468,7 @@ async def stream(websocket: WebSocket, session_id: str):
 
 
 # ============================================================================
-# Preview — serve the session's built PWA so it can be installed on any device.
+# Preview -- serve the session's built PWA so it can be installed on any device.
 # ============================================================================
 
 def _session_preview_dir(
@@ -1480,7 +1480,7 @@ def _session_preview_dir(
     that emits preview_ready events AND by the deploy endpoint to find the
     files to copy.
 
-    `project_dir` lets a single session host multiple apps — the session
+    `project_dir` lets a single session host multiple apps -- the session
     workspace might contain `calorie-tracker/dist/`, `weather/dist/`, etc.,
     and each can be deployed as its own slug. Empty/None → session root.
     """
@@ -1502,11 +1502,18 @@ def _session_preview_dir(
             return None
         for p in parts:
             base = base / p
+    # Resolve dist/ -- for a fullstack project (backend/ + frontend/),
+    # the Vite build is at <project>/frontend/dist, not <project>/dist.
+    # Static-only projects use <project>/dist. Try fullstack first; fall
+    # back to the static location.
+    fullstack = base / "frontend" / "dist" / "index.html"
+    if fullstack.exists():
+        return base / "frontend" / "dist"
     return base / "dist"
 
 
 # Directories the agent scaffold script creates that the deploy detector
-# must NOT consider as a "sub-app" — they're build artefacts, not user apps.
+# must NOT consider as a "sub-app" -- they're build artefacts, not user apps.
 _DEPLOY_IGNORE_DIRS = frozenset({
     "node_modules", ".git", ".claude", ".cache", "dist", "build",
     ".next", ".nuxt", ".svelte-kit", ".vite", "coverage", ".turbo",
@@ -1549,11 +1556,21 @@ def _detect_dist_candidates(session_id: str) -> list[dict]:
 
     cands: list[dict] = []
 
-    # 1) Session root dist/ (project_dir="") — only if it's a *real*
-    #    user build, i.e. there's a package.json alongside. Without one
-    #    we treat root as "no app at root" so we don't suggest an empty
-    #    dist/ the agent never wrote.
+    # 1) Session root dist/ (project_dir="") -- only if it's a *real*
+    #    user build. Two layouts count as a "real" root build:
+    #      (a) static Vite at root:  <base>/package.json + <base>/dist/index.html
+    #      (b) fullstack at root:    <base>/frontend/dist/index.html
+    #                                 (and ideally <base>/backend/ alongside,
+    #                                 but we accept the dist alone so the user
+    #                                 sees the candidate even if backend/ is
+    #                                 mid-scaffold). The deploy-time
+    #                                 fullstack check (presence of
+    #                                 backend/requirements.txt or
+    #                                 backend/main.py) decides the runtime
+    #                                 path; the candidate is the dist that
+    #                                 needs promoting.
     root_dist = base / "dist" / "index.html"
+    root_fullstack_dist = base / "frontend" / "dist" / "index.html"
     if root_dist.exists() and (base / "package.json").exists():
         try:
             st = (base / "dist").stat()
@@ -1565,9 +1582,21 @@ def _detect_dist_candidates(session_id: str) -> list[dict]:
             })
         except OSError:
             pass
+    elif root_fullstack_dist.exists():
+        try:
+            st = (base / "frontend" / "dist").stat()
+            cands.append({
+                "project_dir": "",
+                "abs_path": str(base / "frontend" / "dist"),
+                "mtime": int(st.st_mtime),
+                "index_size": root_fullstack_dist.stat().st_size,
+            })
+        except OSError:
+            pass
 
     # 2) Sub-app folders (any direct child that's a directory, not in
-    #    the noise set, and contains dist/index.html).
+    #    the noise set, and contains dist/index.html OR a fullstack
+    #    layout with frontend/dist/index.html).
     try:
         children = sorted(base.iterdir(), key=lambda p: p.name)
     except OSError:
@@ -1577,14 +1606,24 @@ def _detect_dist_candidates(session_id: str) -> list[dict]:
             continue
         if child.name in _DEPLOY_IGNORE_DIRS or child.name.startswith("."):
             continue
-        dist_idx = child / "dist" / "index.html"
-        if not dist_idx.exists():
+        # Static: <child>/dist/index.html
+        static_idx = child / "dist" / "index.html"
+        # Fullstack: <child>/frontend/dist/index.html (Vite build under
+        # the frontend/ subdir of a backend+frontend scaffold).
+        fullstack_idx = child / "frontend" / "dist" / "index.html"
+        if static_idx.exists():
+            dist_idx = static_idx
+            dist_dir = child / "dist"
+        elif fullstack_idx.exists():
+            dist_idx = fullstack_idx
+            dist_dir = child / "frontend" / "dist"
+        else:
             continue
         try:
-            st = (child / "dist").stat()
+            st = dist_dir.stat()
             cands.append({
                 "project_dir": child.name,
-                "abs_path": str(child / "dist"),
+                "abs_path": str(dist_dir),
                 "mtime": int(st.st_mtime),
                 "index_size": dist_idx.stat().st_size,
             })
@@ -1592,13 +1631,31 @@ def _detect_dist_candidates(session_id: str) -> list[dict]:
             continue
 
     cands.sort(key=lambda c: c["mtime"], reverse=True)
-    return cands
+
+    # Dedupe by abs_path. A fullstack app has frontend/dist/ at the session
+    # root AND inside the `frontend/` subdir — they point to the SAME dist
+    # (no, wait — at root it's <base>/frontend/dist/, and as a "subdir" we
+    # treat `frontend/` as the sub-app, so it's <base>/frontend/frontend/dist/
+    # which doesn't exist). The duplication we just saw is because the
+    # fullstack-at-root check matched AND the subdir-iteration also matched
+    # the `frontend/` dir. Both produce abs_path <base>/frontend/dist. Keep
+    # the root-level match (project_dir="") and drop the subdir-iteration
+    # duplicate, since "session root with fullstack layout" is the cleaner
+    # user mental model.
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for c in cands:
+        if c["abs_path"] in seen:
+            continue
+        seen.add(c["abs_path"])
+        deduped.append(c)
+    return deduped
 
 
 def _auto_pick_project_dir(session_id: str) -> str | None:
     """Pick the most likely project_dir for a session: the only candidate
     if there's exactly one, else None. Returns "" (empty string) for the
-    session root dist/. None means 'ambiguous — caller must decide'."""
+    session root dist/. None means 'ambiguous -- caller must decide'."""
     cands = _detect_dist_candidates(session_id)
     if len(cands) == 1:
         return cands[0]["project_dir"]
@@ -1606,7 +1663,7 @@ def _auto_pick_project_dir(session_id: str) -> str | None:
 
 
 # /preview/{session_id}/* was removed: it generated temporary URLs tied
-# to a session ID that the user (rightly) found unreliable — they were
+# to a session ID that the user (rightly) found unreliable -- they were
 # half-broken without a service worker scope, and disappeared on session
 # delete. The Deploy button → `<slug>.<apps-root>/` flow replaces it with
 # a stable, installable URL the user controls. The dist-dir resolver
@@ -1615,14 +1672,14 @@ def _auto_pick_project_dir(session_id: str) -> str | None:
 
 
 # ============================================================================
-# Deployed apps — promote a session's built dist/ to a persistent URL.
+# Deployed apps -- promote a sessions built dist/ to a persistent URL.
 #
 # Flow:
 #   1. Agent builds → <session_workspace>/dist/index.html exists
 #   2. POST /api/sessions/<sid>/deploy {slug?}
 #   3. Server picks slug (slugify name; -2, -3 on collision), copies
 #      dist/ → /opt/ojas-apps/<slug>/, inserts deployed_apps row
-#   4. App is live at https://<host>/apps/<slug>/ — survives session delete
+#   4. App is live at https://<host>/apps/<slug>/ -- survives session delete
 #      + backend restart (it's just files on disk + a DB row, no process)
 # ============================================================================
 
@@ -1687,7 +1744,7 @@ def _resolve_apps_root_domain() -> str | None:
     """Find the root domain under which deployed apps are served at
     https://<slug>.<root>/. Order:
     1. OJAS_APPS_ROOT_DOMAIN env var (explicit override)
-    2. Fall back to OJAS_DOMAIN — if apps live alongside the apex
+    2. Fall back to OJAS_DOMAIN -- if apps live alongside the apex
        (the most common setup), they share the same root.
     3. None (caller will use a sensible default like <slug>.<OJAS_DOMAIN>).
     """
@@ -1719,24 +1776,273 @@ def _deployed_app_or_404(slug: str, user: dict) -> dict:
 # toggle endpoints + Caddy regen land; the systemd paths light up
 # automatically when deploys start writing `service_name` and `port`.
 
+# ---- Systemd service helpers (fullstack apps) -----------------------------
+#
+# Each fullstack app runs as its own systemd unit. We:
+#   - Allocate a free TCP port from OJAS_APPS_PORT_RANGE (9100-9899).
+#   - Generate a unit file at /etc/systemd/system/ojas-app-<slug>.service
+#     with hard resource limits (MemoryMax, CPUQuota), filesystem
+#     isolation (ProtectSystem=strict), and bind to 127.0.0.1 (Caddy
+#     proxies to it).
+#   - Start/stop the unit on toggle. /api/* is proxied via Caddy.
+
+OJAS_APPS_PORT_RANGE_START = 9100
+OJAS_APPS_PORT_RANGE_END = 9899
+OJAS_APPS_PORT_RANGE_SIZE = OJAS_APPS_PORT_RANGE_END - OJAS_APPS_PORT_RANGE_START + 1
+OJAS_APPS_UNIT_DIR = Path("/etc/systemd/system")
+OJAS_APPS_VENV_BIN = "bin"  # relative to backend dir
+
+# The Ojas backend runs as `ojas` (uid 997 in the system unit). All
+# per-app systemd units also run as `ojas` so they share the same file
+# permissions and can write to /opt/ojas-apps/<slug>/data/.
+OJAS_APP_USER = "ojas"
+
+
+def _listening_ports_in_range() -> set[int]:
+    """Return the set of TCP ports currently in LISTEN state within
+    OJAS_APPS_PORT_RANGE. Used by _allocate_app_port() to find a free
+    slot. Reads /proc/net/tcp (world-readable) -- no privileges needed.
+    Excludes ports the Ojas backend itself allocated (recorded in DB)
+    so a restart of Ojas doesn't accidentally re-grab a port another
+    unit is still listening on (after a crash, the LISTEN state
+    outlives the DB record briefly)."""
+    import struct
+    import socket
+    in_use: set[int] = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            data = open(f, "rb").read()
+        except OSError:
+            continue
+        # Each line: sl local_address rem_address st ...
+        # local_address is "<hex_ip>:<hex_port>". st=0A means LISTEN.
+        for line in data.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            if parts[3] != "0A":  # not LISTEN
+                continue
+            local = parts[1].decode("ascii", "replace")
+            if ":" not in local:
+                continue
+            try:
+                port = int(local.split(":", 1)[1], 16)
+            except ValueError:
+                continue
+            if OJAS_APPS_PORT_RANGE_START <= port <= OJAS_APPS_PORT_RANGE_END:
+                in_use.add(port)
+    return in_use
+
+
+def _allocate_app_port() -> int:
+    """Return a free TCP port in OJAS_APPS_PORT_RANGE that is NOT
+    currently in the deployed_apps DB AND NOT in LISTEN state. Raises
+    RuntimeError if the range is exhausted (caller should surface a
+    clear error to the user -- "all 800 ports in use, pause an app
+    first")."""
+    used_by_db: set[int] = set()
+    with db._connect() as cx:   # noqa: SLF001
+        for r in cx.execute("SELECT port FROM deployed_apps WHERE port IS NOT NULL"):
+            if r["port"] is not None:
+                used_by_db.add(int(r["port"]))
+    used_by_listen = _listening_ports_in_range()
+    used = used_by_db | used_by_listen
+    for port in range(OJAS_APPS_PORT_RANGE_START, OJAS_APPS_PORT_RANGE_END + 1):
+        if port not in used:
+            return port
+    raise RuntimeError(
+        f"no free ports in {OJAS_APPS_PORT_RANGE_START}-{OJAS_APPS_PORT_RANGE_END} "
+        f"({len(used_by_db)} apps deployed, {len(used_by_listen)} listening) -- "
+        f"pause an existing app from /settings and try again"
+    )
+
+
+def _write_systemd_unit(slug: str, port: int, backend_dir: Path) -> Path:
+    """Generate /etc/systemd/system/ojas-app-<slug>.service with hard
+    resource limits + filesystem isolation. Idempotent: overwrites
+    existing unit. Returns the unit file path."""
+    unit = OJAS_APPS_UNIT_DIR / f"ojas-app-{slug}.service"
+    venv_python = backend_dir / ".venv" / "bin" / "python"
+    venv_uvicorn = backend_dir / ".venv" / "bin" / "uvicorn"
+    data_dir = backend_dir.parent / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # DATABASE_URL points at the per-app SQLite file. Use a fully
+    # qualified path so it works regardless of WorkingDirectory.
+    db_path = data_dir / "app.db"
+    # The StandardOutput/Error go to the journal so the logs button
+    # in the chat strip + Settings page can tail them via
+    # `journalctl -u ojas-app-<slug>`. We DO NOT add `--workers N`
+    # to uvicorn: one process per app keeps the memory math honest
+    # (we promised "toggle off = memory goes to ~0"). v1.2 can add
+    # workers behind a per-app CPU quota if needed.
+    body = f"""# Auto-generated by Ojas for slug={slug}. Do not edit by hand.
+[Unit]
+Description=Ojas fullstack app: {slug}
+After=network.target
+
+[Service]
+Type=simple
+User={OJAS_APP_USER}
+Group={OJAS_APP_USER}
+WorkingDirectory={backend_dir}
+Environment="DATABASE_URL=sqlite:////{db_path}"
+Environment="PORT={port}"
+ExecStart={venv_uvicorn} main:app --host 127.0.0.1 --port {port} --log-level info
+Restart=on-failure
+RestartSec=2
+
+# Hard resource limits. MemoryMax caps RAM; CPUQuota caps CPU at
+# 200% of one core (multi-threaded uvicorn can use 2 cores; the
+# rest of the system is unaffected).
+MemoryMax=512M
+CPUQuota=200%
+
+# Filesystem isolation. ProtectSystem=strict makes /usr, /boot, etc.
+# read-only. ProtectHome=true hides /home/* (other users' files).
+# PrivateTmp=true gives the app its own /tmp. ReadWritePaths whitelists
+# the app's own dir for the SQLite file and any user uploads.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths={backend_dir} {data_dir} /opt/ojas-apps/{slug}
+
+# No new privileges, no core dumps, predictable PID file.
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target
+"""
+    # The Ojas backend runs as the `ojas` user inside a systemd unit
+    # with `NoNewPrivileges=true`, which blocks `sudo` from elevating.
+    # We use a setuid root helper at /usr/local/sbin/ojas-systemd-helper
+    # which validates unit names against the ojas-app-*.service
+    # pattern before doing anything. Built from deploy/ojas-systemd-helper.c.
+    import tempfile
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".service", delete=False,
+        prefix=f"ojas-app-{slug}-",
+    ) as tmp:
+        tmp.write(body)
+        tmp_path = Path(tmp.name)
+    try:
+        result = subprocess.run(
+            ["/usr/local/sbin/ojas-systemd-helper", "write-unit", f"ojas-app-{slug}.service", str(tmp_path)],
+            check=False, timeout=5, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"helper write-unit failed: {result.stderr}")
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    return unit
+
+
 def _start_app_service(app: dict) -> bool:
     """Start the systemd unit for a fullstack app. Returns True on
-    success. No-op for static apps (no service_name in the row)."""
+    success. No-op for static apps (no service_name in the row).
+    For fullstack: starts the unit via `sudo systemctl` (the Ojas
+    user can't directly control systemd without a NOPASSWD rule --
+    see /etc/sudoers.d/ojas-systemd), then polls /health for up to
+    5 seconds.
+
+    Uses `restart` (not `start`) so a re-deploy picks up the rewritten
+    unit file (e.g. new PORT, new DATABASE_URL). `start` on an
+    already-active unit is a no-op and the running process keeps
+    using the OLD EnvironmentFile values from when it first started."""
     svc = app.get("service_name")
     if not svc:
         return True
-    # v1.1: subprocess.run(["systemctl", "start", svc], check=True)
+    try:
+        subprocess.run(
+            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "daemon-reload"],
+            check=False, timeout=5, capture_output=True,
+        )
+        subprocess.run(
+            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "enable", svc],
+            check=False, timeout=10, capture_output=True,
+        )
+        subprocess.run(
+            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "restart", svc],
+            check=True, timeout=10, capture_output=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"[ojas] failed to start {svc}: {e}")
+        return False
+    # Health-check poll: up to 5s for the backend to bind + accept requests.
+    import urllib.request
+    port = app.get("port")
+    if not port:
+        return True
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health", timeout=1
+            ) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.25)
     return True
 
 
 def _stop_app_service(app: dict) -> None:
     """Stop the systemd unit for a fullstack app. Best-effort. No-op
-    for static apps."""
+    for static apps. Uses `sudo systemctl stop` (ojas user doesn't
+    have direct systemd access)."""
     svc = app.get("service_name")
     if not svc:
         return
-    # v1.1: subprocess.run(["systemctl", "stop", svc], check=False)
-    return
+    try:
+        subprocess.run(
+            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "stop", svc],
+            check=False, timeout=5, capture_output=True,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"[ojas] helper stop {svc} failed: {e}")
+
+
+def _pip_install_for_app(backend_dir: Path, requirements: Path) -> tuple[bool, str]:
+    """Create a venv at backend_dir/.venv and pip install -r requirements.
+    Returns (success, error_message). Runs as the `ojas` user so the
+    resulting files are writable by the systemd unit."""
+    import venv
+    venv_dir = backend_dir / ".venv"
+    try:
+        # Build the venv as the current user (ojas). Use --system-site-packages
+        # off so we don't leak host packages; a clean venv is cheap.
+        builder = venv.EnvBuilder(
+            system_site_packages=False,
+            clear=True,
+            symlinks=False,
+            with_pip=True,
+        )
+        builder.create(str(venv_dir))
+    except Exception as e:
+        return False, f"venv creation failed: {e}"
+    venv_pip = venv_dir / "bin" / "pip"
+    try:
+        result = subprocess.run(
+            [str(venv_pip), "install", "--quiet", "-r", str(requirements)],
+            check=False, timeout=300, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return False, f"pip install failed: {result.stderr[-500:]}"
+    except subprocess.TimeoutExpired:
+        return False, "pip install timed out (>5min)"
+    except OSError as e:
+        return False, f"pip install OS error: {e}"
+    return True, ""
 
 
 # ---- Caddy route regeneration (shared by toggle + boot + delete) --------
@@ -1748,7 +2054,7 @@ def _stop_app_service(app: dict) -> None:
 # `/opt/ojas-apps/.stopped/<slug>/`. The Caddy `try_files` chain ends
 # with a shared `/.paused/index.html` fallback, so any request for a
 # paused slug lands on a friendly "this app is paused" page instead of
-# a 404. No Caddy reload required — `file_server` re-stats per request.
+# a 404. No Caddy reload required -- `file_server` re-stats per request.
 #
 # Layout while toggling:
 #   /opt/ojas-apps/
@@ -1758,12 +2064,13 @@ def _stop_app_service(app: dict) -> None:
 
 OJAS_APPS_STOPPED_DIR = Path("/opt/ojas-apps/.stopped")
 OJAS_APPS_PAUSED_DIR = Path("/opt/ojas-apps/.paused")
+OJAS_CADDY_ROUTES_DIR = Path("/etc/caddy/routes.d")
 
 
 def _apply_app_state_to_disk(slug: str, new_state: str) -> None:
     """Move the app dir between `/opt/ojas-apps/<slug>/` (live) and
     `/opt/ojas-apps/.stopped/<slug>/` (paused). Creates the paused
-    HTML on first run. Idempotent — calling with the already-applied
+    HTML on first run. Idempotent -- calling with the already-applied
     state is a no-op."""
     OJAS_APPS_PAUSED_DIR.mkdir(parents=True, exist_ok=True)
     OJAS_APPS_STOPPED_DIR.mkdir(parents=True, exist_ok=True)
@@ -1771,7 +2078,7 @@ def _apply_app_state_to_disk(slug: str, new_state: str) -> None:
     live = OJAS_APPS_ROOT / slug
     stopped = OJAS_APPS_STOPPED_DIR / slug
     # If the row exists but the dir was deleted out from under us,
-    # there's nothing to move — the next deploy will recreate it.
+    # there's nothing to move -- the next deploy will recreate it.
     if new_state == "stopped":
         if live.exists():
             live.rename(stopped)
@@ -1781,57 +2088,153 @@ def _apply_app_state_to_disk(slug: str, new_state: str) -> None:
 
 
 def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
-    """Placeholder kept so the call sites in toggle/delete endpoints
-    still typecheck. The dir-rename scheme (see _apply_app_state_to_disk)
-    doesn't need any Caddy config regeneration; this function is a
-    no-op for now. Kept for v1.1 when fullstack apps will need per-slug
-    Caddy fragments to proxy /api/* to the running backend port."""
-    # No-op for v1 (static-only toggle). The Caddy wildcard block is
-    # static; toggle = dir rename. See deploy/Caddyfile.
-    return
+    """Re-emit per-slug Caddy fragments for FULLSTACK apps. Static apps
+    don't need a fragment (the wildcard block handles them). Each
+    fragment declares a more-specific site block that Caddy matches
+    BEFORE the `*.ojas.karmacode.cloud` wildcard, declaring the
+    `/api/*` reverse_proxy to the per-app backend port.
+
+    This function is idempotent: it writes every fragment fresh, so
+    a port change or service_name change propagates without manual
+    cleanup. The OS-level install is `/etc/caddy/routes.d/<slug>.caddy`,
+    included from the main Caddyfile via `import`."""
+    OJAS_CADDY_ROUTES_DIR.mkdir(parents=True, exist_ok=True)
+    apps_root = _resolve_apps_root_domain() or _resolve_public_domain() or "ojas.example.com"
+    with db._connect() as cx:   # noqa: SLF001
+        if owner_user_id is None:
+            rows = cx.execute(
+                "SELECT slug, port, service_name, state "
+                "FROM deployed_apps "
+                "WHERE port IS NOT NULL AND service_name IS NOT NULL"
+            ).fetchall()
+        else:
+            rows = cx.execute(
+                "SELECT slug, port, service_name, state "
+                "FROM deployed_apps "
+                "WHERE port IS NOT NULL AND service_name IS NOT NULL "
+                "AND (owner_user_id = ? OR owner_user_id IS NULL)",
+                (owner_user_id,),
+            ).fetchall()
+    live_slugs = {r["slug"] for r in rows}
+    # Wipe stale fragments (deleted apps, no longer fullstack)
+    for f in OJAS_CADDY_ROUTES_DIR.glob("*.caddy"):
+        if f.stem not in live_slugs:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    for r in rows:
+        r = dict(r)
+        target = OJAS_CADDY_ROUTES_DIR / f"{r['slug']}.caddy"
+        if r.get("state") == "stopped":
+            # Paused: serve the shared paused page (the wildcard block
+            # already does this for /<slug>/, so we don't need a fragment
+            # -- the wildcard will handle it via the /.paused/ fallback).
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            continue
+        # Live + fullstack: per-slug site block with /api/* reverse proxy
+        port = r["port"]
+        # NOTE: in Caddyfile syntax, the opening `{` of a site block
+        # MUST be on the SAME LINE as the site address. Putting it on
+        # the next line (as is common in Caddy JSON configs) is a
+        # syntax error in the Caddyfile parser. Hence the awkward
+        # formatting below.
+        target.write_text(f"""# Auto-generated for {r['slug']} (fullstack, state=running).
+# Do not edit by hand. Regenerated by server/app.py:_regenerate_caddy_routes_for_user.
+#
+# The per-site `tls {{ on_demand }}` block is REQUIRED for new subdomains.
+# The wildcard block in the main Caddyfile has `on_demand` too, but it
+# only applies to the *route* that matches the wildcard. Per-slug site
+# blocks (imported via `import /etc/caddy/routes.d/*.caddy` at server
+# level) are separate site definitions; they need their own `tls
+# {{ on_demand }}` so the on-demand ACME flow runs for the specific
+# hostname. Note the Caddyfile parser requires directives INSIDE a
+# block to be on their own line, so this is multi-line, not the more
+# common one-liner.
+{r['slug']}.{apps_root} {{
+    tls {{
+        on_demand
+    }}
+    encode gzip
+    root * /opt/ojas-apps/{r['slug']}/static
+
+    # Caddy handler ordering gotcha: top-level directives after a
+    # `handle` block ALL run for every request, regardless of whether
+    # the `handle` already handled it. So `file_server` after
+    # `handle @api` was running for /api/* requests, finding no
+    # file at /api/items, falling back to /index.html, and returning
+    # the SPA HTML to API callers (the reverse_proxy never ran).
+    #
+    # Fix: put BOTH the API and the static handlers inside explicit
+    # `handle` blocks. Caddy's `handle` directive is terminal -- once
+    # a `handle` block's matcher accepts the request, no other
+    # directives (or other `handle` blocks) at the same level run.
+    @api path /api/*
+    handle @api {{
+        reverse_proxy 127.0.0.1:{port}
+    }}
+    handle {{
+        # SPA fallback: requested file → /index.html. The
+        # /opt/ojas-apps/.paused/ shared page is served by the
+        # wildcard block (which has it in its try_files chain) only
+        # for hosts that DON'T have a per-slug fragment. Since this
+        # per-slug fragment is only present for running apps (the
+        # regen deletes it on state=stopped), a paused app's host
+        # naturally falls through to the wildcard + /.paused/index.html
+        # path. No paused fallback needed here.
+        try_files {{path}} /index.html
+        file_server
+    }}
+    header {{
+        X-Content-Type-Options "nosniff"
+    }}
+    @hashed path /assets/*
+    header @hashed Cache-Control "public, max-age=31536000, immutable"
+    @sw path /sw.js
+    header @sw Cache-Control "no-store"
+    @html path_regexp ^\\/$|\\.html$
+    header @html Cache-Control "no-cache"
+}}
+""")
+    # Reload Caddy
+    try:
+        subprocess.run(
+            ["systemctl", "reload", "caddy"],
+            check=False, timeout=5, capture_output=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _drop_caddy_fragment(slug: str) -> None:
+    """Remove a single per-slug Caddy fragment. Used on app-delete."""
+    f = OJAS_CADDY_ROUTES_DIR / f"{slug}.caddy"
+    try:
+        if f.exists():
+            f.unlink()
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            ["systemctl", "reload", "caddy"],
+            check=False, timeout=5, capture_output=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def _ensure_paused_page() -> None:
-    """Write the shared 'this app is paused' HTML if it isn't there.
-    One file, ~700 bytes. Re-runs are no-ops thanks to the content
-    equality check."""
+    """Write the shared `this app is paused` HTML if it is not there. One file, ~700 bytes. Re-runs are no-ops thanks to the content equality check."""
     target = OJAS_APPS_PAUSED_DIR / "index.html"
-    body = """<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>App paused</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
-             margin: 0; min-height: 100vh; display: grid; place-items: center;
-             background: #0b0b0c; color: #e7e7ea; }
-      .card { max-width: 32rem; padding: 2.5rem; border-radius: 1.25rem;
-              background: #15151a; border: 1px solid #2a2a31; text-align: center; }
-      h1 { margin: 0 0 0.5rem; font-size: 1.5rem; font-weight: 600; }
-      p  { margin: 0; color: #9a9aa3; line-height: 1.55; }
-      .dot { display: inline-block; width: 0.5rem; height: 0.5rem; border-radius: 50%;
-             background: #6b6b75; margin-right: 0.5rem; vertical-align: middle; }
-    </style>
-  </head>
-  <body>
-    <main class="card">
-      <h1><span class="dot"></span>This app is paused</h1>
-      <p>The owner has temporarily stopped this deployment. Open the Ojas
-         settings page and toggle it back on to bring it back.</p>
-    </main>
-  </body>
-</html>
-"""
+    body = "<!doctype html><title>App paused</title><body><h1>This app is paused</h1><p>Open the Ojas settings page and toggle it back on.</p></body>"
     try:
         existing = target.read_text() if target.exists() else None
         if existing != body:
             target.write_text(body)
     except OSError:
-        # Paused-page creation isn't critical for the toggle to function;
-        # Caddy will 500 if the file's missing, but the toggle still
-        # updates state correctly.
         pass
 
 
@@ -1846,9 +2249,9 @@ def sessions_deploy(
     request: Request,
     user: dict = Depends(require_user),
 ):
-    """Copy the session's built dist/ to a persistent /opt/ojas-apps/<slug>/
+    """Copy the sessions built dist/ to a persistent /opt/ojas-apps/<slug>/
     location and register it as a deployed app. The deployed app is
-    DECOUPLED from the session — deleting the session leaves the live URL
+    DECOUPLED from the session -- deleting the session leaves the live URL
     intact. Re-deploying the same session to the SAME slug is allowed
     (atomic in-place swap); re-deploying without a slug picks a fresh one."""
     import shutil
@@ -1860,7 +2263,7 @@ def sessions_deploy(
     # 1. Need a built dist/. If the client didn't tell us which sub-app
     #    to deploy, auto-detect: pick the only candidate if there's just
     #    one, otherwise return a 400 with a list so the user can choose
-    #    (this is the common path — the dialog sends the pre-filled
+    #    (this is the common path -- the dialog sends the pre-filled
     #    value from /detected-dist, so this fallback mostly hits the
     #    API-only case).
     if project_dir is None:
@@ -1870,7 +2273,7 @@ def sessions_deploy(
         elif len(cands) == 0:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                "no built dist/ yet — ask the agent to run `npm run build` first",
+                "no built dist/ yet -- ask the agent to run `npm run build` first",
             )
         else:
             names = [c["project_dir"] or "<session root>" for c in cands]
@@ -1883,13 +2286,13 @@ def sessions_deploy(
     if dist is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "invalid sub-app folder — paths with '..' or absolute paths are not allowed",
+            "invalid sub-app folder -- paths with '..' or absolute paths are not allowed",
         )
     if not dist.exists():
         hint = f" (looked in {dist})" if project_dir else ""
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"no built dist/ yet — ask the agent to run `npm run build` first{hint}",
+            f"no built dist/ yet -- ask the agent to run `npm run build` first{hint}",
         )
 
     # 2. Pick a slug. If user supplied one, slugify it; if it collides AND
@@ -1910,20 +2313,46 @@ def sessions_deploy(
     # paused, the dir lives at /opt/ojas-apps/.stopped/<slug>/; we move it
     # back to the live path before staging so the swap is a no-op-rename
     # rather than a slow cross-tree copy.
+    #
+    # For FULLSTACK apps, the dist goes into <slug>/static/ (not <slug>/
+    # directly) so the backend/ subdir can sit alongside without
+    # colliding. We detect fullstack up-front and choose the target
+    # subdir accordingly.
     OJAS_APPS_ROOT.mkdir(parents=True, exist_ok=True)
     target = OJAS_APPS_ROOT / slug
     stopped_target = OJAS_APPS_STOPPED_DIR / slug
     _apply_app_state_to_disk(slug, "running")  # ensure live path is writable
+
+    # Resolve the absolute project path so the fullstack check works
+    # regardless of where the request's `project_dir` came from.
+    project_abs = _session_workspace_root(session_id)
+    if project_abs and project_dir:
+        parts = [p for p in project_dir.replace("\x00", "").split("/") if p and p != ".."]
+        for p in parts:
+            project_abs = project_abs / p
+    is_fullstack = bool(project_abs) and (
+        (project_abs / "backend" / "requirements.txt").exists() or
+        (project_abs / "backend" / "main.py").exists()
+    )
+
+    # Choose where the dist lands. Fullstack → <slug>/static/. Static →
+    # directly under <slug>/.
+    dist_target = target / "static" if is_fullstack else target
+    dist_target.mkdir(parents=True, exist_ok=True)
     staging = OJAS_APPS_ROOT / f".staging-{slug}-{int(time.time())}"
     try:
         shutil.copytree(dist, staging)
-        if target.exists():
+        if dist_target.exists() and any(dist_target.iterdir()):
+            # Existing static dir -- back it up before swap
             backup = OJAS_APPS_ROOT / f".old-{slug}-{int(time.time())}"
-            target.rename(backup)
-            staging.rename(target)
+            if dist_target.is_dir() and not dist_target.is_symlink():
+                shutil.move(str(dist_target), str(backup))
+            else:
+                dist_target.unlink()
+            shutil.move(str(staging), str(dist_target))
             shutil.rmtree(backup, ignore_errors=True)
         else:
-            staging.rename(target)
+            shutil.move(str(staging), str(dist_target))
     except OSError as e:
         # Best-effort cleanup of any half-copied staging dir
         shutil.rmtree(staging, ignore_errors=True)
@@ -1932,6 +2361,66 @@ def sessions_deploy(
             f"could not deploy app: {e}",
         )
 
+    # 3b. FULLSTACK: if the project has a backend/ with requirements.txt,
+    # pip-install into a venv + write+start a systemd unit. The frontend
+    # dist is at /opt/ojas-apps/<slug>/static/ now. We also need
+    # /opt/ojas-apps/<slug>/backend/ + /opt/ojas-apps/<slug>/data/.
+
+    service_name: str | None = None
+    port: int | None = None
+    if is_fullstack:
+        # The dist was already copied into <slug>/static/ above. Now
+        # copy backend/ alongside, create data/, and venv.
+        # (The earlier rename in step 3 put the dist into dist_target
+        # which IS the static dir for fullstack apps.)
+        # Now copy backend/ and create data/
+        backend_src = project_abs / "backend"
+        backend_dst = target / "backend"
+        if backend_src.exists():
+            if backend_dst.exists():
+                shutil.rmtree(backend_dst, ignore_errors=True)
+            shutil.copytree(backend_src, backend_dst)
+        # Create a venv + pip install
+        ok, err = _pip_install_for_app(backend_dst, backend_src / "requirements.txt")
+        if not ok:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"could not install backend deps: {err}",
+            )
+        # Reuse the existing port for a re-deploy so the systemd unit
+        # stays compatible with the Caddy fragment and the running
+        # process. Allocating a fresh port on every re-deploy would
+        # orphan the old one and break the live URL until Caddy picked
+        # up the new port (and would 502 any in-flight requests).
+        existing_row = db.get_deployed_app(slug) or {}
+        if existing_row.get("port") and existing_row.get("service_name"):
+            port = int(existing_row["port"])
+        else:
+            # Allocate a port + write the systemd unit
+            try:
+                port = _allocate_app_port()
+            except RuntimeError as e:
+                raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e))
+        slug_safe = re.sub(r"[^a-z0-9_-]", "-", slug.lower())[:40]
+        service_name = f"ojas-app-{slug_safe}.service"
+        _write_systemd_unit(slug_safe, port, backend_dst)
+        # daemon-reload + enable + start (via the setuid helper, since
+        # the Ojas user can't invoke systemctl directly)
+        try:
+            subprocess.run(
+                ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "daemon-reload"],
+                check=True, timeout=10, capture_output=True,
+            )
+            subprocess.run(
+                ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "enable", service_name],
+                check=True, timeout=10, capture_output=True,
+            )
+        except (subprocess.CalledProcessError, OSError) as e:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"systemctl enable failed: {e}",
+            )
+
     # 4. Insert or touch the DB row
     if in_place:
         # Re-deploying the same slug: refresh the recorded subfolder too,
@@ -1939,6 +2428,15 @@ def sessions_deploy(
         # vice versa) actually repoints the live URL.
         db.touch_deployed_app(slug, project_dir=project_dir)
         app_row = db.get_deployed_app(slug) or {}
+        # Update service_name + port if this is a fullstack re-deploy
+        if is_fullstack and service_name and port:
+            with db._connect() as cx:   # noqa: SLF001
+                cx.execute(
+                    "UPDATE deployed_apps SET service_name = ?, port = ? "
+                    "WHERE slug = ?",
+                    (service_name, port, slug),
+                )
+            app_row = db.get_deployed_app(slug) or {}
     else:
         app_row = db.create_deployed_app(
             slug=slug,
@@ -1948,10 +2446,26 @@ def sessions_deploy(
             source_project_id=session.get("project_id"),
             owner_user_id=user["id"],
             project_dir=project_dir,
+            service_name=service_name,
+            port=port,
         )
 
+    # 4b. If fullstack, regenerate Caddy fragments so the per-slug
+    # /api/* reverse_proxy block is written + Caddy reloaded. Also
+    # start the systemd unit now that the row exists.
+    if is_fullstack and service_name and port:
+        # Read the row back to get owner_user_id for the regen
+        app_row_for_regen = db.get_deployed_app(slug) or {}
+        _regenerate_caddy_routes_for_user(app_row_for_regen.get("owner_user_id"))
+        ok = _start_app_service(app_row_for_regen)
+        if not ok:
+            # Don't fail the deploy -- the row is in place, the user
+            # can retry from the settings page. Mark state=starting
+            # so the UI shows a spinner; last_health_at stays null.
+            db.set_deployed_app_state(slug, "starting", error_message="health check failed")
+
     # 5. Build the URL. Prefer the canonical subdomain form
-    # `https://<slug>.<apps_root>/` — that's the user-facing URL the
+    # `https://<slug>.<apps_root>/` -- that's the user-facing URL the
     # deploy button shows in the chat. The apps_root domain is
     # separately configurable from OJAS_DOMAIN so users can host apps
     # on a different domain than the apex (e.g. apex at
@@ -2010,7 +2524,7 @@ def session_deployed_apps_list(
     session_id: str,
     user: dict = Depends(require_user),
 ):
-    """Just the apps deployed FROM this session — used by the chat UI to
+    """Just the apps deployed FROM this session -- used by the chat UI to
     render the deploy strip with `<slug>.<apps-root>/` URLs inline. Same
     ownership rules as everywhere else (root sees all)."""
     _session_or_404(session_id, user)
@@ -2080,7 +2594,7 @@ def sessions_detected_dist(
 
 @app.delete("/api/deployed-apps/{slug}")
 def deployed_apps_delete(slug: str, user: dict = Depends(require_user)):
-    """Take down a deployed app — rmtree the on-disk files AND remove the
+    """Take down a deployed app -- rmtree the on-disk files AND remove the
     DB row. Idempotent on missing files (so a botched-half-state app can
     still be cleaned up from the UI)."""
     import shutil
@@ -2089,11 +2603,35 @@ def deployed_apps_delete(slug: str, user: dict = Depends(require_user)):
     # Stop the systemd unit (fullstack) before rmtree so we don't
     # leave a zombie process holding files open.
     _stop_app_service(app)
+    # Disable + remove the systemd unit file (fullstack)
+    svc = app.get("service_name")
+    if svc:
+        for cmd in (
+            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "disable", svc],
+            ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "stop", svc],
+        ):
+            try:
+                subprocess.run(cmd, check=False, timeout=5, capture_output=True)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        unit_file = Path("/etc/systemd/system") / svc
+        try:
+            if unit_file.exists():
+                subprocess.run(
+                    ["/usr/local/sbin/ojas-systemd-helper", "rm-unit", svc],
+                    check=False, timeout=5, capture_output=True,
+                )
+            subprocess.run(
+                ["/usr/local/sbin/ojas-systemd-helper", "systemctl", "daemon-reload"],
+                check=False, timeout=5, capture_output=True,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     if target.exists() and target.is_dir():
         try:
             shutil.rmtree(target)
         except OSError as e:
-            # Don't leave the DB row dangling on a filesystem hiccup —
+            # Don't leave the DB row dangling on a filesystem hiccup --
             # surface the error but still drop the row so the user can
             # retry the deploy without slug collision.
             db.delete_deployed_app(slug)
@@ -2139,10 +2677,14 @@ def deployed_app_start(slug: str, user: dict = Depends(require_user)):
             raise HTTPException(500, "failed to start service")
     # Move the app dir back to the live path. Caddy's `file_server`
     # re-stats per request, so the new config takes effect on the
-    # very next request — no Caddy reload needed.
+    # very next request -- no Caddy reload needed.
     _apply_app_state_to_disk(slug, "running")
     now = int(time.time())
     db.set_deployed_app_state(slug, "running", last_health_at=now)
+    # Re-emit the per-slug Caddy fragment (was deleted on stop) so
+    # the /api/* reverse_proxy block comes back and Caddy picks up
+    # the new host block.
+    _regenerate_caddy_routes_for_user(app.get("owner_user_id"))
     return DeployStateResponse(slug=slug, state="running", last_state_at=now, last_health_at=now)
 
 
@@ -2166,6 +2708,10 @@ def deployed_app_stop(slug: str, user: dict = Depends(require_user)):
     # /.paused/index.html page for any subsequent request.
     _apply_app_state_to_disk(slug, "stopped")
     db.set_deployed_app_state(slug, "stopped")
+    # Drop the per-slug Caddy fragment so the wildcard block takes
+    # over (its try_files chain has /.paused/index.html as a
+    # fallback). Re-created on the next start.
+    _regenerate_caddy_routes_for_user(app.get("owner_user_id"))
     return DeployStateResponse(
         slug=slug, state="stopped",
         last_state_at=int(time.time()),
@@ -2176,7 +2722,7 @@ def deployed_app_stop(slug: str, user: dict = Depends(require_user)):
 
 @app.get("/api/deployed-apps/{slug}/state", response_model=DeployStateResponse)
 def deployed_app_state(slug: str, user: dict = Depends(require_user)):
-    """Return just the state for one app. Cheaper than a full listing —
+    """Return just the state for one app. Cheaper than a full listing --
     used by the chat-strip pill to refresh the badge after a toggle."""
     app = _deployed_app_or_404(slug, user)
     return DeployStateResponse(
@@ -2205,7 +2751,7 @@ def users_deployed_apps(user: dict = Depends(require_user)):
 @app.get("/apps/{slug}/")
 @app.get("/apps/{slug}/{file_path:path}")
 def apps_serve(slug: str, file_path: str = ""):
-    """Static-serve a deployed app at /apps/<slug>/. NO auth — the URL is
+    """Static-serve a deployed app at /apps/<slug>/. NO auth -- the URL is
     intentionally shareable so users can install the PWA on any device.
     Slugs are unguessable enough in practice (the alphanumeric space + the
     fact that an app only exists if the owner explicitly deployed it).
@@ -2232,13 +2778,13 @@ def apps_serve(slug: str, file_path: str = ""):
     app_resolved = app_dir.resolve()
     requested = file_path or "index.html"
     target = (app_dir / requested).resolve()
-    # Path traversal defence — target MUST be inside app_dir.
+    # Path traversal defence -- target MUST be inside app_dir.
     try:
         target.relative_to(app_resolved)
     except ValueError:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
     if not target.exists() or not target.is_file():
-        # SPA fallback — every non-asset path returns index.html so the
+        # SPA fallback -- every non-asset path returns index.html so the
         # built React Router can take over client-side.
         target = app_dir / "index.html"
         if not target.exists():
@@ -2258,20 +2804,20 @@ def apps_serve(slug: str, file_path: str = ""):
 
 
 # ============================================================================
-# Admin (root only) — running processes, all users, etc.
+# Admin (root only) -- running processes, all users, etc.
 # ============================================================================
 
 @app.get("/api/admin/processes", response_model=list[ProcessResponse])
 def admin_processes_list(_root: dict = Depends(require_root)):
     """Every tracked spawned process across every session on this VM. Each
     row carries the session_id so the admin can navigate to it from the UI.
-    Includes ports — useful for spotting "which port is that preview app
+    Includes ports -- useful for spotting "which port is that preview app
     using right now?". Each row also carries `is_alive` so the UI can
     distinguish live processes from stale DB rows (the process exited but
     the row wasn't cleaned up)."""
     rows = []
     for p in db.list_all_processes():
-        # `os.kill(pid, 0)` is the cheapest "is this PID alive?" probe —
+        # `os.kill(pid, 0)` is the cheapest "is this PID alive?" probe --
         # sends no signal, just checks for ESRCH vs success. We tolerate
         # permission errors (rare; only happens for setuid pids).
         try:
@@ -2289,10 +2835,10 @@ def admin_processes_list(_root: dict = Depends(require_root)):
 
 @app.delete("/api/admin/processes/{pid}")
 def admin_processes_kill(pid: int, _root: dict = Depends(require_root)):
-    """SIGTERM the process and unregister the row. Idempotent — if the
+    """SIGTERM the process and unregister the row. Idempotent -- if the
     process is already gone, just drops the row. Used to manually clean
     up zombie dev servers / hung builds. Refuses to kill the Ojas main
-    backend or the caddy reverse proxy — those are protected services,
+    backend or the caddy reverse proxy -- those are protected services,
     not session-spawned work."""
     import signal
     # Refuse to kill protected Ojas services
@@ -2313,7 +2859,7 @@ def admin_processes_kill(pid: int, _root: dict = Depends(require_root)):
 
 @app.get("/api/admin/services", response_model=list[OjasServiceResponse])
 def admin_services_list(_root: dict = Depends(require_root)):
-    """Every Ojas-owned service on this VM — main backend, caddy proxy,
+    """Every Ojas-owned service on this VM -- main backend, caddy proxy,
     deployed apps (port-only rows), MCP servers, future external services.
     Each row is tagged with `source` so the admin UI can group them.
 
@@ -2372,7 +2918,7 @@ def admin_services_list(_root: dict = Depends(require_root)):
 
 @app.get("/api/admin/buses")
 def admin_buses_list(_root: dict = Depends(require_root)):
-    """Snapshot of every active session bus — queue depth, subscriber
+    """Snapshot of every active session bus -- queue depth, subscriber
     count, dropped-event count. Helps operators spot clients too slow
     to keep up (dropped_count > 0) or sessions with wedged
     subscribers (queue full, no one draining it)."""
@@ -2400,7 +2946,7 @@ def admin_user_delete(
     """Hard-delete a user. Refuses to delete the last root account
     (would leave the box un-administrable). Cascades to their auth
     tokens + projects. FULLY removes their deployed apps (files + URL
-    + DB row + ojas_services row) — the public /apps/<slug>/ endpoint
+    + DB row + ojas_services row) -- the public /apps/<slug>/ endpoint
     will return 404 once this returns.
 
     Side effects (all best-effort, never block the delete):
@@ -2418,7 +2964,7 @@ def admin_user_delete(
     if target.get("role") == "root" and db.count_root_users() <= 1:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "refusing to delete the last root user — promote another user "
+            "refusing to delete the last root user -- promote another user "
             "to root first, or set OJAS_ROOT_EMAIL/PASSWORD in .env to "
             "bootstrap a new one",
         )
@@ -2430,7 +2976,7 @@ def admin_user_delete(
         pass
     # Fully tear down the user's deployed apps (files + URL + DB row +
     # ojas_services row). Runs BEFORE auth.delete_user() because the FK
-    # on deployed_apps.owner_user_id is SET NULL — once the user is
+    # on deployed_apps.owner_user_id is SET NULL -- once the user is
     # gone, the apps become orphan and we'd have to filter by name
     # instead of owner_user_id.
     import shutil
@@ -2598,11 +3144,11 @@ def caddy_ask(domain: str = Query(...)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no domain")
     domain = domain.strip().lower()
     # Apps-root domain. Apps live at <slug>.<apps_root>. The apex
-    # (OJAS_DOMAIN) is a separate thing — apps may share it OR live
+    # (OJAS_DOMAIN) is a separate thing -- apps may share it OR live
     # on a different domain entirely.
     root = (_resolve_apps_root_domain() or _resolve_public_domain() or "").lower()
     if root and not domain.endswith("." + root):
-        # Not under our apps root — reject.
+        # Not under our apps root -- reject.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not our domain")
     # Extract the slug (the leftmost label).
     slug = domain.split(".", 1)[0]
@@ -2613,7 +3159,7 @@ def caddy_ask(domain: str = Query(...)):
 
 @app.get("/api/debug/whoami")
 def debug_whoami(user: dict = Depends(require_user)):
-    """Diagnostic endpoint — answers "who does the server think I am, and
+    """Diagnostic endpoint -- answers "who does the server think I am, and
     what data does it see for me?" Used to pin down session/project
     persistence bugs. Safe to expose: only returns the caller's own data
     (root sees everything, but that's already true everywhere)."""
