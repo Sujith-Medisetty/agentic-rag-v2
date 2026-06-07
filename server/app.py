@@ -1502,14 +1502,21 @@ def _session_preview_dir(
             return None
         for p in parts:
             base = base / p
-    # Resolve dist/ -- for a fullstack project (backend/ + frontend/),
-    # the Vite build is at <project>/frontend/dist, not <project>/dist.
-    # Static-only projects use <project>/dist. Try fullstack first; fall
-    # back to the static location.
-    fullstack = base / "frontend" / "dist" / "index.html"
-    if fullstack.exists():
+    # Resolve dist/ — the layout depends on whether the project has a
+    # backend/ folder:
+    #   - fullstack (backend/ + frontend/)   → <project>/frontend/dist
+    #   - static-only (no backend/)         → <project>/dist OR
+    #                                          <project>/frontend/dist
+    # For static-only, prefer <project>/dist (the conventional Vite
+    # static layout). Fall back to <project>/frontend/dist if that's
+    # the only build the agent produced.
+    static_idx = base / "dist" / "index.html"
+    fullstack_idx = base / "frontend" / "dist" / "index.html"
+    if static_idx.exists():
+        return base / "dist"
+    if fullstack_idx.exists():
         return base / "frontend" / "dist"
-    return base / "dist"
+    return None  # signal: no build found at all (caller raises 400)
 
 
 # Directories the agent scaffold script creates that the deploy detector
@@ -1606,10 +1613,13 @@ def _detect_dist_candidates(session_id: str) -> list[dict]:
             continue
         if child.name in _DEPLOY_IGNORE_DIRS or child.name.startswith("."):
             continue
-        # Static: <child>/dist/index.html
+        # Layout priority: a static <child>/dist/ build wins over the
+        # fullstack <child>/frontend/dist/ because the Vite static
+        # layout is the more common one. The deploy code still
+        # detects fullstack at runtime by the presence of backend/
+        # inside the same project, so the candidate path doesn't
+        # dictate stack.
         static_idx = child / "dist" / "index.html"
-        # Fullstack: <child>/frontend/dist/index.html (Vite build under
-        # the frontend/ subdir of a backend+frontend scaffold).
         fullstack_idx = child / "frontend" / "dist" / "index.html"
         if static_idx.exists():
             dist_idx = static_idx
@@ -2351,17 +2361,21 @@ def sessions_deploy(
     staging = OJAS_APPS_ROOT / f".staging-{slug}-{int(time.time())}"
     try:
         shutil.copytree(dist, staging)
-        if dist_target.exists() and any(dist_target.iterdir()):
-            # Existing static dir -- back it up before swap
-            backup = OJAS_APPS_ROOT / f".old-{slug}-{int(time.time())}"
-            if dist_target.is_dir() and not dist_target.is_symlink():
-                shutil.move(str(dist_target), str(backup))
-            else:
-                dist_target.unlink()
-            shutil.move(str(staging), str(dist_target))
-            shutil.rmtree(backup, ignore_errors=True)
-        else:
-            shutil.move(str(staging), str(dist_target))
+        # shutil.move has TWO modes:
+        #   - dst doesn't exist → renames src to dst (what we want)
+        #   - dst is a directory → moves src INSIDE dst as a child
+        # We need the first. Old code passed a (possibly-existing)
+        # dist_target and got mode #2 — staging ended up nested
+        # inside dist_target as `.staging-{slug}-{ts}/`, which Caddy
+        # never finds. Fix: remove the existing dist_target first,
+        # THEN move staging to that path. We lose the "back up the
+        # old build" step (was a safety net for fast in-place
+        # rollbacks; we don't have a rollback feature yet anyway).
+        if dist_target.is_dir() and not dist_target.is_symlink():
+            shutil.rmtree(dist_target, ignore_errors=True)
+        elif dist_target.is_symlink():
+            dist_target.unlink()
+        shutil.move(str(staging), str(dist_target))
     except OSError as e:
         # Best-effort cleanup of any half-copied staging dir
         shutil.rmtree(staging, ignore_errors=True)
