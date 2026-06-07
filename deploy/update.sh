@@ -35,6 +35,13 @@ EOF
 ok "Python deps current"
 
 log "Rebuilding frontend"
+# Earlier update.sh ran the build as root and left root-owned files in
+# web/dist (notably workbox's sw.js.map). The build now runs as
+# ${OJAS_USER}, which can't overwrite those leftovers → EACCES. Wipe
+# dist/ and normalise ownership of the whole web/ tree before building
+# so every run starts from a clean, user-owned slate.
+rm -rf "${OJAS_DIR}/web/dist"
+chown -R "${OJAS_USER}:${OJAS_USER}" "${OJAS_DIR}/web"
 sudo -u "${OJAS_USER}" bash <<EOF
 set -e
 cd ${OJAS_DIR}/web
