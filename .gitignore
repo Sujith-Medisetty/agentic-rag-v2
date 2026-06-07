@@ -29,6 +29,10 @@ web/src/**/*.js
 .env
 .env.local
 
+# Claude Code — per-user local state (settings.local.json with bash allowlist, etc.)
+# Each developer / session has their own; never commit.
+.claude/
+
 # Editor / OS noise
 .DS_Store
 .idea/
