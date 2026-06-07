@@ -2305,7 +2305,16 @@ def sessions_deploy(
         slug = existing["slug"]
         in_place = True
     else:
-        slug = db.allocate_deployed_slug(desired)
+        # allocate_deployed_slug raises DeployedSlugTaken on collision —
+        # the user must pick a different slug. We do NOT auto-suffix
+        # with -2/-3 (the user wants to see the conflict and choose).
+        try:
+            slug = db.allocate_deployed_slug(desired)
+        except db.DeployedSlugTaken as e:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"slug '{e.slug}' is already taken — pick a different one",
+            )
         in_place = False
 
     # 3. Copy files. Use a sibling temp dir + rename for atomicity (so the
@@ -2562,6 +2571,16 @@ class DetectedDistResponse(BaseModel):
     # The pick the deploy endpoint would use by default (== candidates[0]
     # if status=="single", else None). UI can also pre-fill this.
     auto_pick: str | None = None
+    # True when there's a built dist newer than the most recent deploy
+    # IN THIS SESSION (or when no deploys exist yet). The chat uses this
+    # to show the "Build ready. Click Deploy" banner under the agent's
+    # last reply. False when the latest dist is older than the latest
+    # deploy (nothing to publish).
+    fresh_build: bool = False
+    # The mtime of the freshest candidate (or 0 if none). Same epoch
+    # seconds as DistCandidate.mtime. Lets the UI show "built 3m ago"
+    # without an extra round-trip.
+    fresh_mtime: int = 0
 
 
 @app.get(
@@ -2573,22 +2592,47 @@ def sessions_detected_dist(
     user: dict = Depends(require_user),
 ):
     """Scan the session workspace for built `dist/` folders. Used by the
-    deploy dialog to pre-fill the Sub-app folder field (and to disable
-    Deploy when no build exists or multiple sub-apps are present)."""
+    deploy dialog to pre-fill the Project field, and by the chat
+    banner to detect "fresh build" (newer than the latest deploy
+    from this session)."""
     _session_or_404(session_id, user)
     cands = _detect_dist_candidates(session_id)
+    # Compare against the most recent deploy FROM THIS SESSION. A
+    # build is "fresh" if its mtime is newer than the latest
+    # last_redeploy_at for any of this session's apps — or if
+    # there are no deploys yet.
+    last_redeploy = 0
+    try:
+        for row in db.list_deployed_apps_for_session(session_id):
+            ts = int(row.get("last_redeploy_at") or 0)
+            if ts > last_redeploy:
+                last_redeploy = ts
+    except Exception:
+        # If the helper isn't available, default to "fresh" so we
+        # never hide a build that's actually there.
+        last_redeploy = 0
+    fresh_build = False
+    fresh_mtime = 0
+    if cands:
+        fresh_mtime = max(c["mtime"] for c in cands)
+        fresh_build = fresh_mtime > last_redeploy
     if len(cands) == 0:
-        return DetectedDistResponse(candidates=[], status="none", auto_pick=None)
+        return DetectedDistResponse(
+            candidates=[], status="none", auto_pick=None,
+            fresh_build=False, fresh_mtime=0,
+        )
     if len(cands) == 1:
         return DetectedDistResponse(
             candidates=[DistCandidate(**c) for c in cands],
             status="single",
             auto_pick=cands[0]["project_dir"],
+            fresh_build=fresh_build, fresh_mtime=fresh_mtime,
         )
     return DetectedDistResponse(
         candidates=[DistCandidate(**c) for c in cands],
         status="multiple",
         auto_pick=cands[0]["project_dir"],  # newest as best guess
+        fresh_build=fresh_build, fresh_mtime=fresh_mtime,
     )
 
 

@@ -950,18 +950,31 @@ def _slugify(text: str) -> str:
     return s[:40]   # cap length so URLs stay tidy
 
 
+class DeployedSlugTaken(RuntimeError):
+    """Raised when the requested slug is already in use by another
+    deployed app. The user (not the server) picks a new slug — we
+    don't auto-suffix with `-2`/`-3` because that produces surprising
+    URLs the user didn't ask for. The HTTP layer maps this to a 409
+    with the conflicting slug in the body so the dialog can show it
+    inline next to the input."""
+
+    def __init__(self, slug: str) -> None:
+        super().__init__(f"slug already taken: {slug}")
+        self.slug = slug
+
+
 def allocate_deployed_slug(desired: str) -> str:
-    """Return a free slug — `desired` if unused, else desired-2, desired-3, …
-    Up to -999 before giving up (in practice the user picks a better name
-    long before then). Raises RuntimeError on exhaustion."""
+    """Return `desired` if it's free, otherwise raise
+    :class:`DeployedSlugTaken`. We do NOT auto-suffix with `-2`/`-3`
+    — the user is shown a 409 and picks a different slug themselves.
+    Auto-suffixing was removed because it produced URLs the user
+    didn't choose (silent surprise) and made slug-based book-keeping
+    (DNS, browser bookmarks, settings) ambiguous.
+    """
     base = _slugify(desired) or "app"
     if get_deployed_app(base) is None:
         return base
-    for i in range(2, 1000):
-        candidate = f"{base}-{i}"
-        if get_deployed_app(candidate) is None:
-            return candidate
-    raise RuntimeError(f"couldn't allocate a slug starting with '{base}' (1000 already taken)")
+    raise DeployedSlugTaken(base)
 
 
 def create_deployed_app(
@@ -1075,6 +1088,20 @@ def get_deployed_app(slug: str) -> dict | None:
             "SELECT * FROM deployed_apps WHERE slug = ?", (slug,),
         ).fetchone()
     return dict(row) if row else None
+
+
+def list_deployed_apps_for_session(session_id: str) -> list[dict]:
+    """List every deployed app whose `source_session_id` matches. Used by
+    the deploy banner to compare the latest build mtime against the
+    most recent `last_redeploy_at` from this session — so the banner
+    only shows "Build ready" when there's actually something newer."""
+    with _connect() as cx:
+        rows = cx.execute(
+            "SELECT slug, last_redeploy_at FROM deployed_apps "
+            "WHERE source_session_id = ?",
+            (session_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def list_deployed_apps(owner_user_id: str | None = None) -> list[dict]:
