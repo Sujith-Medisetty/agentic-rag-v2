@@ -1235,13 +1235,22 @@ _FRONTEND_PKG_MARKERS = (
 
 
 def _is_ojas_workspace(ctx: "ProjectContext | None") -> bool:
-    """Return True iff the workspace is an Ojas deploy workspace — i.e. the
-    agent is being invoked from inside `/opt/ojas` (the Ojas platform repo),
-    or the Ojas templates directory is reachable from cwd.
+    """Return True iff the workspace is an Ojas-managed workspace — i.e.
+    the agent is being invoked from inside the Ojas platform repo
+    (`/opt/ojas`), the deployed-apps data dir (`/opt/ojas-apps`), or a
+    user-created project workspace rooted under `/home/ojas/ojas/...`.
+
+    Per-session agent workspaces look like:
+        /home/ojas/ojas/<project-name>/<session-id>/
+    …so any path that lives under a project workspace is an Ojas workspace.
+
+    Also accepts cwd that can reach `agents/templates/` by walking up —
+    that's where the static / fullstack scaffolds live, and an agent
+    working on the platform itself might be in a subdir of it.
 
     Used to gate the Ojas app rules section so it only appears in Ojas
-    sessions. For a random Python repo on a developer's machine, the section
-    is skipped entirely (saves ~2.5k input tokens per turn).
+    sessions. For a random Python repo on a developer's machine, the
+    section is skipped entirely (saves ~2.5k input tokens per turn).
     """
     if ctx is None:
         return False
@@ -1249,13 +1258,22 @@ def _is_ojas_workspace(ctx: "ProjectContext | None") -> bool:
         cwd = Path(ctx.cwd).resolve()
     except (OSError, RuntimeError):
         return False
-    # (1) cwd is inside /opt/ojas — the Ojas platform repo
-    if "/opt/ojas" in str(cwd):
+    s = str(cwd)
+    # (1) cwd is inside /opt/ojas — the Ojas platform repo itself
+    if s == "/opt/ojas" or s.startswith("/opt/ojas/"):
         return True
     # (2) cwd is the ojas-apps data dir or any subdir of it
-    if "/opt/ojas-apps" in str(cwd):
+    if s == "/opt/ojas-apps" or s.startswith("/opt/ojas-apps/"):
         return True
-    # (3) the templates directory is reachable from cwd (walk up the tree)
+    # (3) cwd is under /home/ojas/ojas/ — the default root for user-
+    #     created project workspaces (each project gets a subdir, each
+    #     session gets a subdir under that). Any agent running in here
+    #     is building on behalf of an Ojas user.
+    if s == "/home/ojas/ojas" or s.startswith("/home/ojas/ojas/"):
+        return True
+    # (4) the templates directory is reachable from cwd (walk up the
+    #     tree) — for in-platform development where the agent might be
+    #     working in a subdir of the Ojas repo
     cursor: Path | None = cwd
     while cursor is not None:
         if (cursor / "agents" / "templates").is_dir():
