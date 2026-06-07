@@ -276,3 +276,8 @@ class DeployJobStatusResponse(BaseModel):
     result: DeployResponse | None = None
     created_at: int
     updated_at: int
+    # Wall-clock time the job reached a terminal state (succeeded,
+    # failed, or cancelled). None while the job is still running.
+    # The frontend doesn't currently use this — it's a hint for the
+    # backend sweeper + useful for debugging stale job entries.
+    completed_at: int | None = None

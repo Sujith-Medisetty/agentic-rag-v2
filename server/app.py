@@ -112,6 +112,7 @@ async def lifespan(app: FastAPI):
     await _configure_runtime_singletons()
     _register_ojas_services()
     _reconcile_deployed_apps_on_boot()
+    _start_deploy_job_sweeper()
     yield
 
 def _reconcile_deployed_apps_on_boot() -> None:
@@ -1359,6 +1360,11 @@ class _DeployJob:
     error: str | None = None
     result: dict | None = None       # populated only on succeeded
     task: asyncio.Task | None = None
+    # Set by _set_terminal to int(time.time()) on succeeded/failed/cancelled.
+    # Used by the periodic sweeper to drop completed jobs after a TTL so
+    # the in-memory dict doesn't grow unbounded for users who deploy
+    # many apps in one session. None while the job is still running.
+    completed_at: int | None = None
     _lock: _threading.RLock = field(default_factory=_threading.RLock)
 
     def snapshot(self) -> dict:
@@ -1368,16 +1374,17 @@ class _DeployJob:
         with self._lock:
             steps_copy = [dict(s) for s in self.steps]
             return {
-                "job_id":     self.job_id,
-                "session_id": self.session_id,
-                "slug":       self.slug,
-                "status":     self.status,
-                "phase":      self.phase,
-                "steps":      steps_copy,
-                "error":      self.error,
-                "result":     self.result,
-                "created_at": self.created_at,
-                "updated_at": self.updated_at,
+                "job_id":       self.job_id,
+                "session_id":   self.session_id,
+                "slug":         self.slug,
+                "status":       self.status,
+                "phase":        self.phase,
+                "steps":        steps_copy,
+                "error":        self.error,
+                "result":       self.result,
+                "created_at":   self.created_at,
+                "updated_at":   self.updated_at,
+                "completed_at": self.completed_at,
             }
 
 _deploy_jobs: dict[str, _DeployJob] = {}
@@ -1396,6 +1403,57 @@ def _deploy_job_or_404(job_id: str, session_id: str, user: dict) -> _DeployJob:
     if job.session_id != session_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deploy job not found")
     return job
+
+
+async def _sweep_completed_deploy_jobs() -> None:
+    """Periodic background task: drop completed deploy jobs from the
+    in-memory registry after a 5-minute TTL. Necessary so the dict
+    doesn't grow unbounded for users who deploy many apps in one
+    session. The TTL is generous (5 min) so a re-poll by the user
+    (e.g. they navigate back to the chat 30 seconds after the modal
+    closed) still sees the canonical result before the entry is swept.
+
+    Without this TTL the registry would only ever lose entries when
+    the next deploy overwrote them (since job_id is a fresh UUID
+    per-deploy, that's never). Bounded memory in practice."""
+    COMPLETED_TTL_SECONDS = 300
+    SWEEP_INTERVAL_SECONDS = 60
+    while True:
+        try:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        cutoff = int(time.time()) - COMPLETED_TTL_SECONDS
+        stale_ids: list[str] = []
+        with _deploy_jobs_lock:
+            for jid, job in _deploy_jobs.items():
+                # Only sweep jobs that are in a terminal state AND have
+                # been terminal for at least the TTL. We tolerate the
+                # race where job.completed_at is None (task crashed
+                # before _set_terminal ran) by also sweeping status
+                # in {succeeded, failed, cancelled} with no completion
+                # time set, as long as updated_at is old.
+                if job.completed_at is not None and job.completed_at < cutoff:
+                    stale_ids.append(jid)
+                elif job.status in ("succeeded", "failed", "cancelled") and \
+                     job.completed_at is None and job.updated_at < cutoff:
+                    stale_ids.append(jid)
+        for jid in stale_ids:
+            with _deploy_jobs_lock:
+                _deploy_jobs.pop(jid, None)
+        if stale_ids:
+            print(f"[ojas] swept {len(stale_ids)} stale deploy job(s) (TTL {COMPLETED_TTL_SECONDS}s)")
+
+
+def _start_deploy_job_sweeper() -> asyncio.Task:
+    """Spawn the periodic sweeper. Idempotent — only one instance runs
+    at a time per backend process. Called once from lifespan()."""
+    if getattr(_start_deploy_job_sweeper, "_task", None) is not None:
+        return _start_deploy_job_sweeper._task  # type: ignore[return-value]
+    task = asyncio.create_task(_sweep_completed_deploy_jobs())
+    _start_deploy_job_sweeper._task = task  # type: ignore[attr-defined]
+    return task
+
 
 @app.post("/api/sessions/{session_id}/compact")
 async def compact_session(
@@ -2584,7 +2642,13 @@ async def sessions_deploy(
             user_id=user["id"],
         )
     )
-    job.task.add_done_callback(lambda _t, jid=job_id: _deploy_jobs.pop(jid, None))
+    # Note: we deliberately do NOT pop the job from _deploy_jobs when
+    # the task finishes. The frontend's first poll can fire a few
+    # seconds after the 202 (or the user may re-open the modal and
+    # re-poll), and the in-memory row is the only place the per-step
+    # result is stored. We sweep stale completed jobs in a background
+    # task below (5-minute TTL — generous enough for the user to
+    # re-poll if they navigate back, small enough to bound memory).
     with _deploy_jobs_lock:
         _deploy_jobs[job_id] = job
     return DeployJobStartResponse(
@@ -2723,7 +2787,13 @@ async def _run_deploy_job(
                 job.error = error[:500]
             if result is not None:
                 job.result = result
-            job.updated_at = int(time.time())
+            now = int(time.time())
+            job.updated_at = now
+            # Mark the wall-clock time the job reached its terminal
+            # state. The sweeper uses this to TTL completed jobs out
+            # of the in-memory registry (5 minutes — generous enough
+            # for a re-poll, small enough to bound memory).
+            job.completed_at = now
         try:
             kind = "deploy_complete" if status == "succeeded" else "deploy_failed"
             reporter._pub(kind, {
