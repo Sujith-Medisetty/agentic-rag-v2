@@ -2459,9 +2459,11 @@ function DeployModal({
       setPhase("running");
     } catch (e: any) {
       const msg = e?.message ?? "deploy failed";
-      if (e?.status === 409 || /already taken/i.test(msg)) {
-        // 409: slug collision — surface as a field-level error so the
-        // user can fix it and re-submit. We stay in the config phase.
+      if (e?.status === 409 || /already taken|already deployed as/i.test(msg)) {
+        // 409: slug collision OR sub-app already deployed under a
+        // different slug. The server's error already names the
+        // existing slug + URL, so just surface it as a field-level
+        // message and stay in the config phase.
         setSlugError(msg.replace(/^409:\s*/, ""));
       } else {
         setErr(msg);

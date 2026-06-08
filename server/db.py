@@ -1104,6 +1104,43 @@ def list_deployed_apps_for_session(session_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_deployed_app_for_subapp(
+    source_session_id: str, project_dir: str | None,
+) -> dict | None:
+    """Return the deployed app row whose (source_session_id, project_dir)
+    matches -- i.e. the slug this sub-app is currently published under.
+    Used by the deploy endpoint to enforce 'one slug per sub-app per
+    session': a session can host N sub-apps (N project_dir values), but
+    each sub-app is locked to a single slug. Re-deploying the same
+    sub-app under a different slug returns 409 -- the user must delete
+    the existing deploy first.
+
+    `project_dir` is matched NULL-safe: None <-> NULL and '' <-> ''
+    (the session root). The deploy endpoint passes the same project_dir
+    it intends to deploy, so a None/empty project_dir in the request
+    matches a row whose stored project_dir is also None or ''.
+
+    Returns None if the sub-app has never been deployed.
+    """
+    with _connect() as cx:
+        if project_dir is None or project_dir == "":
+            row = cx.execute(
+                "SELECT * FROM deployed_apps "
+                "WHERE source_session_id = ? AND "
+                "      (project_dir IS NULL OR project_dir = '') "
+                "LIMIT 1",
+                (source_session_id,),
+            ).fetchone()
+        else:
+            row = cx.execute(
+                "SELECT * FROM deployed_apps "
+                "WHERE source_session_id = ? AND project_dir = ? "
+                "LIMIT 1",
+                (source_session_id, project_dir),
+            ).fetchone()
+    return dict(row) if row else None
+
+
 def list_deployed_apps(owner_user_id: str | None = None) -> list[dict]:
     """List deployed apps. If owner_user_id is given, only that user's apps
     (plus any orphan apps whose owner was deleted — keeps the admin view

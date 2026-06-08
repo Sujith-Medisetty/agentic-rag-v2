@@ -379,6 +379,17 @@ def get_ojas_app_rules_section() -> str:
         "it, the user picks a slug on top of it, and multiple apps in the "
         "same session are **sibling project folders**, never nested.",
         "",
+        "**One slug per sub-app, per session.** Ojas enforces that a given "
+        "(session, sub-app) pair can only ever be published under one slug. "
+        "If the user asks to \"rename the deployed app\", \"use a new URL\", "
+        "or \"publish this same sub-app under a different name\", the deploy "
+        "endpoint will refuse with a 409. The only path to a new slug is: "
+        "the user clicks Delete on the existing pill, then redeploys with "
+        "the new slug. Do NOT promise a rename -- it will fail at the server. "
+        "A single session can still host N sub-apps (one per sibling folder), "
+        "each with its own slug -- only the rename-within-a-sub-app path is "
+        "blocked.",
+        "",
         "**FastAPI `include_router` ordering — read this before writing "
         "`main.py`.** FastAPI's `APIRouter.include_router` (and "
         "`FastAPI.include_router` at the top level) snapshots the router's "

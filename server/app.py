@@ -2751,6 +2751,31 @@ async def sessions_deploy(
             )
         in_place = False
 
+    # 2a. Enforce: one slug per (session, project_dir). A session can
+    #     host N sub-apps (each with its own project_dir), but each
+    #     sub-app is locked to a single slug. If the user tries to
+    #     re-deploy the same sub-app under a different slug, refuse
+    #     with 409 -- the only path to a new slug is: delete the
+    #     existing deploy first, then redeploy.
+    #
+    #     This check is independent of the in-place branch above: that
+    #     branch matches by slug (user typed in the same slug), this
+    #     branch matches by (session, project_dir) (this sub-app is
+    #     already on a different slug). Both can fire for the same
+    #     request, in which case the in-place check is the no-op and
+    #     this check is the one that returns 409.
+    existing_for_subapp = db.get_deployed_app_for_subapp(
+        session_id, project_dir,
+    )
+    if existing_for_subapp and existing_for_subapp["slug"] != slug:
+        existing_url = _public_url_for(existing_for_subapp["slug"])
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this sub-app is already deployed as "
+            f"'{existing_for_subapp['slug']}' at {existing_url} -- "
+            f"delete the existing deploy first to use a different slug.",
+        )
+
     # 3. Build the public URL (synthesised before the background task
     #    so the 202 response can include it).
     scheme = "https"
