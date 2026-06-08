@@ -2517,18 +2517,23 @@ function DeployModal({
             {jobStatus?.phase || "Starting…"} — keep this window open until it finishes.
           </p>
         )}
-        {/* Step checklist. 11 entries in a fixed order. We render them
-            by index so the UI is stable even if the server emits them
-            out of order (it shouldn't, but defensive). */}
+        {/* Step checklist. 13 entries in a fixed order (matches the
+            server's _DEPLOY_STEPS). We render them by index so the UI
+            is stable even if the server emits them out of order (it
+            shouldn't, but defensive). The fallback labels are used
+            only until the first poll lands; once jobStatus.steps is
+            populated we use the server's authoritative label. */}
         <ol className="mt-1 space-y-1.5" data-testid="deploy-steps">
           {Array.from({ length: 13 }).map((_, idx) => {
-            // Map index → label. The server emits the same 11 in the
-            // same order; we use the server's name/label when we have it.
+            // Fallback labels — only used before the first poll.
+            // Must stay in lockstep with server/app.py _DEPLOY_STEPS.
             const s = jobStatus?.steps?.[idx];
-            const label = s?.label ?? ["", "Validating", "Reserving URL", "Copying build",
-              "Copying backend", "Creating virtualenv", "Installing Python deps",
-              "Writing systemd unit", "Enabling service", "Recording deployment",
-              "Configuring proxy", "Starting service"][idx];
+            const label = s?.label ?? ["", "Validating build", "Reserving public URL",
+              "Copying build to /opt/ojas-apps", "Adding PWA defaults", "Copying backend",
+              "Creating virtualenv", "Installing Python dependencies",
+              "Writing systemd unit", "Enabling systemd service",
+              "Recording deployment", "Configuring reverse proxy",
+              "Pre-fetching TLS certificate", "Starting service + health check"][idx];
             const status = s?.status ?? (isRunning ? "pending" : "pending");
             const message = s?.message ?? null;
             const isCurrent = status === "running";
