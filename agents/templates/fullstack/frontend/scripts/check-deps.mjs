@@ -95,6 +95,98 @@ for (const pkg of CRITICAL) {
   }
 }
 
+// 3. Walk node_modules/ directly and count physical copies of each
+//    critical dep. `npm ls` reports the deduped top-level copy and
+//    hides nested duplicates behind "deduped" markers -- but a
+//    physical duplicate under e.g.
+//    `node_modules/@radix-ui/react-dialog/node_modules/react/` is
+//    the actual two-React bug: at build time npm/bundler sees one
+//    (the top-level), but at runtime the package's require()
+//    resolves to the nested one. This was the exact bug from
+//    session `62a020f6` (event #41): "react@18.3.1 deduped" next
+//    to "react@19.2.7" in `npm ls`, with the 18.3.1 living
+//    physically under a transitive dep's node_modules.
+function findPhysicalCopies(root, pkg) {
+  const out = [];
+  // BFS over node_modules dirs. We start at the project's own
+  // node_modules, and every time we find a package we ALSO queue
+  // that package's nested node_modules/ to be searched -- which
+  // is exactly where nested duplicates hide.
+  const stack = [path.join(root, "node_modules")];
+  while (stack.length) {
+    const dir = stack.pop();
+    if (!fs.existsSync(dir)) continue;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const full = path.join(dir, e.name);
+      if (e.name === pkg) {
+        // Direct hit: read the version.
+        const pj = path.join(full, "package.json");
+        try {
+          const meta = JSON.parse(fs.readFileSync(pj, "utf-8"));
+          out.push({ version: meta.version, path: full });
+        } catch {
+          // ignore -- broken copy
+        }
+      } else if (e.name.startsWith("@")) {
+        // Scoped namespace dir (`@radix-ui`, etc). For each
+        // `<scope>/<pkg>/` child, check both the pkg itself AND
+        // descend into its nested node_modules.
+        let scoped;
+        try {
+          scoped = fs.readdirSync(full, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const s of scoped) {
+          if (!s.isDirectory()) continue;
+          const subPkg = path.join(full, s.name, pkg);
+          if (fs.existsSync(subPkg) && fs.statSync(subPkg).isDirectory()) {
+            const pj = path.join(subPkg, "package.json");
+            try {
+              const meta = JSON.parse(fs.readFileSync(pj, "utf-8"));
+              out.push({ version: meta.version, path: subPkg });
+            } catch {
+              // ignore
+            }
+          }
+          // Recurse into this scoped pkg's nested node_modules
+          // for the case where the duplicate is one or more
+          // levels deeper.
+          const nestedNm = path.join(full, s.name, "node_modules");
+          if (fs.existsSync(nestedNm)) stack.push(nestedNm);
+        }
+      }
+      // For non-`@`, non-`pkg` entries (regular package dirs),
+      // also descend into their nested node_modules to find
+      // deeper duplicates.
+      const nestedNm = path.join(full, "node_modules");
+      if (fs.existsSync(nestedNm)) stack.push(nestedNm);
+    }
+  }
+  return out;
+}
+
+for (const pkg of CRITICAL) {
+  const copies = findPhysicalCopies(projectRoot, pkg);
+  if (copies.length > 1) {
+    const summary = copies
+      .map((c) => `${c.version} @ ${path.relative(projectRoot, c.path)}`)
+      .join("\n      ");
+    issues.push(
+      `${pkg} has ${copies.length} physical copies under node_modules:\n      ${summary}\n` +
+        `Even if "npm ls" shows one "deduped" version, a nested copy will load ` +
+        `a second React at runtime, breaking hooks.`,
+    );
+  }
+}
+
 if (issues.length) {
   console.error("check-deps FAILED:");
   for (const msg of issues) console.error("  - " + msg);
