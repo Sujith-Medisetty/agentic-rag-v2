@@ -288,3 +288,63 @@ class DeployJobStatusResponse(BaseModel):
     # The frontend doesn't currently use this — it's a hint for the
     # backend sweeper + useful for debugging stale job entries.
     completed_at: int | None = None
+
+
+# ---- Async delete (with progress UI) -------------------------------------
+#
+# Mirror the deploy-job schema block. The status endpoint returns the
+# same shape regardless of whether the target is a session or a project
+# (the steps list is the only thing that varies — 7 entries for a
+# session delete, 7*N for a project delete).
+
+class DeleteStep(BaseModel):
+    # Machine-readable step name. For a session delete the names are
+    # "cancel_agent" | "kill_processes" | "teardown_subprojects" |
+    # "rmtree_subdir" | "drop_checkpoint" | "clear_bus" | "drop_rows",
+    # cycled per session in a project delete. Lets the UI color-code
+    # the current step without re-reading the label.
+    name: str
+    # Human-readable label. The worker may append a sub-message (e.g.
+    # "Tearing down sub-projects — torn down foo, bar") at runtime.
+    label: str
+    # "pending" | "running" | "done" | "failed".
+    status: str
+    # Optional detail (e.g. the slugs that were torn down, or an
+    # error message on failure).
+    message: str | None = None
+    started_at: int | None = None
+    finished_at: int | None = None
+
+
+class DeleteJobStartResponse(BaseModel):
+    # Returned by the async POST /delete endpoint with 202 Accepted.
+    # The client polls GET /delete-jobs/{job_id} for per-step progress.
+    job_id: str
+    # Echoes the target the delete was kicked off against. Lets the
+    # client route the poll to the right endpoint (sessions vs projects)
+    # without re-deriving it.
+    target_id: str
+    # "session" | "project" — used by the UI to title the progress modal
+    # ("Deleting session X" vs "Deleting project Y").
+    target_kind: str
+    # 7 entries (session) or 7*N entries (project, where N = # sessions).
+    # Pre-populated in 'pending' state so the UI can render the
+    # checklist immediately on the 202 response, before the first poll.
+    steps: list[DeleteStep]
+
+
+class DeleteJobStatusResponse(BaseModel):
+    job_id: str
+    target_id: str
+    target_kind: str
+    # "pending" | "running" | "succeeded" | "failed" | "cancelled".
+    status: str
+    # Human-readable current phase name (mirrors the running step's
+    # label, e.g. "Tearing down sub-projects").
+    phase: str
+    steps: list[DeleteStep]
+    # Set on failed / cancelled. Truncated to 500 chars server-side.
+    error: str | None = None
+    created_at: int
+    updated_at: int
+    completed_at: int | None = None

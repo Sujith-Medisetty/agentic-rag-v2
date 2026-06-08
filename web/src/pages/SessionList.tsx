@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams, useNavigate } from "react-router-dom";
-import { projectsApi, sessionsApi, ApiError } from "@/lib/api";
+import {
+  projectsApi, sessionsApi, sessionApi, ApiError,
+  type DeleteJobStart,
+} from "@/lib/api";
 import type { Project, Session } from "@/lib/types";
 import ProjectSettings from "@/components/ProjectSettings";
 import { useSessions } from "@/lib/sessionContext";
+import DeleteProgressModal from "@/components/DeleteProgressModal";
 
 export default function SessionList() {
   const { projectId } = useParams<{ projectId: string }>();
@@ -24,6 +28,12 @@ export default function SessionList() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState("");
   const [editingBusy, setEditingBusy] = useState(false);
+  // DeleteProgressModal state. Same pattern as Workspace.tsx.
+  const [deletingSession, setDeletingSession] = useState<{
+    id: string;
+    name: string;
+    job: DeleteJobStart | null;
+  } | null>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
 
   // React modal state for name conflicts. `null` = hidden. Otherwise:
@@ -125,13 +135,23 @@ export default function SessionList() {
 
   const deleteSession = async (s: Session) => {
     if (!confirm(
-      `Delete session "${s.name}"?\n\nThis permanently removes the chat history, plan state, and event log for this session. This cannot be undone.`
+      `Delete session "${s.name}"?\n\n` +
+      `This permanently removes the chat history, the agent's edited files, ` +
+      `the sub-project build output, and any live URLs + systemd units for ` +
+      `this session. The entry disappears immediately; the server cleanup ` +
+      `runs in the background.\n\nThis cannot be undone.`
     )) return;
+    // 1. Cancel any in-flight agent turn (best-effort).
+    sessionApi.cancel(s.id).catch(() => {});
+    // 2. Optimistic sidebar removal.
+    sessionsStore.remove(s.id);
+    // 3. Kick off the async server-side teardown + open the progress
+    //    modal.
     try {
-      await sessionsApi.remove(s.id);
-      sessionsStore.remove(s.id);
+      const job = await sessionApi.startDelete(s.id);
+      setDeletingSession({ id: s.id, name: s.name, job });
     } catch (e: any) {
-      setErr(e?.message ?? "delete failed");
+      setErr(e?.message ?? "delete failed to start");
     }
   };
 
@@ -298,6 +318,31 @@ export default function SessionList() {
           existingId={conflict.existingId}
           projectId={projectId ?? ""}
           onClose={() => setConflict(null)}
+        />
+      )}
+      {deletingSession && (
+        <DeleteProgressModal
+          open={!!deletingSession}
+          targetKind="session"
+          targetId={deletingSession.id}
+          targetName={deletingSession.name}
+          job={deletingSession.job}
+          onPoll={() =>
+            sessionApi.deleteJobStatus(
+              deletingSession.id,
+              deletingSession.job!.job_id,
+            )
+          }
+          onCancelJob={
+            deletingSession.job
+              ? () =>
+                  sessionApi.cancelDelete(
+                    deletingSession.id,
+                    deletingSession.job!.job_id,
+                  )
+              : undefined
+          }
+          onClose={() => setDeletingSession(null)}
         />
       )}
     </div>

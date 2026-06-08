@@ -107,6 +107,24 @@ export const projectsApi = {
     request<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
+  // Async delete with progress UI. Mirrors sessionApi.startDelete.
+  // The step list is 7 * N where N is the number of sessions in the
+  // project. The project entry is removed from the local list
+  // optimistically the moment the user confirms.
+  startDelete: (id: string) =>
+    request<DeleteJobStart>(
+      `/api/projects/${encodeURIComponent(id)}/delete`,
+      { method: "POST" },
+    ),
+  deleteJobStatus: (id: string, jobId: string) =>
+    request<DeleteJobStatus>(
+      `/api/projects/${encodeURIComponent(id)}/delete-jobs/${encodeURIComponent(jobId)}`,
+    ),
+  cancelDelete: (id: string, jobId: string) =>
+    request<{ ok: boolean; reason?: string }>(
+      `/api/projects/${encodeURIComponent(id)}/delete-jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
+    ),
 };
 
 // ---- Admin (root only) --------------------------------------------------
@@ -288,6 +306,50 @@ export interface DeployJobStart {
   slug: string;
   url: string;
   placeholder_app: DeployedApp;
+}
+
+// ---- Delete-job (async delete with progress UI) --------------------------
+//
+// Mirrors the deploy-job shape. The DeleteProgressModal component polls
+// {sessionApi,projectsApi}.deleteJobStatus() every 800ms and renders
+// the per-step checklist while the server tears down the target.
+
+export type DeleteStepStatus = "pending" | "running" | "done" | "failed";
+
+export interface DeleteStep {
+  name: string;
+  label: string;
+  status: DeleteStepStatus;
+  message: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+export type DeleteJobLifecycleStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface DeleteJobStatus {
+  job_id: string;
+  target_id: string;
+  target_kind: "session" | "project";
+  status: DeleteJobLifecycleStatus;
+  phase: string;
+  steps: DeleteStep[];
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+}
+
+export interface DeleteJobStart {
+  job_id: string;
+  target_id: string;
+  target_kind: "session" | "project";
+  steps: DeleteStep[];
 }
 
 export const deployedAppsApi = {
@@ -473,5 +535,23 @@ export const sessionApi = {
   deployedApps: (sessionId: string) =>
     request<DeployedApp[]>(
       `/api/sessions/${encodeURIComponent(sessionId)}/deployed-apps`,
+    ),
+  // Async delete with progress UI. Returns 202 with a {job_id, ...}
+  // envelope; the actual cleanup runs in a background task. The
+  // sidebar removes the entry optimistically the moment the user
+  // confirms — this method just kicks off the server-side teardown.
+  startDelete: (sessionId: string) =>
+    request<DeleteJobStart>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/delete`,
+      { method: "POST" },
+    ),
+  deleteJobStatus: (sessionId: string, jobId: string) =>
+    request<DeleteJobStatus>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/delete-jobs/${encodeURIComponent(jobId)}`,
+    ),
+  cancelDelete: (sessionId: string, jobId: string) =>
+    request<{ ok: boolean; reason?: string }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/delete-jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
     ),
 };

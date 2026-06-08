@@ -1,13 +1,24 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { projectsApi, pathsApi, ApiError } from "@/lib/api";
+import {
+  projectsApi, pathsApi, ApiError,
+  type DeleteJobStart,
+} from "@/lib/api";
 import type { Project } from "@/lib/types";
+import DeleteProgressModal from "@/components/DeleteProgressModal";
 
 export default function ProjectList() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  // DeleteProgressModal state. Project delete is 7*N steps where N
+  // = # sessions in the project, so the modal can show a long list.
+  const [deletingProject, setDeletingProject] = useState<{
+    id: string;
+    name: string;
+    job: DeleteJobStart | null;
+  } | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -73,17 +84,31 @@ export default function ProjectList() {
               type="button"
               onClick={async () => {
                 if (!confirm(
-                  `Delete project "${p.name}"?\n\nThis permanently removes ALL its sessions, messages, and events. Files on disk at ${p.workspace_path} are NOT touched.\n\nThis cannot be undone.`
+                  `Delete project "${p.name}"?\n\n` +
+                  `This permanently removes ALL its sessions, the agent's edited ` +
+                  `files, the sub-project build outputs, and every live URL + ` +
+                  `systemd unit across every session in the project. The empty ` +
+                  `project root at ${p.workspace_path} will remain. The entry ` +
+                  `disappears immediately; the server cleanup runs in the ` +
+                  `background.\n\nThis cannot be undone.`
                 )) return;
+                // Optimistic removal — the project disappears from the
+                // list the moment the user confirms.
+                setProjects((ps) => ps.filter((x) => x.id !== p.id));
+                // Kick off the async server-side teardown.
                 try {
-                  await projectsApi.remove(p.id);
-                  load();
+                  const job = await projectsApi.startDelete(p.id);
+                  setDeletingProject({ id: p.id, name: p.name, job });
                 } catch (e) {
+                  // Restore on failure.
+                  setProjects((ps) => [...ps, p].sort((a, b) =>
+                    a.name.localeCompare(b.name),
+                  ));
                   alert(`Delete failed: ${e instanceof ApiError ? e.message : "unknown"}`);
                 }
               }}
               className="min-h-touch min-w-touch rounded-md border border-border/60 px-2 text-sm text-muted hover:border-danger/40 hover:bg-danger/10 hover:text-danger"
-              title="Delete project (sessions + messages + events; files on disk untouched)"
+              title="Delete project (all sessions + agent files + sub-projects + live URLs)"
               aria-label={`Delete project ${p.name}`}
             >
               Delete
@@ -102,6 +127,31 @@ export default function ProjectList() {
             setShowCreate(false);
             load();
           }}
+        />
+      )}
+      {deletingProject && (
+        <DeleteProgressModal
+          open={!!deletingProject}
+          targetKind="project"
+          targetId={deletingProject.id}
+          targetName={deletingProject.name}
+          job={deletingProject.job}
+          onPoll={() =>
+            projectsApi.deleteJobStatus(
+              deletingProject.id,
+              deletingProject.job!.job_id,
+            )
+          }
+          onCancelJob={
+            deletingProject.job
+              ? () =>
+                  projectsApi.cancelDelete(
+                    deletingProject.id,
+                    deletingProject.job!.job_id,
+                  )
+              : undefined
+          }
+          onClose={() => setDeletingProject(null)}
         />
       )}
     </div>

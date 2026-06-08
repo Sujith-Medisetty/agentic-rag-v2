@@ -7,12 +7,16 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Outlet, useNavigate, useParams, Link } from "react-router-dom";
-import { projectsApi, sessionsApi, sessionApi, authApi, ApiError } from "@/lib/api";
-import type { AuthUser } from "@/lib/api";
+import {
+  projectsApi, sessionsApi, sessionApi, authApi, ApiError,
+  type DeleteJobStart, type DeleteJobStatus,
+  type AuthUser,
+} from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import type { Project, Session } from "@/lib/types";
 import { useSessions } from "@/lib/sessionContext";
 import InstallButton from "@/components/InstallButton";
+import DeleteProgressModal from "@/components/DeleteProgressModal";
 
 export default function Workspace() {
   const navigate = useNavigate();
@@ -43,6 +47,14 @@ export default function Workspace() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState("");
   const [editingBusy, setEditingBusy] = useState(false);
+  // DeleteProgressModal state. The sidebar entry is removed
+  // optimistically the moment the modal opens; this state just
+  // tracks the in-flight job so the modal can poll for progress.
+  const [deletingSession, setDeletingSession] = useState<{
+    id: string;
+    name: string;
+    job: DeleteJobStart | null;
+  } | null>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
   // Name-conflict modal (real React <dialog>, not a native alert).
   const [conflict, setConflict] = useState<{
@@ -118,15 +130,30 @@ export default function Workspace() {
     if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
   };
 
-  const deleteSession = async (sid: string) => {
-    if (!confirm("Delete this chat?\n\nIts messages, plan, and event log will be permanently removed. Workspace files on disk are NOT touched.")) return;
+  const deleteSession = async (s: Session) => {
+    if (!confirm(
+      `Delete this chat "${s.name}"?\n\n` +
+      `This permanently removes the chat history, the agent's edited files, ` +
+      `the sub-project build output, and any live URLs + systemd units for ` +
+      `this session. The sidebar entry disappears immediately; the server ` +
+      `cleanup runs in the background.\n\nThis cannot be undone.`
+    )) return;
+    // 1. Cancel any in-flight agent turn (best-effort, fire-and-forget).
+    sessionApi.cancel(s.id).catch(() => {});
+    // 2. Optimistic sidebar removal. The user shouldn't have to wait
+    //    for the server round-trip to see the entry disappear.
+    sessionsStore.remove(s.id);
+    if (activeSessionIdRef.current === s.id) navigate("/");
+    // 3. Kick off the async server-side teardown and open the
+    //    progress modal so the user can see what's happening.
     try {
-      await sessionApi.cancel(sid).catch(() => {});
-      await sessionsApi.remove(sid);
-      sessionsStore.remove(sid);
-      if (activeSessionId === sid) navigate("/");
+      const job = await sessionApi.startDelete(s.id);
+      setDeletingSession({ id: s.id, name: s.name, job });
     } catch (e: any) {
-      setLoadErr(e?.message ?? "delete failed");
+      // Server refused (e.g. 404 because the session was already gone,
+      // 409 because a previous delete is still running). The sidebar
+      // is already updated; the modal just won't open.
+      setLoadErr(e?.message ?? "delete failed to start");
     }
   };
 
@@ -321,7 +348,7 @@ export default function Workspace() {
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            deleteSession(s.id);
+                            deleteSession(s);
                           }}
                           className="absolute right-1.5 top-1/2 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-subtle transition-colors hover:bg-danger/10 hover:text-danger"
                           title="Delete chat"
@@ -479,6 +506,31 @@ export default function Workspace() {
           existingName={conflict.existingName}
           existingId={conflict.existingId}
           onClose={() => setConflict(null)}
+        />
+      )}
+      {deletingSession && (
+        <DeleteProgressModal
+          open={!!deletingSession}
+          targetKind="session"
+          targetId={deletingSession.id}
+          targetName={deletingSession.name}
+          job={deletingSession.job}
+          onPoll={() =>
+            sessionApi.deleteJobStatus(
+              deletingSession.id,
+              deletingSession.job!.job_id,
+            )
+          }
+          onCancelJob={
+            deletingSession.job
+              ? () =>
+                  sessionApi.cancelDelete(
+                    deletingSession.id,
+                    deletingSession.job!.job_id,
+                  )
+              : undefined
+          }
+          onClose={() => setDeletingSession(null)}
         />
       )}
     </div>

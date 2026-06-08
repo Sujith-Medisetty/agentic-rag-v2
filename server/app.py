@@ -94,6 +94,7 @@ from server.schemas import (
     AuthStatusResponse, DeployRequest, DeployResponse, DeployedAppResponse,
     DeployJobStartResponse, DeployJobStatusResponse, DeployStep,
     DeployStateResponse, DeployedAppsBySession,
+    DeleteJobStartResponse, DeleteJobStatusResponse, DeleteStep,
     EventResponse, GitInfoResponse, LoginRequest,
     LoginResponse, MessagePostRequest, MessageResponse, OjasServiceResponse,
     ProcessResponse, ProjectCreateRequest, ProjectResponse, ProjectSettingsRequest,
@@ -113,6 +114,7 @@ async def lifespan(app: FastAPI):
     _register_ojas_services()
     _reconcile_deployed_apps_on_boot()
     _start_deploy_job_sweeper()
+    _start_delete_job_sweeper()
     yield
 
 def _reconcile_deployed_apps_on_boot() -> None:
@@ -1049,6 +1051,201 @@ def sessions_delete(session_id: str, user: dict = Depends(require_user)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
     return {"ok": True}
 
+
+# ---- Async delete (with progress UI) -------------------------------------
+#
+# These endpoints are the "new" way to delete a session or project — they
+# spawn a background job that walks a fixed 7-step cleanup checklist
+# (cancel agent, kill processes, teardown sub-projects, rmtree the
+# workspace subdir, drop checkpoint, clear bus, drop rows) and report
+# progress via GET /api/{sessions|projects}/{id}/delete-jobs/{job_id}.
+#
+# The OLD synchronous DELETE handlers above are kept untouched (so
+# any custom tooling that POSTs a DELETE continues to work). The UI
+# (DeleteProgressModal) uses the new POST endpoints to get the
+# progress checklist; the sidebar removes the entry optimistically the
+# moment the user confirms, so the UI feels instant even if the
+# server-side teardown takes 5+ seconds.
+
+@app.post(
+    "/api/sessions/{session_id}/delete",
+    response_model=DeleteJobStartResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def sessions_delete_async(
+    session_id: str,
+    user: dict = Depends(require_user),
+):
+    """Start an async delete job for a session. Returns 202 with
+    {job_id, target_id, steps: [7 default steps]}; the client polls
+    /api/sessions/{id}/delete-jobs/{jid} for per-step progress.
+
+    Idempotency: calling this twice for the same session_id while a
+    previous job is still running returns 409 (only one delete at a
+    time). If the previous job already finished, the new call 404s
+    because the session row is gone (which is the right behavior —
+    there's nothing left to delete)."""
+    import uuid
+    # Ownership check first — 404s (not 403) for cross-user access to
+    # avoid leaking the existence of other users' sessions.
+    _session_or_404(session_id, user)
+    with _delete_jobs_lock:
+        for existing in _delete_jobs.values():
+            if existing.target_kind == "session" and existing.target_id == session_id \
+                    and existing.status in ("pending", "running"):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"a delete job for this session is already running "
+                    f"({existing.job_id})",
+                )
+    job_id = uuid.uuid4().hex
+    now = int(time.time())
+    job = _DeleteJob(
+        job_id=job_id, target_kind="session", target_id=session_id,
+        user_id=user["id"], created_at=now, updated_at=now,
+    )
+    _init_delete_job_steps(job, len(_DELETE_STEP_NAMES))
+    # Bind a fresh event loop task. Capture the loop first so the
+    # task is scheduled on the loop the request is running on (matches
+    # the deploy job pattern at app.py:2791-2805).
+    bus = get_bus(session_id)
+    if not bus.is_bound():
+        bus.bind_loop(asyncio.get_running_loop())
+    job.task = asyncio.create_task(
+        _run_delete_job(
+            job=job, target_kind="session", target_id=session_id,
+            user_id=user["id"],
+        )
+    )
+    with _delete_jobs_lock:
+        _delete_jobs[job_id] = job
+    return DeleteJobStartResponse(
+        job_id=job_id, target_id=session_id,
+        target_kind="session",
+        steps=job.snapshot()["steps"],
+    )
+
+
+@app.get(
+    "/api/sessions/{session_id}/delete-jobs/{job_id}",
+    response_model=DeleteJobStatusResponse,
+)
+def sessions_delete_job_status(
+    session_id: str,
+    job_id: str,
+    user: dict = Depends(require_user),
+):
+    """Poll for the per-step status of an in-flight or recently-finished
+    session-delete job. Returns 404 if the job_id is unknown OR not
+    owned by the caller (to avoid leaking other users' job ids)."""
+    job = _delete_job_or_404(job_id, session_id, user)
+    snap = job.snapshot()
+    return DeleteJobStatusResponse(**snap)
+
+
+@app.post("/api/sessions/{session_id}/delete-jobs/{job_id}/cancel")
+async def sessions_delete_job_cancel(
+    session_id: str,
+    job_id: str,
+    user: dict = Depends(require_user),
+):
+    """Request cancellation of an in-flight delete job. Idempotent —
+    returns {ok: false, reason: ...} if the job is no longer running.
+    Best-effort: the worker checks cancel_requested at step boundaries
+    and bails out cleanly after the current step finishes."""
+    job = _delete_job_or_404(job_id, session_id, user)
+    with job._lock:
+        if job.status not in ("pending", "running"):
+            return {"ok": False, "reason": f"job is {job.status}"}
+        job.cancel_requested = True
+    return {"ok": True}
+
+
+@app.post(
+    "/api/projects/{project_id}/delete",
+    response_model=DeleteJobStartResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def projects_delete_async(
+    project_id: str,
+    user: dict = Depends(require_user),
+):
+    """Start an async delete job for a project (and every session in it).
+    The step list is 7 * N where N is the number of sessions in the
+    project (or 0 if the project is empty)."""
+    import uuid
+    _project_or_404(project_id, user)
+    with _delete_jobs_lock:
+        for existing in _delete_jobs.values():
+            if existing.target_kind == "project" and existing.target_id == project_id \
+                    and existing.status in ("pending", "running"):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"a delete job for this project is already running "
+                    f"({existing.job_id})",
+                )
+    sessions = db.list_sessions(project_id)
+    job_id = uuid.uuid4().hex
+    now = int(time.time())
+    job = _DeleteJob(
+        job_id=job_id, target_kind="project", target_id=project_id,
+        user_id=user["id"], created_at=now, updated_at=now,
+    )
+    # 7 steps per session. For an empty project (no sessions) we
+    # still want a single 'finalize' step so the UI shows the user
+    # something is happening — the worker will skip straight to the
+    # final delete_project call.
+    step_count = max(len(sessions) * len(_DELETE_STEP_NAMES), 1)
+    _init_delete_job_steps(job, step_count)
+    # Cancel any in-flight agent turns across all the project's
+    # sessions (mirrors what the sync handler did at app.py:1021-1023).
+    for s in sessions:
+        task = _active_turns.get(s["id"])
+        if task is not None and not task.done():
+            task.cancel()
+    job.task = asyncio.create_task(
+        _run_delete_job(
+            job=job, target_kind="project", target_id=project_id,
+            user_id=user["id"],
+        )
+    )
+    with _delete_jobs_lock:
+        _delete_jobs[job_id] = job
+    return DeleteJobStartResponse(
+        job_id=job_id, target_id=project_id,
+        target_kind="project",
+        steps=job.snapshot()["steps"],
+    )
+
+
+@app.get(
+    "/api/projects/{project_id}/delete-jobs/{job_id}",
+    response_model=DeleteJobStatusResponse,
+)
+def projects_delete_job_status(
+    project_id: str,
+    job_id: str,
+    user: dict = Depends(require_user),
+):
+    job = _delete_job_or_404(job_id, project_id, user)
+    snap = job.snapshot()
+    return DeleteJobStatusResponse(**snap)
+
+
+@app.post("/api/projects/{project_id}/delete-jobs/{job_id}/cancel")
+async def projects_delete_job_cancel(
+    project_id: str,
+    job_id: str,
+    user: dict = Depends(require_user),
+):
+    job = _delete_job_or_404(job_id, project_id, user)
+    with job._lock:
+        if job.status not in ("pending", "running"):
+            return {"ok": False, "reason": f"job is {job.status}"}
+        job.cancel_requested = True
+    return {"ok": True}
+
+
 @app.get("/api/sessions/{session_id}", response_model=SessionResponse)
 def sessions_get(session_id: str, user: dict = Depends(require_user)):
     """Fetch a single session's current state. Used by the chat page
@@ -1495,6 +1692,434 @@ def _start_deploy_job_sweeper() -> asyncio.Task:
         return _start_deploy_job_sweeper._task  # type: ignore[return-value]
     task = asyncio.create_task(_sweep_completed_deploy_jobs())
     _start_deploy_job_sweeper._task = task  # type: ignore[attr-defined]
+    return task
+
+
+# ============================================================================
+# Delete-job pattern — mirrors the deploy-job pattern above. Each session
+# (or project) delete kicks off a background task that walks a fixed list
+# of cleanup steps (cancel agent, kill processes, tear down sub-projects,
+# rmtree the workspace subdir, drop checkpoint, clear bus, drop rows). The
+# UI shows the steps in a checklist (DeleteProgressModal) while the sidebar
+# removes the entry optimistically the moment the user confirms.
+# ============================================================================
+
+# Number of named steps PER SESSION in a delete job. For a project delete
+# the steps list is 7 * N where N is the number of sessions in the project.
+# Kept here so the UI's fallback label array (DeleteProgressModal) can
+# match it without a round-trip.
+_DELETE_STEP_NAMES: list[tuple[str, str]] = [
+    ("cancel_agent",      "Cancelling agent"),
+    ("kill_processes",    "Killing spawned processes"),
+    ("teardown_subprojects", "Tearing down sub-projects"),
+    ("rmtree_subdir",     "Removing workspace files"),
+    ("drop_checkpoint",   "Dropping agent checkpoint"),
+    ("clear_bus",         "Clearing event bus"),
+    ("drop_rows",         "Removing database rows"),
+]
+
+
+@dataclass
+class _DeleteJob:
+    job_id: str
+    target_kind: str             # "session" | "project"
+    target_id: str
+    user_id: str
+    created_at: int
+    updated_at: int
+    status: str = "pending"      # pending|running|succeeded|failed|cancelled
+    phase: str = "queued"
+    steps: list[dict] = field(default_factory=list)
+    error: str | None = None
+    # If the job failed mid-flight, the original (pre-delete) rows that
+    # would let the UI restore the sidebar entry on failure. None for
+    # sessions (the optimistic removal has nothing to restore from
+    # server-side), or for jobs that haven't been started yet.
+    restore_apps: list[dict] = field(default_factory=list)
+    task: asyncio.Task | None = None
+    completed_at: int | None = None
+    _lock: _threading.RLock = field(default_factory=_threading.RLock)
+    # Set to True when the user (or a caller) requests cancellation.
+    # The worker checks this at each step boundary and bails out cleanly
+    # after the current step finishes. Unlike deploy jobs (which we
+    # don't bother cancelling — a deploy is fast), delete jobs are
+    # sometimes long (5+ seconds for a fullstack app's systemd tear-down)
+    # so cancel is worth supporting.
+    cancel_requested: bool = False
+
+    def snapshot(self) -> dict:
+        """Thread-safe read of the job state for the GET endpoint."""
+        with self._lock:
+            steps_copy = [dict(s) for s in self.steps]
+            return {
+                "job_id":       self.job_id,
+                "target_kind":  self.target_kind,
+                "target_id":    self.target_id,
+                "status":       self.status,
+                "phase":        self.phase,
+                "steps":        steps_copy,
+                "error":        self.error,
+                "created_at":   self.created_at,
+                "updated_at":   self.updated_at,
+                "completed_at": self.completed_at,
+            }
+
+_delete_jobs: dict[str, _DeleteJob] = {}
+_delete_jobs_lock = _threading.Lock()
+
+
+def _delete_job_or_404(job_id: str, target_id: str, user: dict) -> _DeleteJob:
+    """Lookup + ownership check. 404s if missing OR not owned by caller
+    (not 403, to avoid leaking other users' job ids). Mirrors the
+    _deploy_job_or_404 ownership rule."""
+    with _delete_jobs_lock:
+        job = _delete_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "delete job not found")
+    if user["role"] != "root" and job.user_id != user["id"]:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "delete job not found")
+    if job.target_id != target_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "delete job not found")
+    return job
+
+
+def _init_delete_job_steps(job: _DeleteJob, step_count: int) -> None:
+    """Pre-populate job.steps with `step_count` pending entries. The
+    actual names+labels are filled in by the worker as it runs (because
+    the teardown_subprojects step's message includes the slug being
+    torn down at runtime)."""
+    with job._lock:
+        for i in range(step_count):
+            # Module index for default label fallback.
+            mod_i = i % len(_DELETE_STEP_NAMES)
+            name, label = _DELETE_STEP_NAMES[mod_i]
+            job.steps.append({
+                "name": name,
+                "label": label,
+                "status": "pending",
+                "message": None,
+                "started_at": None,
+                "finished_at": None,
+            })
+
+
+def _set_delete_step(
+    job: _DeleteJob, idx: int, status: str, message: str | None = None,
+) -> None:
+    """Mutate job.steps[idx] in place. Caller is responsible for
+    pre-populating the list (use _init_delete_job_steps). status is one
+    of 'running' | 'done' | 'failed'. Thread-safe via job._lock."""
+    with job._lock:
+        s = job.steps[idx]
+        if status == "running" and s.get("started_at") is None:
+            s["started_at"] = int(time.time())
+        if status in ("done", "failed"):
+            s["finished_at"] = int(time.time())
+        s["status"] = status
+        if message is not None:
+            s["message"] = message
+        job.updated_at = int(time.time())
+
+
+def _set_delete_terminal(
+    job: _DeleteJob, status: str, error: str | None = None,
+) -> None:
+    """Mark the job as finished. Sets completed_at so the sweeper can
+    drop it after the TTL."""
+    with job._lock:
+        job.status = status
+        job.phase = status
+        job.error = error
+        job.completed_at = int(time.time())
+        job.updated_at = job.completed_at
+
+
+async def _run_delete_job(
+    *,
+    job: _DeleteJob,
+    target_kind: str,
+    target_id: str,
+    user_id: str,
+) -> None:
+    """Worker for a single delete job. Walks the steps in order,
+    flipping each pending → running → done/failed, and emits progress
+    to the job's snapshot (which the GET poll endpoint reads).
+
+    The order of operations is fixed and matches the cleanup the server
+    has always done synchronously in _purge_session_everything. The
+    per-step granularity is what the UI shows in its checklist. We do
+    NOT abort the entire job on a single step's failure — the underlying
+    helpers are best-effort + idempotent, so we mark the failed step,
+    log the error, and keep going. The job as a whole lands in 'failed'
+    if any step failed.
+    """
+    any_step_failed = False
+    first_error: str | None = None
+
+    try:
+        if target_kind == "session":
+            sessions_to_purge = [_load_session_for_delete(target_id, user_id)]
+        else:  # project
+            sessions_to_purge = _load_sessions_for_project_delete(target_id, user_id)
+
+        # Capture deployed-app rows before we tear them down so we can
+        # restore the sidebar on failure (server-side rows the UI
+        # optimistically removed are mirrored in job.restore_apps).
+        with job._lock:
+            job.restore_apps = [
+                a for s in sessions_to_purge
+                for a in db.list_deployed_apps_for_session(s["id"])
+            ]
+
+        # Walk the sessions one by one, running the 7-step sequence for each.
+        for s_idx, session in enumerate(sessions_to_purge):
+            base = s_idx * len(_DELETE_STEP_NAMES)
+            sid = session["id"]
+            slug_for_label = (sessions_to_purge[0].get("name") if s_idx == 0
+                              else f"session {s_idx + 1}/{len(sessions_to_purge)}")
+
+            with job._lock:
+                job.phase = f"deleting {slug_for_label}"
+                job.updated_at = int(time.time())
+            if job.cancel_requested:
+                _set_delete_terminal(job, "cancelled", "cancelled by user")
+                return
+
+            # 1. cancel_agent
+            _set_delete_step(job, base + 0, "running")
+            try:
+                task = _active_turns.get(sid)
+                if task is not None and not task.done():
+                    task.cancel()
+                    try:
+                        # Give the agent a beat to honor the cancellation.
+                        await asyncio.wait_for(
+                            asyncio.shield(task), timeout=1.5,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                _set_delete_step(job, base + 0, "done")
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"cancel_agent: {e}"
+                _set_delete_step(job, base + 0, "failed", str(e)[:200])
+
+            if job.cancel_requested:
+                _set_delete_terminal(job, "cancelled", "cancelled by user")
+                return
+
+            # 2. kill_processes
+            _set_delete_step(job, base + 1, "running")
+            try:
+                _kill_session_processes(sid)
+                _set_delete_step(job, base + 1, "done")
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"kill_processes: {e}"
+                _set_delete_step(job, base + 1, "failed", str(e)[:200])
+
+            if job.cancel_requested:
+                _set_delete_terminal(job, "cancelled", "cancelled by user")
+                return
+
+            # 3. teardown_subprojects — for each deployed app: stop+rm
+            #    systemd unit, drop Caddy fragment, rmtree on disk.
+            _set_delete_step(job, base + 2, "running")
+            try:
+                app_rows = db.list_deployed_apps_for_session(sid)
+                teardown_msgs: list[str] = []
+                caddy_changed = False
+                for row in app_rows:
+                    slug = row["slug"]
+                    try:
+                        # 1. Tear down the systemd unit (fullstack apps
+                        #    only) — stop+disable+rm+daemon-reload.
+                        _remove_app_service_files(slug, row)
+                        # 2. Unlink the per-slug Caddy fragment. We do
+                        #    this directly (not via _drop_caddy_fragment)
+                        #    so we can batch the Caddy reload to ONCE at
+                        #    the end of the loop instead of once per
+                        #    app — N reloads of Caddy for N apps is
+                        #    wasteful and can race.
+                        caddy_frag = OJAS_CADDY_ROUTES_DIR / f"{slug}.caddy"
+                        try:
+                            if caddy_frag.exists():
+                                caddy_frag.unlink()
+                                caddy_changed = True
+                        except OSError:
+                            pass
+                        # 3. Rmtree the on-disk dir.
+                        for d in (row["app_dir"], str(OJAS_APPS_STOPPED_DIR / slug)):
+                            if d and Path(d).exists():
+                                shutil.rmtree(d, ignore_errors=True)
+                        teardown_msgs.append(f"torn down {slug}")
+                    except Exception as e:
+                        teardown_msgs.append(f"{slug}: {e}")
+                # One Caddy reload for the whole session, regardless of
+                # how many apps we tore down.
+                if caddy_changed:
+                    try:
+                        _reload_caddy()
+                    except Exception:
+                        pass
+                _set_delete_step(
+                    job, base + 2, "done",
+                    "; ".join(teardown_msgs) if teardown_msgs else "no sub-projects",
+                )
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"teardown_subprojects: {e}"
+                _set_delete_step(job, base + 2, "failed", str(e)[:200])
+
+            if job.cancel_requested:
+                _set_delete_terminal(job, "cancelled", "cancelled by user")
+                return
+
+            # 4. rmtree_subdir — the agent's edited workspace files.
+            _set_delete_step(job, base + 3, "running")
+            try:
+                _purge_session_workspace_subdir(session)
+                _set_delete_step(job, base + 3, "done")
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"rmtree_subdir: {e}"
+                _set_delete_step(job, base + 3, "failed", str(e)[:200])
+
+            if job.cancel_requested:
+                _set_delete_terminal(job, "cancelled", "cancelled by user")
+                return
+
+            # 5. drop_checkpoint — langgraph state + on-disk state dir.
+            _set_delete_step(job, base + 4, "running")
+            try:
+                _purge_session_state_dir(sid)
+                _purge_langgraph_checkpoint(sid)
+                _set_delete_step(job, base + 4, "done")
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"drop_checkpoint: {e}"
+                _set_delete_step(job, base + 4, "failed", str(e)[:200])
+
+            if job.cancel_requested:
+                _set_delete_terminal(job, "cancelled", "cancelled by user")
+                return
+
+            # 6. clear_bus — drop the per-session WebSocket bus.
+            _set_delete_step(job, base + 5, "running")
+            try:
+                _purge_session_bus(sid)
+                _set_delete_step(job, base + 5, "done")
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"clear_bus: {e}"
+                _set_delete_step(job, base + 5, "failed", str(e)[:200])
+
+            if job.cancel_requested:
+                _set_delete_terminal(job, "cancelled", "cancelled by user")
+                return
+
+            # 7. drop_rows — DB cascade. Done LAST so the rows still
+            #    exist during the teardown_subprojects step (the rmtree
+            #    on row["app_dir"] needs the row to know where to look).
+            _set_delete_step(job, base + 6, "running")
+            try:
+                if target_kind == "session":
+                    if not db.delete_session(sid):
+                        raise RuntimeError("session row not found")
+                # For a project delete, the per-session rows are dropped
+                # together by delete_project() AFTER the per-session
+                # filesystem work (matches the old sync handler's order).
+                _set_delete_step(job, base + 6, "done")
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"drop_rows: {e}"
+                _set_delete_step(job, base + 6, "failed", str(e)[:200])
+
+        # Final step for project deletes: drop the project row itself.
+        # (For session deletes, the per-session delete_session call above
+        # already removed the row.)
+        if target_kind == "project":
+            try:
+                if not db.delete_project(target_id):
+                    raise RuntimeError("project row not found")
+            except Exception as e:
+                any_step_failed = True
+                first_error = first_error or f"delete_project: {e}"
+
+        if any_step_failed:
+            _set_delete_terminal(job, "failed", first_error)
+        else:
+            _set_delete_terminal(job, "succeeded")
+    except asyncio.CancelledError:
+        _set_delete_terminal(job, "cancelled", "cancelled")
+        raise
+    except Exception as e:
+        _set_delete_terminal(job, "failed", f"unexpected: {e}")
+
+
+def _load_session_for_delete(session_id: str, user_id: str) -> dict:
+    """Load a session row + ownership check. Mirrors _session_or_404
+    but raises a 500-shaped RuntimeError (not HTTPException) because
+    this is called from the background worker, not the request path."""
+    sess = db.get_session(session_id)
+    if sess is None:
+        raise RuntimeError(f"session {session_id} not found")
+    # Ownership check: regular users can only delete their own sessions.
+    # The HTTP request handler that started this job already 404'd for
+    # cross-user access, so this is a defense-in-depth check.
+    if sess.get("user_id") and sess["user_id"] != user_id:
+        raise RuntimeError(f"not authorized to delete session {session_id}")
+    return sess
+
+
+def _load_sessions_for_project_delete(project_id: str, user_id: str) -> list[dict]:
+    """Load every session in a project + ownership check. Same
+    defense-in-depth pattern as _load_session_for_delete."""
+    proj = db.get_project(project_id)
+    if proj is None:
+        raise RuntimeError(f"project {project_id} not found")
+    if proj.get("user_id") and proj["user_id"] != user_id:
+        raise RuntimeError(f"not authorized to delete project {project_id}")
+    sessions = db.list_sessions(project_id)
+    if not sessions:
+        # Empty project — nothing to purge. The delete_project call at
+        # the end will still drop the row.
+        return []
+    return sessions
+
+
+async def _sweep_completed_delete_jobs() -> None:
+    """Periodic background task: drop completed delete jobs after a
+    5-minute TTL. Mirrors _sweep_completed_deploy_jobs."""
+    COMPLETED_TTL_SECONDS = 300
+    SWEEP_INTERVAL_SECONDS = 60
+    while True:
+        try:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        cutoff = int(time.time()) - COMPLETED_TTL_SECONDS
+        stale_ids: list[str] = []
+        with _delete_jobs_lock:
+            for jid, djob in _delete_jobs.items():
+                if djob.completed_at is not None and djob.completed_at < cutoff:
+                    stale_ids.append(jid)
+                elif djob.status in ("succeeded", "failed", "cancelled") and \
+                     djob.completed_at is None and djob.updated_at < cutoff:
+                    stale_ids.append(jid)
+        for jid in stale_ids:
+            with _delete_jobs_lock:
+                _delete_jobs.pop(jid, None)
+        if stale_ids:
+            print(f"[ojas] swept {len(stale_ids)} stale delete job(s) (TTL {COMPLETED_TTL_SECONDS}s)")
+
+
+def _start_delete_job_sweeper() -> asyncio.Task:
+    """Spawn the periodic sweeper. Idempotent."""
+    if getattr(_start_delete_job_sweeper, "_task", None) is not None:
+        return _start_delete_job_sweeper._task  # type: ignore[return-value]
+    task = asyncio.create_task(_sweep_completed_delete_jobs())
+    _start_delete_job_sweeper._task = task  # type: ignore[attr-defined]
     return task
 
 
