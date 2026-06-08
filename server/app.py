@@ -1387,7 +1387,7 @@ from dataclasses import dataclass, field
 # the 11 entries emitted in _run_deploy_job; counted at import time
 # so an out-of-sync build fails fast rather than silently rendering
 # a 4-step checklist for a fullstack deploy.
-_DEPLOY_STEP_COUNT = 12
+_DEPLOY_STEP_COUNT = 13
 
 @dataclass
 class _DeployJob:
@@ -2268,6 +2268,53 @@ def _remove_app_service_files(slug: str, row: dict | None = None) -> None:
     except (OSError, subprocess.TimeoutExpired) as e:
         print(f"[ojas] helper rm-unit/daemon-reload {svc} failed: {e}")
 
+
+def _prefetch_tls_cert(subdomain_url: str, slug: str) -> None:
+    """Trigger Caddy's on-demand TLS flow for a freshly-deployed
+    fullstack app so the per-host Let's Encrypt cert lands BEFORE the
+    user visits.
+
+    Why this exists: a fullstack app's per-slug Caddy fragment
+    declares `tls { on_demand }` -- Caddy only obtains the cert on
+    the FIRST user request, and during the 3-5s ACME round-trip it
+    serves a temporary cert that the browser flags as "Your
+    connection is not private". The user has to hard-refresh a few
+    times to clear the warning.
+
+    Fix: make one HEAD request from the server to the new subdomain
+    right after the Caddy reload. Caddy's on-demand flow runs in the
+    background, the cert lands in its storage (`/var/lib/caddy/...`),
+    and by the time the user actually visits, the cert is already
+    there. The HEAD is cheap (no body, returns immediately) and
+    idempotent -- if the cert is already issued, the request just
+    serves normally.
+
+    Best-effort: we never raise out of this function. The deploy
+    succeeds even if the cert prefetch fails (DNS hiccup, ACME
+    rate-limit, network blip). The user just gets the legacy
+    "refresh a few times" experience for that one bad case, which
+    is still strictly better than failing the deploy.
+    """
+    if not subdomain_url:
+        return
+    try:
+        import urllib.request
+        # 8s timeout = generous (the user would have given up by now,
+        # but Caddy's on-demand is async so this should return in
+        # well under a second -- the slow part is the ACME challenge,
+        # which happens in Caddy's background goroutine).
+        req = urllib.request.Request(subdomain_url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            # Discard the body. We're not checking the status code
+            # either -- a 200 means the cert is ready, a 5xx means
+            # the cert fetch is still in flight and the next
+            # request will get the cert. Either way, our work here
+            # is done.
+            _ = resp.status
+    except Exception as e:
+        # Don't let any error here fail the deploy. Log + move on.
+        print(f"[ojas] cert prefetch for {slug} failed: {e}")
+
 def _rmtree_with_symlinks(path: Path) -> None:
     """Recursive delete that unlinks symlinks BEFORE recursing into
     them. `shutil.rmtree(..., ignore_errors=True)` is the usual tool,
@@ -2823,6 +2870,7 @@ _DEPLOY_STEPS: list[tuple[str, str]] = [
     ("enable_service", "Enabling systemd service"),
     ("db_row",         "Recording deployment"),
     ("caddy_regen",    "Configuring reverse proxy"),
+    ("prefetch_cert",  "Pre-fetching TLS certificate"),
     ("start_service",  "Starting service + health check"),
 ]
 
@@ -3132,15 +3180,42 @@ async def _run_deploy_job(
                 raise
             _set_step(9, "done")
 
-            # 10. start_service + 5s health poll
-            _set_step(10, "running")
+            # 9.5 prefetch_cert — fullstack apps use a per-slug Caddy
+            #     site block with `tls { on_demand }`, which means
+            #     Caddy only obtains the per-host Let's Encrypt cert
+            #     on the FIRST user request -- and during that 3-5s
+            #     ACME round-trip, Caddy serves a temporary cert that
+            #     the user's browser flags as "Your connection is not
+            #     private". Static apps are unaffected because the
+            #     wildcard `*.ojas.karmacode.cloud` cert is
+            #     pre-issued and re-used. So: make one HEAD request to
+            #     the new subdomain right after the reload. Caddy's
+            #     on-demand flow runs in the background, the cert
+            #     lands in its storage, and by the time the user
+            #     visits the URL, the cert is already there. Best-
+            #     effort: we don't fail the deploy if the cert fetch
+            #     itself errors (DNS, network blip, ACME rate-limit);
+            #     the user just gets the legacy "refresh a few times"
+            #     experience for that one bad case.
+            if subdomain_url:
+                _set_step(10, "running")
+                try:
+                    await loop.run_in_executor(
+                        None, lambda: _prefetch_tls_cert(subdomain_url, slug),
+                    )
+                except Exception as e:
+                    print(f"[ojas] cert prefetch for {slug} failed: {e}")
+                _set_step(10, "done")
+
+            # 11. start_service + 5s health poll
+            _set_step(11, "running")
             ok = await loop.run_in_executor(
                 None, lambda: _start_app_service(app_row),
             )
             if not ok:
                 # Soft failure — row is in place, user can retry.
                 db.set_deployed_app_state(slug, "starting", error_message="health check failed")
-            _set_step(10, "done")
+            _set_step(11, "done")
 
         # Finalize
         db.set_deployed_app_state(slug, "running", last_health_at=int(time.time()))

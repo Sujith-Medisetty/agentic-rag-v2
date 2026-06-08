@@ -2519,7 +2519,7 @@ function DeployModal({
             by index so the UI is stable even if the server emits them
             out of order (it shouldn't, but defensive). */}
         <ol className="mt-1 space-y-1.5" data-testid="deploy-steps">
-          {Array.from({ length: 12 }).map((_, idx) => {
+          {Array.from({ length: 13 }).map((_, idx) => {
             // Map index → label. The server emits the same 11 in the
             // same order; we use the server's name/label when we have it.
             const s = jobStatus?.steps?.[idx];
