@@ -1025,6 +1025,7 @@ export default function ChatPage() {
         sessionId={sessionId ?? ""}
         sessionName={turns[0]?.userPrompt ?? "app"}
         apps={deployedApps}
+        freshBuild={!!lastDetected?.fresh_build}
         // Hoisted state so the build-ready banner can also open the
         // modal (single source of truth — both the strip button and
         // the banner button call setShowDeployModal(true)).
@@ -2086,17 +2087,27 @@ function BuildReadyBanner({
 
 // ============================================================================
 // DeployStrip — sticky horizontal strip between the plan panel and the chat
-// scroll area. Shows every app deployed FROM this session as a pill (slug +
-// open + delete) plus a "Deploy" button that opens the modal.
+// scroll area. Shows every app deployed FROM this session as a state-aware
+// pill (slug + public URL + 🔄 Update when a fresh build is detected, ✓ Up
+// to date when not). A single "+ Deploy new" button on the right opens the
+// modal for a *new* app (first-time deploy or a sibling project in a
+// multi-app session) — it is only enabled when the agent has produced a
+// build since the last re-deploy of the default project, so the user never
+// sees a "Deploy" button that would fail with "no dist/ found".
 // ============================================================================
 
 function DeployStrip({
-  sessionId, sessionName, apps, onDeployed, onDeleted, onToggled,
+  sessionId, sessionName, apps, freshBuild, onDeployed, onDeleted, onToggled,
   showModal: showModalProp, onShowModalChange,
 }: {
   sessionId: string;
   sessionName: string;
   apps: DeployedApp[];
+  // True when a fresh build exists for this session (i.e. dist/ mtime is
+  // newer than the most recent last_redeploy_at of any of this session's
+  // apps). Drives whether the per-pill Update button + the strip's
+  // "+ Deploy new" button are enabled.
+  freshBuild: boolean;
   onDeployed: (app: DeployedApp) => void;
   onDeleted: (slug: string) => void;
   onToggled: (slug: string, state: string) => void;
@@ -2120,21 +2131,39 @@ function DeployStrip({
         <div className="mx-auto flex max-w-4xl flex-wrap items-center gap-2 px-4 py-2">
           {apps.length === 0 ? (
             <span className="flex-1 text-tx-xs text-muted">
-              Once a build is ready, tap Deploy to publish at{" "}
-              <span className="font-mono">&lt;slug&gt;.{hostApps()}</span>.
+              {freshBuild
+                ? "Build ready — click “Deploy new” to publish."
+                : "Build the app first (`npm run build`), then come back and click “Deploy new”."}
             </span>
           ) : (
             apps.map((a) => (
-              <DeployedAppPill key={a.slug} app={a} onDeleted={onDeleted} onToggled={onToggled} />
+              <DeployedAppPill
+                key={a.slug}
+                app={a}
+                freshBuild={freshBuild}
+                onDeployed={onDeployed}
+                onDeleted={onDeleted}
+                onToggled={onToggled}
+              />
             ))
           )}
+          {/* "+ Deploy new" — for a *new* sub-app from this session
+              (first-time deploy, or a sibling project in a multi-app
+              session). Always present so the user can start a fresh
+              deploy at any time, but disabled until a build exists --
+              otherwise the modal would 500 with "no dist/ found". */}
           <button
             type="button"
             onClick={() => setShowModal(true)}
-            disabled={!sessionId}
-            className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/15 px-3 py-1.5 text-tx-sm font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
+            disabled={!sessionId || !freshBuild}
+            title={
+              !freshBuild
+                ? "Build the app first (`npm run build`) to enable"
+                : "Publish a new sub-app from this session"
+            }
+            className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/15 px-3 py-1.5 text-tx-sm font-medium text-accent hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            <UploadIcon /> Deploy
+            <UploadIcon /> Deploy new
           </button>
         </div>
       </div>
@@ -2162,9 +2191,23 @@ function hostApps(): string {
 }
 
 function DeployedAppPill({
-  app, onDeleted, onToggled,
-}: { app: DeployedApp; onDeleted: (slug: string) => void; onToggled: (slug: string, state: string) => void }) {
-  const url = `${window.location.protocol}//${app.slug}.${window.location.host}/`;
+  app, freshBuild, onDeployed, onDeleted, onToggled,
+}: {
+  app: DeployedApp;
+  // True when this session has a fresh build that the user could push
+  // to this app. Drives the per-pill "🔄 Update" button so the
+  // action only appears when there's actually something to update.
+  freshBuild: boolean;
+  onDeployed: (app: DeployedApp) => void;
+  onDeleted: (slug: string) => void;
+  onToggled: (slug: string, state: string) => void;
+}) {
+  // Server-computed URL is authoritative (handles apps-root domain
+  // resolution + future routing). Fall back to a derived URL only
+  // if the server didn't send one -- legacy rows pre-dating the
+  // public_url field.
+  const url = app.public_url
+    || `${window.location.protocol}//${app.slug}.${window.location.host}/`;
   const [busy, setBusy] = useState(false);
   const state = app.state ?? "running";
   const isOff = state === "stopped" || state === "error";
@@ -2187,6 +2230,32 @@ function DeployedAppPill({
       onToggled(app.slug, next.state);
     } catch (e: any) {
       alert(`Toggle failed: ${e?.message ?? "unknown"}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  // Update = in-place re-deploy of the same slug. The server detects
+  // slug+owner match and swaps the dist atomically (no new port, no
+  // new systemd unit, no new URL). The deploy modal would also work
+  // but is overkill for a re-deploy -- it asks for a slug, project,
+  // and 12-step progress that the user has already seen once.
+  const update = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      // Kick off the deploy with the existing slug. The 202 returns
+      // a job_id; the optimistic placeholder is spliced in by the
+      // caller (ChatPage) which polls the job and replaces this
+      // pill's row when the job succeeds. We don't await the
+      // completion here because it can take 10-30s for a fullstack
+      // -- the user gets live step progress via the existing
+      // polling flow.
+      await sessionApi.deploy(app.source_session_id ?? "", {
+        slug: app.slug,
+        project_dir: app.project_dir ?? undefined,
+      });
+    } catch (e: any) {
+      alert(`Update failed: ${e?.message ?? "unknown"}`);
     } finally {
       setBusy(false);
     }
@@ -2215,10 +2284,42 @@ function DeployedAppPill({
         <span className={`inline-block size-2 rounded-full transition-opacity ${dotClass} ${busy ? "opacity-50" : ""}`} />
       </button>
       <span className="font-mono" title={url}>{app.slug}</span>
+      {/* Public URL link, always present. The href is the
+          server-computed public_url so the user can bookmark one URL
+          and have it survive every re-deploy. The "↗" icon is
+          intentionally small and the URL is in the title for
+          hover-preview without eating pill real estate. */}
       <a
         href={url} target="_blank" rel="noreferrer"
-        className="hover:text-accent" title="Open"
+        className="hover:text-accent" title={url}
       >↗</a>
+      {/* Update / Up-to-date indicator. Driven by the session-wide
+          fresh_build flag, not per-app: if the agent rebuilt any
+          sub-app in this session, the user is probably about to
+          want to push it everywhere. We could compute this per-app
+          (compare dist mtime to this app's last_redeploy_at) but
+          that adds a server round-trip per pill; the session-level
+          flag is correct in 99% of cases (the agent rebuilds the
+          whole workspace) and the user can always click "Deploy
+          new" for a sibling project. */}
+      {freshBuild ? (
+        <button
+          type="button"
+          onClick={update}
+          disabled={busy}
+          title={`Push the new build to ${app.slug} (same URL, no new port)`}
+          className="inline-flex items-center gap-1 rounded border border-accent/40 bg-accent/15 px-1.5 py-0.5 font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
+        >
+          🔄 Update
+        </button>
+      ) : (
+        <span
+          className="inline-flex items-center gap-1 rounded border border-success/30 bg-success/10 px-1.5 py-0.5 font-medium text-success"
+          title="Live and up to date — no new build since the last deploy"
+        >
+          ✓ Up to date
+        </span>
+      )}
       <button
         type="button" onClick={remove}
         className="text-muted hover:text-danger"
@@ -2418,7 +2519,7 @@ function DeployModal({
             by index so the UI is stable even if the server emits them
             out of order (it shouldn't, but defensive). */}
         <ol className="mt-1 space-y-1.5" data-testid="deploy-steps">
-          {Array.from({ length: 11 }).map((_, idx) => {
+          {Array.from({ length: 12 }).map((_, idx) => {
             // Map index → label. The server emits the same 11 in the
             // same order; we use the server's name/label when we have it.
             const s = jobStatus?.steps?.[idx];

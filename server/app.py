@@ -1387,7 +1387,7 @@ from dataclasses import dataclass, field
 # the 11 entries emitted in _run_deploy_job; counted at import time
 # so an out-of-sync build fails fast rather than silently rendering
 # a 4-step checklist for a fullstack deploy.
-_DEPLOY_STEP_COUNT = 11
+_DEPLOY_STEP_COUNT = 12
 
 @dataclass
 class _DeployJob:
@@ -1947,6 +1947,23 @@ def _resolve_apps_root_domain() -> str | None:
     if apex:
         return apex
     return None
+
+def _public_url_for(slug: str) -> str:
+    """Compute the public URL for a deployed sub-app, used to populate
+    `DeployedAppResponse.public_url` so the UI doesn't need to know the
+    apps-root domain. Always absolute so a non-technical user can
+    click it from any page (chat strip, settings, deploy modal).
+
+    Order matches the deploy response builder at line 376:
+      1. `https://<slug>.<apps-root>/` when an apps-root is resolved
+         (production -- TLS + on-demand cert via the Caddy wildcard).
+      2. `/apps/<slug>/` relative path (legacy fallback, used when
+         Ojas runs without a public domain -- e.g. localhost dev).
+    """
+    apps_root = _resolve_apps_root_domain() or _resolve_public_domain()
+    if apps_root:
+        return f"https://{slug}.{apps_root}/"
+    return f"/apps/{slug}/"
 
 def _deployed_app_or_404(slug: str, user: dict) -> dict:
     """Lookup + ownership check. Returns the row dict, or raises 404 if the
@@ -2710,6 +2727,7 @@ async def sessions_deploy(
         project_dir=project_dir, state="starting",
         last_state_at=int(time.time()), last_health_at=None,
         error_message=None, service_name=None, port=None,
+        public_url=_public_url_for(slug),
     )
 
     # 5. Register the job + spawn the background task. Mirror the
@@ -2797,6 +2815,7 @@ _DEPLOY_STEPS: list[tuple[str, str]] = [
     ("validate",       "Validating build"),
     ("eager_caddy",    "Reserving public URL"),
     ("copy_dist",      "Copying build to /opt/ojas-apps"),
+    ("inject_pwa",     "Adding PWA defaults"),
     ("copy_backend",   "Copying backend"),
     ("venv_create",    "Creating virtualenv"),
     ("pip_install",    "Installing Python dependencies"),
@@ -2972,6 +2991,23 @@ async def _run_deploy_job(
             raise
         _set_step(2, "done")
 
+        # 2.5 inject_pwa — write the manifest + sw + icons + <head>
+        #     tags the agent forgot to ship. Cheap (a few KB of text +
+        #     two small PNGs from /opt/ojas/assets/). Idempotent: an
+        #     agent that DID include custom PWA assets keeps them
+        #     untouched. Runs before the fullstack-only copy_backend so
+        #     the static/ tree is settled before the backend handler
+        #     starts touching sibling paths.
+        _set_step(3, "running")
+        try:
+            await loop.run_in_executor(None, lambda: _inject_default_pwa_assets(
+                dist_target, slug=slug, name=(session.get("name") or slug),
+            ))
+        except Exception as e:
+            _set_step(3, "failed", str(e)[:200])
+            raise
+        _set_step(3, "done")
+
         service_name: str | None = None
         port: int | None = None
         slug_safe = re.sub(r"[^a-z0-9_-]", "-", slug.lower())[:40]
@@ -3112,7 +3148,8 @@ async def _run_deploy_job(
         result = {
             "slug": slug,
             "url": subdomain_url,
-            "app": DeployedAppResponse(**app_row).model_dump(mode="json"),
+            "app": {**DeployedAppResponse(**app_row).model_dump(mode="json"),
+                    "public_url": _public_url_for(slug)},
         }
         _set_terminal("succeeded", result=result)
 
@@ -3256,6 +3293,255 @@ def _do_copy_dist(*, dist, dist_target, slug) -> None:
         shutil.rmtree(str(staging), ignore_errors=True)
         raise
 
+# ---- PWA defaults injector ----------------------------------------------
+#
+# Both Ojas templates ship a working PWA shell (manifest.webmanifest,
+# sw.js, icon-192/512.png) under `frontend/public/`, but a non-trivial
+# fraction of agent builds either (a) replace the template's `index.html`
+# and forget to keep the <link rel="manifest"> / <meta name="apple-mobile-
+# web-app-capable"> tags, or (b) ship without a `public/` folder at all.
+# The result: the deploy "succeeds" but the served URL is not installable
+# on mobile -- the browser never fires `beforeinstallprompt` because the
+# manifest check fails. This is invisible until the user tries to install
+# the app on their phone and gets nothing.
+#
+# To make every sub-app installable without trusting the agent, the
+# server injects a complete PWA shell at the end of the dist copy. Every
+# write is idempotent: existing custom assets are preserved (we only
+# write when the file is missing), and we never touch a <link> or <meta>
+# tag that's already in the served index.html. Re-deploys are safe and
+# won't clobber per-app theming the agent set up.
+#
+# The defaults use Ojas's bundled icon (a neutral 192/512 PNG that the
+# Ojas main app already ships at /opt/ojas/web/public/icons/) so the
+# installable icon on the user's home screen is recognizably "an Ojas
+# app" even before the agent swaps in a branded asset. Agents can
+# replace the icon at any time by shipping their own `public/icon-192.png`
+# on the next build.
+
+OJAS_DEFAULT_ICONS_DIR = Path("/opt/ojas/assets")
+
+_DEFAULT_PWA_MANIFEST = (
+    '{{\n'
+    '  "name": {name_json},\n'
+    '  "short_name": {short_name_json},\n'
+    '  "description": "An app deployed by Ojas",\n'
+    '  "start_url": "./",\n'
+    '  "scope": "./",\n'
+    '  "display": "standalone",\n'
+    '  "background_color": "#020617",\n'
+    '  "theme_color": "#4f46e5",\n'
+    '  "icons": [\n'
+    '    {{ "src": "./icon-192.png", "sizes": "192x192", "type": "image/png" }},\n'
+    '    {{ "src": "./icon-512.png", "sizes": "512x512", "type": "image/png" }}\n'
+    '  ]\n'
+    '}}\n'
+)
+
+_DEFAULT_PWA_SW = '''// Minimal service worker installed by Ojas so the browser
+// surfaces the install prompt for sub-apps. Network-first for HTML so
+// re-deploys are visible immediately; cache-first for content-hashed
+// assets (they're immutable by hash, so a new file = a new URL = a
+// cache miss). The cache name is keyed to the deploy epoch so a new
+// build evicts the old one on activate.
+const CACHE = "ojas-static-v" + {version!r};
+
+self.addEventListener("install", (e) => {{
+  self.skipWaiting();
+}});
+
+self.addEventListener("activate", (e) => {{
+  e.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))
+    ).then(() => self.clients.claim())
+  );
+}});
+
+self.addEventListener("fetch", (e) => {{
+  if (e.request.method !== "GET") return;
+  const url = new URL(e.request.url);
+  if (url.pathname.endsWith("/sw.js")) return;
+
+  const isHTML =
+    e.request.mode === "navigate" ||
+    e.request.destination === "document" ||
+    url.pathname.endsWith(".html") ||
+    url.pathname === "/" ||
+    url.pathname.endsWith("/");
+
+  if (isHTML) {{
+    e.respondWith(
+      fetch(e.request)
+        .then((res) => {{
+          if (res.ok) {{
+            const clone = res.clone();
+            caches.open(CACHE).then((c) => c.put(e.request, clone));
+          }}
+          return res;
+        }})
+        .catch(() => caches.match(e.request).then((c) => c || Response.error()))
+    );
+    return;
+  }}
+
+  e.respondWith(
+    caches.match(e.request).then((cached) => {{
+      if (cached) return cached;
+      return fetch(e.request).then((res) => {{
+        if (res.ok && url.origin === self.location.origin) {{
+          const clone = res.clone();
+          caches.open(CACHE).then((c) => c.put(e.request, clone));
+        }}
+        return res;
+      }}).catch(() => cached || Response.error());
+    }})
+  );
+}});
+'''
+
+_INDEX_HEAD_PATCHES = [
+    ('<link rel="manifest"',
+     '<link rel="manifest" href="./manifest.webmanifest" />'),
+    ('<meta name="apple-mobile-web-app-capable"',
+     '<meta name="apple-mobile-web-app-capable" content="yes" />'),
+    ('<meta name="apple-mobile-web-app-title"',
+     '<meta name="apple-mobile-web-app-title" content="{short_name}" />'),
+    ('<link rel="apple-touch-icon"',
+     '<link rel="apple-touch-icon" href="./icon-192.png" />'),
+]
+
+
+def _short_name_from(name: str) -> str:
+    """Derive a <=12 char home-screen label from the app's display
+    name. The PWA spec caps short_name at 12 chars (or it gets
+    truncated on Android). Strips non-printable, collapses spaces,
+    falls back to the slug if the result is empty."""
+    import re as _re
+    s = _re.sub(r"[^A-Za-z0-9 ]+", "", name or "").strip()
+    if not s:
+        return "Ojas app"
+    parts = s.split()
+    # Prefer first word if it's <=12, else the first 12 chars.
+    if len(parts[0]) <= 12:
+        return parts[0]
+    return s[:12]
+
+
+def _inject_default_pwa_assets(dist_dir: Path, *, slug: str, name: str) -> None:
+    """Idempotently fill in the four PWA assets + <head> tags the
+    agent forgot to ship. Never overwrites existing custom assets --
+    the rule is "only write if the file/tag is missing", so an
+    agent that DID set up a proper PWA (or that customised the
+    theme_color / icon) keeps their work intact on the next deploy.
+
+    Args:
+        dist_dir: the on-disk target that was just populated by
+            `_do_copy_dist` -- either `/opt/ojas-apps/<slug>/` for
+            static apps or `/opt/ojas-apps/<slug>/static/` for
+            fullstack apps. Both layouts work because the assets
+            land in the same root that Caddy serves from.
+        slug: the deployed slug, baked into the SW cache name.
+        name: the human-readable app name (from the session at
+            deploy time). Used for `name` and `short_name` in the
+            manifest and the apple-mobile-web-app-title <meta>.
+
+    Raises nothing on missing-icons-dir (logged + skipped) so a
+    half-installed Ojas doesn't block deploys; the rest of the
+    PWA still gets written."""
+    import re as _re
+    if not dist_dir.exists():
+        return
+    try:
+        dist_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    short_name = _short_name_from(name)
+
+    # 1. manifest.webmanifest
+    manifest_path = dist_dir / "manifest.webmanifest"
+    if not manifest_path.exists():
+        import json as _json
+        try:
+            manifest_path.write_text(
+                _DEFAULT_PWA_MANIFEST.format(
+                    name_json=_json.dumps(name or "Ojas app"),
+                    short_name_json=_json.dumps(short_name),
+                ),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            print(f"[ojas] inject_pwa: manifest write failed: {e}")
+
+    # 2. sw.js
+    sw_path = dist_dir / "sw.js"
+    if not sw_path.exists():
+        try:
+            # Cache name keyed to deploy epoch so every re-deploy
+            # evicts the old cache. The slug is included so two
+            # apps on the same VM never collide.
+            version = f"{slug}-{int(time.time())}"
+            sw_path.write_text(
+                _DEFAULT_PWA_SW.format(version=version),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            print(f"[ojas] inject_pwa: sw.js write failed: {e}")
+
+    # 3. icons (192 + 512) -- copied from the Ojas-bundled defaults.
+    #    Best-effort: if /opt/ojas/assets/ is missing for some reason
+    #    we log + skip rather than fail the deploy. The manifest
+    #    will still load; the browser will just fall back to its
+    #    default "no icon" rendering until the agent ships one.
+    for size, fname in ((192, "icon-192.png"), (512, "icon-512.png")):
+        target = dist_dir / fname
+        if target.exists():
+            continue
+        src = OJAS_DEFAULT_ICONS_DIR / f"ojas-icon-{size}.png"
+        if not src.exists():
+            print(f"[ojas] inject_pwa: default icon missing at {src}, "
+                  f"skipping {fname}")
+            continue
+        try:
+            target.write_bytes(src.read_bytes())
+        except OSError as e:
+            print(f"[ojas] inject_pwa: {fname} copy failed: {e}")
+
+    # 4. <head> patches in index.html -- idempotent: only inject
+    #    each tag if the same opening token isn't already present.
+    #    We use a simple substring check on the opening tag (not the
+    #    whole tag) because the agent may use a different attribute
+    #    order -- e.g. apple-touch-icon with sizes= or before/after
+    #    rel=apple-touch-icon-precomposed. Either way, the presence
+    #    of `<link rel="apple-touch-icon"` means we don't need to
+    #    inject one.
+    index_path = dist_dir / "index.html"
+    if not index_path.exists():
+        return
+    try:
+        html = index_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    changed = False
+    for marker, tag in _INDEX_HEAD_PATCHES:
+        if marker in html:
+            continue
+        # Use a marker-substituted copy of the tag so the short_name
+        # flows into apple-mobile-web-app-title.
+        try:
+            injected = tag.format(short_name=short_name)
+        except (KeyError, IndexError):
+            injected = tag
+        html = html.replace("</head>", f"  {injected}\n  </head>", 1)
+        changed = True
+    if not changed:
+        return
+    try:
+        index_path.write_text(html, encoding="utf-8")
+    except OSError as e:
+        print(f"[ojas] inject_pwa: index.html write failed: {e}")
+
 def _do_copy_backend(*, project_abs, target) -> None:
     """Symlink-aware copytree of the backend/ subdir. Raises OSError."""
     import shutil
@@ -3304,7 +3590,12 @@ def _do_enable_service(service_name: str) -> None:
 def deployed_apps_list(user: dict = Depends(require_user)):
     """List deployed apps. Root sees all; everyone else sees their own."""
     owner = None if user["role"] == "root" else user["id"]
-    return [DeployedAppResponse(**a) for a in db.list_deployed_apps(owner_user_id=owner)]
+    rows = db.list_deployed_apps(owner_user_id=owner)
+    return [
+        {**DeployedAppResponse(**a).model_dump(mode="json"),
+         "public_url": _public_url_for(a["slug"])}
+        for a in rows
+    ]
 
 @app.get(
     "/api/sessions/{session_id}/deployed-apps",
@@ -3324,7 +3615,11 @@ def session_deployed_apps_list(
         a for a in db.list_deployed_apps(owner_user_id=owner)
         if a.get("source_session_id") == session_id
     ]
-    return [DeployedAppResponse(**a) for a in rows]
+    return [
+        {**DeployedAppResponse(**a).model_dump(mode="json"),
+         "public_url": _public_url_for(a["slug"])}
+        for a in rows
+    ]
 
 # ---- Dist auto-detection --------------------------------------------------
 #
@@ -3536,6 +3831,14 @@ def users_deployed_apps(user: dict = Depends(require_user)):
     their own + orphans (apps whose owner was deleted)."""
     owner = None if user["role"] == "root" else user["id"]
     rows = db.list_deployed_apps_grouped(owner_user_id=owner)
+    # Stamp each app with its live public_url so the Settings page can
+    # render a clickable link without re-deriving the apps-root domain.
+    for r in rows:
+        r["deployed_apps"] = [
+            {**DeployedAppResponse(**a).model_dump(mode="json"),
+             "public_url": _public_url_for(a["slug"])}
+            for a in r.get("deployed_apps", [])
+        ]
     return [DeployedAppsBySession(**r) for r in rows]
 
 # Serve a deployed app's static files. Mirrors the /preview/* handler

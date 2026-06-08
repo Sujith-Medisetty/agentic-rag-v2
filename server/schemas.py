@@ -196,6 +196,13 @@ class DeployedAppResponse(BaseModel):
  # Fullstack-only fields (NULL for static apps).
  service_name: str | None = None
  port: int | None = None
+ # Live public URL for this sub-app -- e.g. https://<slug>.<host>/ for
+ # the wildcard Caddy block, or https://<host>/apps/<slug>/ when no
+ # apps-root domain is configured. Surfaced in the chat strip pill
+ # and the Settings "Deployed" tab so the user can always see (and
+ # bookmark) the same URL across re-deploys. Computed server-side so
+ # the UI doesn't need to know the apps-root domain.
+ public_url: str = ""
 
 
 class DeployStateResponse(BaseModel):

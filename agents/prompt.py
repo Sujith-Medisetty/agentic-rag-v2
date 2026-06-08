@@ -492,13 +492,17 @@ def get_ojas_app_rules_section() -> str:
         "with the new code. Re-run the buildable-artifact verification "
         "(exit 0 + `dist/index.html` exists).",
         "3. **You tell the user to click 🔄 Update <slug>** in the chat "
-        "strip. The chat shows a **🔄 Update <slug>** button (not 🚀 "
-        "Deploy) above the chat scroll because this session has been "
-        "deployed before. Clicking it overwrites the deployed "
-        "`/opt/ojas-apps/<slug>/static/` (or systemd unit) in place — "
-        "**the URL stays the same**, the app at that URL now serves the "
-        "new build on next request. Caddy has no cache layer to flush; "
-        "the new files are picked up immediately.",
+        "strip. The chat strip shows a per-pill **🔄 Update** button "
+        "next to the deployed app when a fresh build is detected (so "
+        "the label auto-toggles between \"🔄 Update <slug>\" and \"✓ "
+        "Up to date\" — don't make the user guess which state it's in). "
+        "Clicking it re-deploys IN PLACE: the server keeps the same "
+        "slug, the same systemd unit, the same Caddy route, and the "
+        "same public URL — it just swaps the dist/ under "
+        "`/opt/ojas-apps/<slug>/` and restarts the service. No new "
+        "port, no new URL, no new system unit. The app at "
+        "`https://<slug>.<host>/` now serves the new build on the next "
+        "request; Caddy has no cache layer to flush.",
         "4. **No data loss.** Re-deploying a static app keeps "
         "`localStorage` intact (it's in the user's browser, not the "
         "server). Re-deploying a fullstack app keeps the SQLite DB "
@@ -510,10 +514,10 @@ def get_ojas_app_rules_section() -> str:
         "Don't make them guess. The right end-of-turn copy is:",
         "",
         "  *\"Done — `<one-line summary of the change>`. Click **🔄 "
-        "Update <slug>** to push the new build to "
-        "`https://<slug>.<host>/`. The URL is the same; Caddy will "
-        "serve the new build on the next request. Your data is "
-        "preserved.\"*",
+        "Update <slug>** on the pill above the chat to push the new "
+        "build to `https://<slug>.<host>/`. The URL is the same; the "
+        "app at that URL serves the new build on the next request. "
+        "Your data is preserved.\"*",
         "",
         "If the change crosses the static↔fullstack boundary (e.g. the "
         "user added a feature that needs auth, so the app is now "
@@ -525,32 +529,45 @@ def get_ojas_app_rules_section() -> str:
         "",
         "## 7. Deploy is a UI button — you do not deploy yourself",
         "",
-        "Once `npm run build` finishes AND your turn ends, the chat shows "
-        "a **🚀 Deploy** button (first deploy) or **🔄 Update <slug>** "
-        "(redeploy) above the chat scroll. Clicking opens a dialog with "
-        "a **Slug** field, a **Project** field (the app folder you just "
-        "built), and a Deploy button. The user picks a slug and clicks "
-        "Deploy. **You do not deploy yourself.** Don't claim 'deployed' "
-        "or 'live at <url>' — only the user's click actually deploys.",
+        "Once `npm run build` finishes AND your turn ends, the chat "
+        "strip shows a per-pill action that depends on whether a "
+        "deployed app already exists for this sub-app's slug:",
         "",
-        "Multi-app session: the dialog shows a **Project** dropdown "
-        "instead of a locked label — the user picks which app to "
-        "publish. Single-app session: the Project field is locked, no "
-        "dropdown.",
+        "  - **First-time deploy** (no app yet for this slug): the strip "
+        "shows a **+ Deploy new** button on the right, which opens the "
+        "modal (Slug + Project + 12-step progress).",
+        "  - **Update** (app exists, fresh build detected): each pill "
+        "shows a **🔄 Update** button next to its slug. One click pushes "
+        "the new build to the SAME URL (no new port, no new systemd "
+        "unit, no new slug).",
+        "  - **Up to date** (app exists, no fresh build): each pill "
+        "shows a **✓ Up to date** badge. No action needed.",
+        "",
+        "**You do not deploy yourself.** Don't claim 'deployed' or "
+        "'live at <url>' — only the user's click actually deploys. "
+        "Mention the exact button the user should click in your "
+        "end-of-turn summary so they don't have to guess.",
+        "",
+        "Multi-app session: each deployed app gets its own pill with "
+        "its own action button. A session can hold N apps at "
+        "independent URLs (`<slug1>.<host>`, `<slug2>.<host>`, ...); "
+        "updating one doesn't touch the others. The **+ Deploy new** "
+        "button on the right is for adding yet another sibling.",
         "",
         "**MANDATORY end-of-turn summary** — copy the right variant "
         "verbatim from these three:",
         "",
         "  - First build, one project:  *\"Build complete. Click "
-        "**🚀 Deploy** above the chat, pick a slug, click Deploy — your "
-        "app will be live at `https://<slug>.<host>/`.\"*",
-        "  - First build, multiple projects:  *\"Build complete. Click "
-        "**🚀 Deploy** above the chat, pick the right project from the "
-        "dropdown, pick a slug, click Deploy.\"*",
+        "**+ Deploy new** above the chat, pick a slug, click Deploy — "
+        "your app will be live at `https://<slug>.<host>/`.\"*",
+        "  - First build, multiple projects:  *\"Build complete. "
+        "Click **+ Deploy new** above the chat, pick the right "
+        "project from the dropdown, pick a slug, click Deploy.\"*",
         "  - Subsequent rebuild (edit-after-deploy):  *\"Done — "
-        "`<one-line change>`. Click **🔄 Update <slug>** to push the "
-        "new build to `https://<slug>.<host>/`. The URL stays the "
-        "same; your data is preserved.\"*",
+        "`<one-line change>`. Click **🔄 Update <slug>** on the pill "
+        "above the chat to push the new build to "
+        "`https://<slug>.<host>/`. The URL stays the same; your data "
+        "is preserved.\"*",
         "",
         "If the build failed, say so plainly with the failing command "
         "and the first error line — do NOT show the user a Deploy "

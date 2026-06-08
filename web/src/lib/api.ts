@@ -201,6 +201,12 @@ export interface DeployedApp {
   error_message: string | null;
   service_name: string | null;
   port: number | null;
+  // Live public URL for this sub-app (e.g. https://<slug>.<host>/).
+  // Surfaced in the chat strip pill and Settings so the user can
+  // bookmark and re-open the same URL across re-deploys. Empty
+  // string is a legacy fallback -- if a future server build drops
+  // the field, the UI falls back to a derived URL.
+  public_url: string;
 }
 
 export interface DeployState {
