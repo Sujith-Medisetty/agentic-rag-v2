@@ -2912,6 +2912,26 @@ async def _run_deploy_job(
     try:
         # 0. validate
         _set_step(0, "running")
+        # 0a. dist quality -- reject bundles that contain two copies of
+        #     React. Symptom at runtime: "Cannot read properties of null
+        #     (reading 'useContext')" and a blank <div id="root">. Cause:
+        #     the agent ran `npm install` from outside the project and
+        #     npm hoisted a second react + react-dom into a parent
+        #     node_modules. Vite happily bundles the result -- the bug
+        #     only surfaces in the browser. We catch it here by counting
+        #     `.useContext=function` definitions in every emitted JS
+        #     file: a clean bundle has exactly 1 per file; a two-React
+        #     bundle has 2+. Templates ship `npm run verify:render` for
+        #     a stronger end-to-end check; this is a last-line-of-
+        #     defence that fires even if the agent skipped the
+        #     pre-render check.
+        try:
+            _validate_dist_quality(_session_preview_dir(
+                job.session_id, project_dir=project_dir,
+            ))
+        except _DistQualityError as dq:
+            _set_step(0, "failed", str(dq)[:200])
+            raise
         _set_step(0, "done")
 
         # 1. eager_caddy — write the placeholder Caddy fragment BEFORE
@@ -3133,6 +3153,91 @@ async def _run_deploy_job(
 # locals). All three swallow OSError and let _run_deploy_job decide
 # whether to set step=failed + raise, since the executor doesn't
 # otherwise have access to the step bookkeeping.
+
+class _DistQualityError(Exception):
+    """Raised by _validate_dist_quality when a built dist looks like it
+    would render as a blank page in the browser -- the most common
+    case being two copies of React bundled together (an "Invalid hook
+    call" / "Cannot read properties of null" failure that the bundler
+    cannot see). Caught by the deploy step which surfaces the message
+    to the user instead of shipping a broken app."""
+
+
+def _validate_dist_quality(dist: Path | None) -> None:
+    """Last-line-of-defence check that the built `dist/` will actually
+    boot in a browser.
+
+    Cheap static analysis -- runs in <100ms on a typical 500KB bundle.
+    It looks for the two-React signature (more than one
+    `.useContext=function` definition in any single JS file) and any
+    obviously broken dist (missing index.html).
+
+    Does NOT run the code, so it cannot replace the agent's
+    `npm run verify:render` smoke test. It only catches the
+    specific class of bug that the bundler cannot see: duplicate
+    React from a hoisted install.
+    """
+    if dist is None or not dist.exists():
+        # Resolver already raises; if we're here the deploy pipeline
+        # was called with no dist. The agent hasn't built yet.
+        raise _DistQualityError(
+            "no dist/ found for this session/project -- "
+            "ask the agent to run `npm run build` first",
+        )
+    index_html = dist / "index.html"
+    if not index_html.exists():
+        raise _DistQualityError(
+            f"dist/index.html missing under {dist} -- the Vite build "
+            "did not produce an output. Run `npm run build` and "
+            "check the console for errors.",
+        )
+    # Static-only apps put assets/ next to index.html. Fullstack apps
+    # put them under static/ (because the Ojas per-slug Caddy fragment
+    # serves from /opt/ojas-apps/<slug>/static/). Check both.
+    assets_dirs = [dist / "assets"]
+    if (dist / "static" / "assets").exists():
+        assets_dirs.append(dist / "static" / "assets")
+    # The check: in any ONE minified JS file, how many
+    # `.useContext=function` definitions appear? A clean React bundle
+    # has exactly 1 (the hook shim). A two-React bundle has 2+. The
+    # `.useState=function` and `.useEffect=function` patterns work
+    # the same way; we count all four so we don't get fooled by
+    # inlined shims that happen to redefine one of the hooks.
+    SIGS = (
+        ".useContext=function",
+        ".useState=function",
+        ".useEffect=function",
+        ".useReducer=function",
+    )
+    for assets in assets_dirs:
+        if not assets.exists():
+            continue
+        for js in assets.glob("*.js"):
+            try:
+                text = js.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for sig in SIGS:
+                count = text.count(sig)
+                if count > 1:
+                    raise _DistQualityError(
+                        f"{js.name} contains {count} copies of "
+                        f"`{sig}` -- this is the signature of a "
+                        "duplicated React in the bundle (typically "
+                        "caused by `npm install` running from a parent "
+                        "directory, which hoists a second react + "
+                        "react-dom into a parent node_modules). The "
+                        "browser will throw `Cannot read properties "
+                        "of null (reading 'useContext')` and the app "
+                        "will render as a blank page. Fix: `cd` into "
+                        "the project, then `rm -rf node_modules "
+                        "package-lock.json && npm install` so all "
+                        "packages land in the project's own "
+                        "node_modules. Then re-run `npm run "
+                        "verify:render` (the templates ship a smoke "
+                        "test that catches this) and re-deploy.",
+                    )
+
 
 def _do_copy_dist(*, dist, dist_target, slug) -> None:
     """shutil.copytree(staging) + atomic move into dist_target. Same

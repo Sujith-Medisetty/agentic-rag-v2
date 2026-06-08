@@ -422,6 +422,58 @@ def get_ojas_app_rules_section() -> str:
         "build, you've fallen into the single-file-HTML trap — start "
         "over with the Vite scaffold command.",
         "",
+        "**Install discipline (React + Vite) — a green build is not proof.** "
+        "`tsc -b` and `vite build` validate types and bundle modules. They do "
+        "NOT execute the code. Treat a green build as a necessary-but-not-"
+        "sufficient signal. Before declaring a frontend done, ALL of these "
+        "must hold:",
+        "",
+        "  1. **Install from inside the project, always.** Run `npm install` "
+        "from `<project>/frontend` (or `<project>` for a flat static layout). "
+        "NEVER `npm install` from a parent directory — npm will hoist new "
+        "packages into a `node_modules` above your project, and at the next "
+        "`npm install` it can REPLACE your project's `node_modules/react` "
+        "with a duplicate. That duplicate is invisible to Vite's build "
+        "(two bundles are still one bundle), but the browser sees TWO "
+        "Reacts at runtime and throws \"Cannot read properties of null "
+        "(reading 'useContext')\" the first time any component renders. "
+        "If you must use `--prefix`, double-check the install landed where "
+        "you expected with `npm ls react --all` from inside the project.",
+        "  2. **One React, in the project's own `node_modules`.** Run "
+        "`npm ls react --all` from inside the project after every install. "
+        "You should see exactly one version. If you see two, you have a "
+        "hoisted parent `package.json` somewhere up the tree — find it and "
+        "delete it (or move the project out from under it) before building. "
+        "The Ojas session workspace intentionally has no parent "
+        "`package.json`, so this only happens if you or a previous turn "
+        "created one. If `find .. -maxdepth 3 -name package.json` shows "
+        "anything above your project, that's the problem.",
+        "  3. **Render the app for real, not just compile it.** A successful "
+        "`vite build` does NOT mean the app boots at runtime. Write a tiny "
+        "smoke test that imports the root component and calls "
+        "`renderToString` from `react-dom/server` (server-render — no "
+        "browser needed), and check the output is non-trivial HTML "
+        "containing something only the real app would produce. This is the "
+        "ONLY step that catches the two-React hook error above, plus "
+        "missing imports, throw-during-render bugs, and bad module "
+        "resolution. Run it before declaring done: "
+        "`vite-node scripts/verify-render.tsx`.",
+        "  4. **Wire it into the build pipeline so you can't skip it.** Add "
+        "a `prebuild` script that runs the dep check, and a `verify` "
+        "script that chains `verify:deps` → `build` → `verify:render`. "
+        "`npm run verify` is the only command that proves the app works; "
+        "a plain `npm run build` is just types and bundling.",
+        "",
+        "Both Ojas templates ship `scripts/check-deps.mjs` (the dep-tree "
+        "check) and `scripts/verify-render.tsx` (the render smoke test) "
+        "pre-installed. If you scaffold from a template they are already "
+        "wired into `prebuild` and `verify` — just run `npm run verify`. "
+        "If you scaffolded from `npm create vite` directly (or hand-wrote a "
+        "`package.json`), copy the two scripts from another Ojas project "
+        "and add the `prebuild` / `verify` lines to `package.json` "
+        "yourself. Skipping this is what lets a two-React bundle ship to "
+        "the user as a perfectly deployable blank page.",
+        "",
         "## 6. Edit-after-deploy — what happens when the user asks for a change",
         "",
         "This comes up a LOT. The user clicks Deploy, the app is live at "
@@ -715,7 +767,11 @@ def get_frontend_ui_quality_section() -> str:
         "the user the app is ready until both commands succeed. If you "
         "find no `package.json` when you go to build, you've fallen into "
         "the single-file-HTML trap — start over with the Vite scaffold "
-        "command above.",
+        "command above. **A green build is necessary but not sufficient** "
+        "— also run `npm run verify` (or `npm run verify:render`) to catch "
+        "the two-React duplicate-hook error and other runtime crashes that "
+        "the bundler can't see. See the full install-discipline rules in "
+        "the *Doing tasks → Fullstack vs. static* section above.",
         "- **manifest.json** at the public root: `name` (full title), "
         "`short_name` (≤12 chars, the home-screen label), "
         "`display: \"standalone\"` (kills browser chrome on launch), "

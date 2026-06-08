@@ -5,9 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/check-deps.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:deps": "node scripts/check-deps.mjs",
+    "verify:render": "vite-node scripts/verify-render.tsx",
+    "verify": "npm run verify:deps && npm run build && npm run verify:render"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
@@ -38,6 +42,7 @@
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.16",
     "typescript": "^5.6.0",
-    "vite": "^5.4.0"
+    "vite": "^5.4.0",
+    "vite-node": "^5.4.0"
   }
 }
