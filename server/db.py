@@ -234,6 +234,72 @@ def _migrate_deployed_apps(cx: sqlite3.Connection) -> None:
     if "port" not in cols:
         cx.execute("ALTER TABLE deployed_apps ADD COLUMN port INTEGER")
 
+    # One-time FK rebuild. The legacy deployed_apps table was built by
+    # a chain of ALTER TABLEs that added source_session_id, source_project_id,
+    # etc. without the REFERENCES clause (SQLite can't add FKs to an
+    # existing column). The current _SCHEMA in this file DOES declare
+    # source_session_id as REFERENCES sessions(id) ON DELETE CASCADE, but
+    # a fresh CREATE TABLE only runs for new DBs — the live DB kept the
+    # old, FK-less table.
+    #
+    # Result: a DELETE on sessions() didn't cascade to deployed_apps,
+    # leaving orphan rows. We fix it by rebuilding the table with the
+    # FK in place and copying the data over. Idempotent: if a FK on
+    # source_session_id already exists, the rebuild is a no-op.
+    fks = list(cx.execute("PRAGMA foreign_key_list(deployed_apps)"))
+    has_session_fk = any(fk[2] == "sessions" and fk[3] == "source_session_id" for fk in fks)
+    if not has_session_fk:
+        # The deployed_apps rows whose session was already deleted
+        # would VIOLATE the new FK at rebuild time, because they
+        # reference a now-missing sessions.id. Set source_session_id
+        # to NULL for those rows first (NULLs are allowed by REFERENCES
+        # without NOT NULL enforcement). This is the correct semantic
+        # anyway: the app is an orphan, the session is gone, NULL
+        # is the truth.
+        cx.execute(
+            "UPDATE deployed_apps SET source_session_id = NULL "
+            "WHERE source_session_id IS NOT NULL "
+            "AND source_session_id NOT IN (SELECT id FROM sessions)"
+        )
+        # Rebuild the table. We snapshot every column, drop the old
+        # table, recreate it via the current _SCHEMA, and copy the
+        # data back. PRAGMA foreign_keys is ON (set in _connect) so
+        # the new FK is enforced.
+        all_cols = [r["name"] for r in cx.execute("PRAGMA table_info(deployed_apps)")]
+        col_csv = ", ".join(f'"{c}"' for c in all_cols)
+        cx.execute(f"CREATE TABLE _deployed_apps_rebuild AS SELECT {col_csv} FROM deployed_apps")
+        cx.execute("DROP TABLE deployed_apps")
+        # Re-run the full schema CREATE for this table only. We can't
+        # run the whole _SCHEMA here (CREATE TABLE IF NOT EXISTS is
+        # a no-op for the now-missing table but we want to be sure
+        # we land in the current shape).
+        cx.executescript("""
+            CREATE TABLE deployed_apps (
+                slug                 TEXT    PRIMARY KEY,
+                name                 TEXT    NOT NULL,
+                source_session_id    TEXT    REFERENCES sessions(id) ON DELETE CASCADE,
+                source_project_id    TEXT,
+                owner_user_id        TEXT    REFERENCES users(id) ON DELETE SET NULL,
+                project_dir          TEXT,
+                app_dir              TEXT    NOT NULL,
+                deployed_at          INTEGER NOT NULL,
+                last_redeploy_at     INTEGER NOT NULL,
+                state                TEXT    NOT NULL DEFAULT 'running'
+                                         CHECK (state IN ('running','stopped','starting','error')),
+                last_state_at        INTEGER,
+                last_health_at       INTEGER,
+                error_message        TEXT,
+                service_name         TEXT,
+                port                 INTEGER
+            )
+        """)
+        cx.execute(f"INSERT INTO deployed_apps ({col_csv}) SELECT {col_csv} FROM _deployed_apps_rebuild")
+        cx.execute("DROP TABLE _deployed_apps_rebuild")
+        # Re-create the indexes the new table lost in the drop.
+        cx.execute("CREATE INDEX IF NOT EXISTS idx_deployed_apps_owner ON deployed_apps(owner_user_id)")
+        cx.execute("CREATE INDEX IF NOT EXISTS idx_deployed_apps_session ON deployed_apps(source_session_id)")
+        cx.execute("CREATE INDEX IF NOT EXISTS idx_deployed_apps_state ON deployed_apps(state)")
+
 
 def _migrate_projects(cx: sqlite3.Connection) -> None:
     """Add new columns to an EXISTING projects table from earlier releases."""

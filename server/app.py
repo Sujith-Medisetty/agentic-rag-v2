@@ -942,10 +942,18 @@ def _kill_session_processes(session_id: str) -> None:
 def _purge_deployed_apps_for_session(session_id: str) -> None:
     """SIGTERM-nothing, but rmtree every deployed_apps `app_dir` rooted in
     this session AND delete the DB rows so the public subdomain stops
-    resolving. Best-effort. The schema's ON DELETE CASCADE (on new rows
-    only) also handles the row drop; we explicitly delete here so the
-    semantics are identical for legacy rows too."""
+    resolving. Best-effort.
+
+    This is the SYNC delete path (DELETE /api/sessions/{id}). The async
+    delete job (_run_delete_job step 3) does the same work inline; keep
+    the two in sync. The async version also unlinks the per-slug Caddy
+    fragment and reloads Caddy at the end — this version used to skip
+    that, which left Caddy fragments and live subdomains for any session
+    deleted via the legacy sync route. Now mirrors the async behaviour:
+    unlink each fragment, then one Caddy reload at the end.
+    """
     import shutil
+    caddy_changed = False
     try:
         # Inline SQL because db.list_deployed_apps doesn't filter by session.
         with db._connect() as cx:   # noqa: SLF001 -- internal helper, fine here
@@ -966,6 +974,17 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
             # effectively a no-op for them.
             row_full = db.get_deployed_app(slug) or {}
             _remove_app_service_files(slug, row_full)
+            # Unlink the per-slug Caddy fragment so the subdomain stops
+            # resolving. Mirrors the async-delete path; without this
+            # the Caddy block stays live and the URL keeps serving the
+            # now-orphaned /opt/ojas-apps/<slug>/ dir.
+            try:
+                caddy_frag = OJAS_CADDY_ROUTES_DIR / f"{slug}.caddy"
+                if caddy_frag.exists():
+                    caddy_frag.unlink()
+                    caddy_changed = True
+            except OSError:
+                pass
             # The app dir is at /opt/ojas-apps/<slug>/. If the app was
             # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
             # instead -- wipe both.
@@ -977,6 +996,13 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
                         pass
             try:
                 db.delete_deployed_app(slug)
+            except Exception:
+                pass
+        # One Caddy reload for the whole session, regardless of how
+        # many apps we tore down. Matches the async-delete behaviour.
+        if caddy_changed:
+            try:
+                _reload_caddy()
             except Exception:
                 pass
     except Exception:
