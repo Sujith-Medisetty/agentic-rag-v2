@@ -22,7 +22,32 @@ from pathlib import Path
 # truncation logic can pivot on it. Currently unread inside this repo — the
 # constant is kept for and as a forward-compatible anchor.
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
+
+# Hardcoded fallback for the system prompt's "model family" label. The
+# RUNTIME value comes from `current_model_name()` (below) so the system
+# prompt matches the orchestrator's actual model — set via AGENT_MODEL at
+# startup. The fallback is hit only when `agents.nodes` hasn't been imported
+# yet (e.g. unit tests loading the prompt module standalone).
 FRONTIER_MODEL_NAME = "MiniMax-M3"
+
+
+def current_model_name() -> str:
+    """Return the model the orchestrator is currently configured to use.
+
+    Reads `agents.nodes._model` (the global set by `configure_model()` at
+    server boot) so the system prompt's "Model family" line is honest about
+    which model is actually being called. Falls back to `FRONTIER_MODEL_NAME`
+    when the orchestrator module isn't importable yet — keeps unit tests and
+    standalone prompt rendering working without a server boot.
+    """
+    try:
+        from agents import nodes as _nodes
+        m = getattr(_nodes, "_model", None)
+        if m:
+            return str(m)
+    except Exception:
+        pass
+    return FRONTIER_MODEL_NAME
 
 MAX_INSTRUCTION_FILE_CHARS = 4_000
 MAX_TOTAL_INSTRUCTION_CHARS = 12_000
@@ -1492,7 +1517,7 @@ class SystemPromptBuilder:
         self.output_style_prompt: str | None = None
         self.os_name: str | None = None
         self.os_version: str | None = None
-        self.model_family_label: str = FRONTIER_MODEL_NAME
+        self.model_family_label: str = current_model_name()
         self.append_sections: list[str] = []
         self.project_context: ProjectContext | None = None
         self.config_section: str | None = None

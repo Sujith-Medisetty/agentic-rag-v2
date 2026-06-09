@@ -13,7 +13,24 @@ from api.types import TokenUsage
 
 
 # Model pricing per million tokens (USD).
+#
+# Two-tier lookup:
+#   1. Exact key match in MODEL_PRICING (e.g. "claude-opus-4-8")
+#   2. Provider-family prefix match (e.g. "claude-opus-*" → Opus pricing)
+#      — used when a model is current but not yet listed by exact name, so
+#      cost accounting still lands in the right ballpark instead of
+#      silently mispricing as Sonnet-class.
+#   3. If still unknown, _lookup_pricing() logs a warning and returns zeros
+#      (was: silently used Sonnet-class prices, which wildly mispriced
+#      Opus calls as ~5x cheaper than they really are).
 MODEL_PRICING: dict[str, dict] = {
+    # ---- Claude 4.x — current (June 2026) ----
+    "claude-opus-4-8": {
+        "input": 15.00,
+        "output": 75.00,
+        "cache_write": 3.75,
+        "cache_read": 1.50,
+    },
     "claude-opus-4-7": {
         "input": 15.00,
         "output": 75.00,
@@ -25,6 +42,12 @@ MODEL_PRICING: dict[str, dict] = {
         "output": 75.00,
         "cache_write": 3.75,
         "cache_read": 1.50,
+    },
+    "claude-sonnet-4-7": {
+        "input": 3.00,
+        "output": 15.00,
+        "cache_write": 0.75,
+        "cache_read": 0.30,
     },
     "claude-sonnet-4-6": {
         "input": 3.00,
@@ -62,6 +85,63 @@ MODEL_PRICING: dict[str, dict] = {
     "mistral":        {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0},
     "deepseek-coder": {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0},
 }
+
+
+# Provider-family fallback — applied when the exact model name isn't in
+# MODEL_PRICING. Order matters: most specific prefix wins. Used by
+# _lookup_pricing() below. Keep this aligned with the MODEL_PRICING keys.
+_PROVIDER_FAMILY_PRICING: list[tuple[str, dict]] = [
+    # Claude families
+    ("claude-opus-4-8",  {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
+    ("claude-opus-4-7",  {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
+    ("claude-opus-4-6",  {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
+    ("claude-opus-",     {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
+    ("claude-sonnet-",   {"input": 3.00,  "output": 15.00, "cache_write": 0.75, "cache_read": 0.30}),
+    ("claude-haiku-",    {"input": 0.80,  "output": 4.00,  "cache_write": 0.20, "cache_read": 0.08}),
+    # OpenAI families
+    ("gpt-4o-",          {"input": 5.00,  "output": 15.00, "cache_write": 0.00, "cache_read": 2.50}),
+    ("gpt-4-turbo",      {"input": 10.00, "output": 30.00, "cache_write": 0.00, "cache_read": 0.00}),
+    ("gpt-4",            {"input": 10.00, "output": 30.00, "cache_write": 0.00, "cache_read": 0.00}),
+    # Local models — assume free
+    ("llama",            {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
+    ("codellama",        {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
+    ("mistral",          {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
+    ("deepseek",         {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
+    ("qwen",             {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
+]
+
+
+def _lookup_pricing(model: str) -> dict:
+    """Find pricing for `model` — exact match, then provider-family prefix,
+    then a logged-warning zero fallback. The previous behaviour silently
+    used Sonnet-class prices for any unknown model, which dramatically
+    undercounted Opus (~$3/15 vs real $15/75) and similarly mispriced any
+    unfamiliar name. Unknown models now show $0.00 with a one-line warning
+    so the operator notices and adds the entry to MODEL_PRICING."""
+    if not model:
+        return {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+    # 1. Exact match
+    p = MODEL_PRICING.get(model)
+    if p is not None:
+        return p
+    # 2. Provider-family prefix (most specific first)
+    low = model.lower()
+    for prefix, pricing in _PROVIDER_FAMILY_PRICING:
+        if low.startswith(prefix):
+            return pricing
+    # 3. Unknown — log once, then return zeros so the cost doesn't lie.
+    import logging, sys
+    logging.getLogger(__name__).warning(
+        "token_counter: unknown model %r — add an entry to MODEL_PRICING "
+        "(or _PROVIDER_FAMILY_PRICING for a family fallback). Showing $0.00.",
+        model,
+    )
+    print(
+        f"[token_counter] WARNING: unknown model {model!r} — cost shown as $0.00. "
+        f"Add an entry to MODEL_PRICING in memory/token_counter.py.",
+        file=sys.stderr, flush=True,
+    )
+    return {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
 
 
 @dataclass
@@ -116,10 +196,7 @@ class TokenCounter:
 
     def cost(self) -> CostEstimate:
         """Calculate cost in USD for all tokens used so far."""
-        pricing = MODEL_PRICING.get(self.model)
-        if not pricing:
-            # unknown model — estimate using a mid-tier price
-            pricing = {"input": 3.0, "output": 15.0, "cache_write": 0, "cache_read": 0}
+        pricing = _lookup_pricing(self.model)
 
         per_m = 1_000_000  # pricing is per million tokens
 

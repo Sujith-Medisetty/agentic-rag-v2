@@ -34,7 +34,7 @@ from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import ToolNode
 
 from agents.state import RunnerState
-from agents.prompt import SystemPromptBuilder, ProjectContext, FRONTIER_MODEL_NAME
+from agents.prompt import SystemPromptBuilder, ProjectContext, current_model_name
 from memory.checkpointer import (
     maybe_compact,
     _estimate_tokens as _estimate_msg_tokens,
@@ -62,12 +62,18 @@ def configure_model(
 ) -> None:
     """Called once at startup so the loop uses the configured provider/model +
     thinking settings. (Iteration/token/time limits are the per-invocation run
-    budget — see reset_run_budget.)"""
-    global _provider, _model, _thinking, _thinking_budget
+    budget — see reset_run_budget.)
+
+    Also drops the cached TokenCounter so the next get_token_counter() call
+    rebuilds it against the NEW model. Without this, a model change in the
+    same process would silently misprice every turn (the cached counter
+    still prices under the old model name)."""
+    global _provider, _model, _thinking, _thinking_budget, _token_counter
     _provider = (provider or "anthropic").lower()
     _model = model
     _thinking = thinking
     _thinking_budget = thinking_budget
+    _token_counter = None  # force rebuild on next get_token_counter() call
 
 
 def configure_tools(extra_tools: list | None = None) -> None:
@@ -377,7 +383,7 @@ def _build_system_prompt(state: RunnerState) -> tuple[str, str]:
     builder = (
         SystemPromptBuilder()
         .with_os(platform.system() or "unknown", platform.release() or "unknown")
-        .with_model_family(FRONTIER_MODEL_NAME)
+        .with_model_family(current_model_name())
         .with_project_context(ctx)
         # Top-level loop is the sole orchestrator — sub-agents (multi_agent.py)
         # deliberately do NOT enable this; they cannot spawn further agents.

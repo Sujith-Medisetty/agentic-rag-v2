@@ -226,13 +226,13 @@ def _build_subagent_system_prompt(subagent_type: str, model: str) -> str:
     """Mirror build_agent_system_prompt: base system prompt + sub-agent note."""
     from datetime import date
     import platform
-    from agents.prompt import SystemPromptBuilder, ProjectContext, FRONTIER_MODEL_NAME
+    from agents.prompt import SystemPromptBuilder, ProjectContext, current_model_name
 
     ctx = ProjectContext.discover_with_git(os.getcwd(), date.today().isoformat())
     builder = (
         SystemPromptBuilder()
         .with_os(platform.system() or "unknown", platform.release() or "unknown")
-        .with_model_family(FRONTIER_MODEL_NAME)
+        .with_model_family(current_model_name())
         .with_project_context(ctx)
         .append_section(
             f"You are a background sub-agent of type `{subagent_type}`. Work only on "
