@@ -481,6 +481,51 @@ def _looks_like_default_name(name: str) -> bool:
     return ("," in rest) or ("/" in rest) or bool(_re.search(r"\d", rest))
 
 
+_STOPWORDS = frozenset({
+    # Articles, conjunctions, prepositions, pronouns, common verbs
+    "a","an","and","are","as","at","be","by","for","from","has","have","he",
+    "her","his","i","if","in","into","is","it","its","my","of","on","or",
+    "our","she","that","the","their","them","they","this","to","was","we",
+    "were","what","when","where","which","who","why","will","with","you","your",
+    "yours","yourself",
+    # Common request-introducer phrases
+    "can","could","do","does","give","just","let","make","me","please","some",
+    "thing","things","like","want","need","help",
+    # Punctuation / filler
+    "say","said","get","got","also","really","actually",
+})
+
+
+def _heuristic_title(first_user_prompt: str) -> str:
+    """Crude fallback for when the LLM title-suggestion call flakes
+    (timeout, model quirk, blocked response). Picks the first few
+    meaningful content words from the user's first prompt and
+    title-cases them. Always returns a non-empty string, even for
+    absolute garbage input. Best-effort: a worse title than the LLM
+    but never an empty failure.
+    """
+    text = (first_user_prompt or "").strip()
+    if not text:
+        return "New Chat"
+    # Tokenize on non-alphanumeric chars, lowercase, drop stopwords
+    # and very short tokens.
+    tokens = [
+        t for t in _re.split(r"[^a-z0-9]+", text.lower())
+        if t and len(t) >= 3 and t not in _STOPWORDS
+    ]
+    if not tokens:
+        return "New Chat"
+    # Take the first 4-5 meaningful tokens. Cap at 5 to keep URLs
+    # and headers tidy.
+    title_tokens = tokens[:5]
+    # Title-case (preserve digits).
+    title = " ".join(t.capitalize() for t in title_tokens)
+    # Cap at 40 chars; truncate on a word boundary.
+    if len(title) > 40:
+        title = title[:40].rsplit(" ", 1)[0] or title[:40]
+    return title or "New Chat"
+
+
 async def _maybe_auto_rename(session_id: str) -> None:
     """If the session is still on a default name, ask the LLM for a
     descriptive title and rename. Idempotent: runs at most once per
@@ -494,7 +539,10 @@ async def _maybe_auto_rename(session_id: str) -> None:
     the user's intent is preserved."""
     if session_id in _AUTO_RENAME_HISTORY:
         return
-    _AUTO_RENAME_HISTORY.add(session_id)
+    # NOTE: we add to _AUTO_RENAME_HISTORY only AFTER a successful
+    # rename. Otherwise a flaky LLM (empty title, timeout, transient
+    # provider error) would poison the cache and prevent retries on
+    # subsequent turns.
     try:
         sess = db.get_session(session_id)
         if sess is None:
@@ -534,8 +582,14 @@ async def _maybe_auto_rename(session_id: str) -> None:
         )
         title = await _call_llm_for_title(suggest_prompt)
         if not title:
-            print(f"[auto-rename] {session_id[:8]}: LLM returned empty title", flush=True)
-            return
+            # LLM returned empty (timeout, model quirks, or stripped
+            # of its think-block). Fall back to a fast heuristic
+            # derived from the first user prompt so the session
+            # gets a meaningful name even when the LLM flakes.
+            # The heuristic is a "lowest common denominator" title
+            # — worse than the LLM but always produces something.
+            print(f"[auto-rename] {session_id[:8]}: LLM returned empty title, using heuristic fallback", flush=True)
+            title = _heuristic_title(prompt_user)
         # Sanitize: strip quotes, collapse whitespace, cap length.
         title = title.strip().strip('"').strip("'").strip("`")
         title = _re.sub(r"\s+", " ", title).strip()
@@ -570,6 +624,10 @@ async def _maybe_auto_rename(session_id: str) -> None:
                 )
             except Exception:
                 pass
+            # Only mark this session as done AFTER a successful
+            # rename (and WS event) — a flake should be retryable
+            # on the next turn, not silently cached as "done".
+            _AUTO_RENAME_HISTORY.add(session_id)
             print(f"[auto-rename] {session_id[:8]}: '{current_name}' → '{final}' (suffixed={was_suffixed})", flush=True)
         except Exception as e:
             print(f"[auto-rename] {session_id[:8]}: rename failed: {e}", flush=True)

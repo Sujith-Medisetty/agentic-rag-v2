@@ -2927,13 +2927,37 @@ function DeployModal({
           <span className="text-tx-xs font-medium text-muted">Slug</span>
           <input
             type="text" value={slug}
-            onChange={(e) => { setSlug(slugifyName(e.target.value)); setSlugError(null); }}
+            // Don't auto-slugify on every keystroke -- the user might
+            // be typing "My Cool App" and we shouldn't mangle the
+            // input mid-type (cursor jumps, "hyphens disappear"
+            // because spaces are silently converted to dashes).
+            // We only normalize: lowercase + drop leading/trailing
+            // whitespace, so the user sees exactly what they typed
+            // + the URL preview updates live with their input.
+            // Full slug sanitization (replacing non-allowed chars,
+            // collapsing multiple hyphens) happens on submit via
+            // the server's _slugify, AND we show a hint below the
+            // input explaining what the final slug will look like.
+            onChange={(e) => {
+              const v = e.target.value.toLowerCase();
+              setSlug(v);
+              setSlugError(null);
+            }}
+            onBlur={(e) => {
+              // On blur, normalize further: collapse whitespace +
+              // run the full slugify so the user sees the final form
+              // before they hit Deploy.
+              setSlug(slugifyName(e.target.value));
+            }}
             aria-invalid={!!slugError}
             className={`field mt-1 font-mono ${slugError ? "border-danger/60" : ""}`}
             placeholder="weather-app" required autoFocus
           />
           <span className="mt-1 block text-tx-xs text-subtle">
-            URL: <span className="font-mono">https://{slug || "<slug>"}.{hostApps()}/</span>
+            URL: <span className="font-mono">https://{slugifyName(slug) || "<slug>"}.{hostApps()}/</span>
+            <span className="ml-2 text-muted">
+              · only <span className="font-mono">a-z 0-9 - _</span> allowed, auto-normalized on submit
+            </span>
           </span>
           {slugError && (
             <span className="mt-1 block text-tx-xs text-danger" role="alert">
@@ -3024,9 +3048,15 @@ function DeployModal({
 function slugifyName(input: string): string {
   return input
     .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 40);
+    // DNS label max is 63 chars per RFC 1035. Caddy's wildcard
+    // block rewrites `<slug>.<root>` and the root itself is
+    // already ~20 chars, so 40 leaves ~3 chars of headroom on
+    // the longest root domains. 60 is the safe ceiling; we
+    // round to 60 to leave 3 chars for the root and the
+    // trailing dot/slash.
+    .slice(0, 60);
 }
 
 function UploadIcon() {
