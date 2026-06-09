@@ -35,17 +35,59 @@ const issues = [];
 // hooks from (e.g. react-router) so a duplicate also fails here.
 const CRITICAL = ["react", "react-dom"];
 
-// 1. No `package.json` in any ancestor. npm will hoist into the
-//    nearest one and silently break the project below it.
+// 1. No `package.json` in any ancestor that npm will actually
+//    resolve against. npm will hoist into the nearest one and
+//    silently break the project below it.
+//
+//    EXCEPTION: a "stub" package.json that exists only as a single
+//    dependency declaration (no `scripts`, no `main`, no `workspaces`,
+//    no actual `node_modules/` with content) is inert for npm
+//    purposes. The Ojas backend root has one of these (it declares
+//    stockfish.wasm for the agent's chess tool and nothing else).
+//    We treat it as a no-op so the frontend project can build even
+//    when the backend root is checked out alongside it.
 let dir = path.dirname(projectRoot);
 for (let i = 0; i < 6; i++) {
-  if (fs.existsSync(path.join(dir, "package.json"))) {
-    issues.push(
-      `package.json found at ${path.join(dir, "package.json")} -- ` +
-        `npm will hoist new installs there and break this project. ` +
-        `Move or delete it.`,
-    );
-    break;
+  const pjPath = path.join(dir, "package.json");
+  if (fs.existsSync(pjPath)) {
+    let inert = true; // default to "skip" — the common case is a stub
+    try {
+      const meta = JSON.parse(fs.readFileSync(pjPath, "utf-8"));
+      // Any of these means the file is a real Node project, not a stub.
+      const looksLikeAProject =
+        meta.scripts !== undefined ||
+        meta.main !== undefined ||
+        meta.workspaces !== undefined ||
+        meta.type === "module" ||
+        meta.bin !== undefined;
+      if (looksLikeAProject) inert = false;
+      // Also flag if there's a real node_modules/ next to it with
+      // actual installable content (more than just leftover dirs).
+      const nmPath = path.join(dir, "node_modules");
+      if (fs.existsSync(nmPath)) {
+        try {
+          const entries = fs.readdirSync(nmPath);
+          // Any real install leaves more than just .package-lock.json
+          // or scoped namespace dirs. Even a single non-dotfile entry
+          // means the directory is a real install target.
+          if (entries.some((e) => !e.startsWith("."))) inert = false;
+        } catch {
+          // unreadable — treat as real to be safe
+          inert = false;
+        }
+      }
+    } catch {
+      // unparseable — treat as a real ancestor and flag it
+      inert = false;
+    }
+    if (!inert) {
+      issues.push(
+        `package.json found at ${pjPath} -- ` +
+          `npm will hoist new installs there and break this project. ` +
+          `Move or delete it.`,
+      );
+      break;
+    }
   }
   const parent = path.dirname(dir);
   if (parent === dir) break;
