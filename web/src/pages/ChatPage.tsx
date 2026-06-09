@@ -689,6 +689,49 @@ export default function ChatPage() {
         if (sessionId) sessionApi.git(sessionId).then(setGit).catch(() => {});
         return;
       }
+      // --- Deploy lifecycle (in-place update OR new deploy) ---
+      // The backend publishes deploy_complete / deploy_failed with the
+      // canonical DeployedApp row in payload.result.app. Refresh the
+      // pill list + the fresh_build flag so the UI re-renders without
+      // a page reload. Without this handler, the deploy pill shows the
+      // pre-deploy state until the user manually refreshes.
+      case "deploy_complete": {
+        if (sessionId) {
+          // Re-fetch both: deployedApps (so the pill shows the new
+          // public_url / last_redeploy_at / state) and detectedDist
+          // (so the fresh_build flag flips back to false and the
+          // "🔄 Update" button becomes "✓ Up to date").
+          sessionApi.deployedApps(sessionId).then(setDeployedApps).catch(() => {});
+          sessionApi.detectedDist(sessionId).then(setLastDetected).catch(() => {});
+        }
+        // Toast so the user knows it landed. payload.result.app.slug
+        // is the canonical fresh row.
+        const okApp = (p?.result?.app ?? {}) as Partial<DeployedApp>;
+        if (okApp.slug) {
+          sessions.setToast?.({
+            message: `Deployed ${okApp.slug} — live at ${okApp.public_url || "(see pill)"}`,
+          });
+        }
+        return;
+      }
+      case "deploy_failed": {
+        if (sessionId) {
+          // Refresh anyway: a failed in-place update may have left the
+          // row in state="error" that's worth surfacing in the pill.
+          sessionApi.deployedApps(sessionId).then(setDeployedApps).catch(() => {});
+        }
+        sessions.setToast?.({
+          message: `Deploy failed: ${String(p?.error ?? "unknown")}`,
+        });
+        return;
+      }
+      case "deploy_progress": {
+        // Live in-flight step progress is shown by the modal's poll;
+        // we don't update the pill for these (would flicker). The case
+        // exists so the event isn't silently dropped if we add live
+        // progress to the pill later.
+        return;
+      }
     }
   }
 
@@ -2331,24 +2374,30 @@ function DeployedAppPill({
   // new systemd unit, no new URL). The deploy modal would also work
   // but is overkill for a re-deploy -- it asks for a slug, project,
   // and 12-step progress that the user has already seen once.
+  //
+  // We DON'T await the job here (it can take 10-30s for a fullstack).
+  // Instead, the WS event handler in ChatPage listens for
+  // deploy_complete / deploy_failed and refreshes deployedApps +
+  // detectedDist. The local `busy` flips the pill to a "Deploying…"
+  // chip so the user sees the click took effect; the WS event then
+  // replaces the pill with the fresh row (which has the new
+  // last_redeploy_at) and clears busy via the natural re-render.
   const update = async () => {
     if (busy) return;
     setBusy(true);
     try {
-      // Kick off the deploy with the existing slug. The 202 returns
-      // a job_id; the optimistic placeholder is spliced in by the
-      // caller (ChatPage) which polls the job and replaces this
-      // pill's row when the job succeeds. We don't await the
-      // completion here because it can take 10-30s for a fullstack
-      // -- the user gets live step progress via the existing
-      // polling flow.
       await sessionApi.deploy(app.source_session_id ?? "", {
         slug: app.slug,
         project_dir: app.project_dir ?? undefined,
       });
+      // Don't setBusy(false) here — leave the pill in the "Deploying…"
+      // state until the deploy_complete / deploy_failed WS event
+      // arrives and re-fetches the row. Fall back after 60s in case
+      // the WS is wedged so the user isn't stuck on "Deploying…"
+      // forever.
+      setTimeout(() => setBusy(false), 60_000);
     } catch (e: any) {
       alert(`Update failed: ${e?.message ?? "unknown"}`);
-    } finally {
       setBusy(false);
     }
   };
@@ -2385,22 +2434,44 @@ function DeployedAppPill({
         href={url} target="_blank" rel="noreferrer"
         className="hover:text-accent" title={url}
       >↗</a>
-      {/* Update / Up-to-date indicator. Driven by the session-wide
-          fresh_build flag, not per-app: if the agent rebuilt any
-          sub-app in this session, the user is probably about to
-          want to push it everywhere. We could compute this per-app
-          (compare dist mtime to this app's last_redeploy_at) but
-          that adds a server round-trip per pill; the session-level
+      {/* Last-deployed timestamp — the visible signal that a re-deploy
+          actually landed. Without this, an in-place update looks
+          identical to a no-op (same slug, same URL). The WS
+          deploy_complete handler refreshes the row with the new
+          last_redeploy_at, so this chip updates without a page reload. */}
+      {app.last_redeploy_at > 0 && !busy && (
+        <span
+          className="text-tx-xs text-muted"
+          title={new Date(app.last_redeploy_at * 1000).toISOString()}
+        >
+          · {timeAgoShort(app.last_redeploy_at)}
+        </span>
+      )}
+      {/* Update / Up-to-date / Deploying indicator. Driven by the
+          session-wide fresh_build flag, not per-app: if the agent
+          rebuilt any sub-app in this session, the user is probably
+          about to want to push it everywhere. We could compute this
+          per-app (compare dist mtime to this app's last_redeploy_at)
+          but that adds a server round-trip per pill; the session-level
           flag is correct in 99% of cases (the agent rebuilds the
-          whole workspace) and the user can always click "Deploy
-          new" for a sibling project. */}
-      {freshBuild ? (
+          whole workspace) and the user can always click "Deploy new"
+          for a sibling project. The "Deploying…" state shows while
+          busy=true (set when the user clicks Update; cleared when the
+          deploy_complete WS event re-fetches the row). */}
+      {busy ? (
+        <span
+          className="inline-flex items-center gap-1 rounded border border-accent/40 bg-accent/15 px-1.5 py-0.5 font-medium text-accent"
+          title="Deploy in progress…"
+        >
+          <span className="inline-block size-1.5 animate-pulse rounded-full bg-accent" />
+          Deploying…
+        </span>
+      ) : freshBuild ? (
         <button
           type="button"
           onClick={update}
-          disabled={busy}
           title={`Push the new build to ${app.slug} (same URL, no new port)`}
-          className="inline-flex items-center gap-1 rounded border border-accent/40 bg-accent/15 px-1.5 py-0.5 font-medium text-accent hover:bg-accent/25 disabled:opacity-50"
+          className="inline-flex items-center gap-1 rounded border border-accent/40 bg-accent/15 px-1.5 py-0.5 font-medium text-accent hover:bg-accent/25"
         >
           🔄 Update
         </button>
