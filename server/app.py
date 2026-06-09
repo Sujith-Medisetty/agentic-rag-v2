@@ -2273,42 +2273,50 @@ async def stream(websocket: WebSocket, session_id: str):
     bus.subscribe(websocket)
     # Emit an initial context_update so the header chip + bottom bar show
     # immediately on connect (not just on the first LLM call of the next
-    # turn). The estimate is computed from the persisted chat history in
-    # the session DB; for a fresh session with no messages, used_tokens
-    # stays 0 and the chip will only appear once the first turn produces
-    # data.
+    # turn). The estimate is computed from the LATEST LangGraph checkpoint's
+    # `messages` channel — that's where the actual conversation history
+    # lives (the server.db stores only session metadata, not chat content).
     try:
         from memory.checkpointer import (
             _estimate_tokens, CONTEXT_WINDOW_TOKENS,
         )
-        from server import db as _db
-        msgs = _db.list_messages(session_id)
-        # Reconstruct a list-of-contents shape that _estimate_tokens
-        # understands (list of strings, or list of {"content": str}).
-        # The session DB only stores role + content, so a char//4 estimate
-        # over the joined content is a good-enough proxy for the LLM
-        # input size.
-        from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-        reconstructed: list = []
-        for m in msgs:
-            content = m.get("content") or ""
-            role = m.get("role") or "human"
-            if role in ("human", "user"):
-                reconstructed.append(HumanMessage(content=content))
-            elif role in ("ai", "assistant"):
-                reconstructed.append(AIMessage(content=content))
-            else:
-                reconstructed.append(ToolMessage(content=content, name=role, tool_call_id=""))
-        if reconstructed:
-            used = _estimate_tokens(reconstructed)
-            warn = int(CONTEXT_WINDOW_TOKENS * 0.25)
-            bus.publish("context_update", {
-                "used_tokens":  used,
-                "budget_tokens": CONTEXT_WINDOW_TOKENS,
-                "percent": round(used / CONTEXT_WINDOW_TOKENS * 100, 1) if CONTEXT_WINDOW_TOKENS else 0,
-                "warning":  used >= warn,
-                "compacting": False,
-            })
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        from pathlib import Path as _P
+        import sqlite3 as _sq
+        ckpt_db = _P.home() / ".agent" / "checkpoints.db"
+        if ckpt_db.exists():
+            # `thread_id` in checkpoints.db == `session_id` in our app —
+            # the langgraph thread is the conversation's stable id.
+            _cx = _sq.connect(str(ckpt_db))
+            _cx.row_factory = _sq.Row
+            try:
+                row = _cx.execute(
+                    "SELECT checkpoint FROM checkpoints "
+                    "WHERE thread_id = ? "
+                    "ORDER BY checkpoint_id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            finally:
+                _cx.close()
+            if row and row["checkpoint"]:
+                try:
+                    ckp = JsonPlusSerializer().loads_typed(
+                        ("msgpack", row["checkpoint"])
+                    )
+                except Exception:
+                    ckp = None
+                if isinstance(ckp, dict):
+                    msgs = ckp.get("channel_values", {}).get("messages", [])
+                    if isinstance(msgs, list) and msgs:
+                        used = _estimate_tokens(msgs)
+                        warn = int(CONTEXT_WINDOW_TOKENS * 0.25)
+                        bus.publish("context_update", {
+                            "used_tokens":  used,
+                            "budget_tokens": CONTEXT_WINDOW_TOKENS,
+                            "percent": round(used / CONTEXT_WINDOW_TOKENS * 100, 1) if CONTEXT_WINDOW_TOKENS else 0,
+                            "warning":  used >= warn,
+                            "compacting": False,
+                        })
     except Exception:
         # Don't let an initial-context hiccup break the WS upgrade
         pass
