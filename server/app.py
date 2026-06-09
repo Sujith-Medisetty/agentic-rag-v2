@@ -242,6 +242,36 @@ def _register_ojas_services() -> None:
     them. Called once on backend boot. Port-only rows for deployed apps
     are also created/refreshed here so the panel always reflects the
     truth on disk under /opt/ojas-apps/."""
+    # 0) Reap ghost rows FIRST so the rest of registration starts
+    #    from a clean table. A ghost is an `ojas_services` row with
+    #    source='ojas-deployed' whose slug isn't in `deployed_apps`
+    #    anymore -- usually because a session delete cleaned the
+    #    deployed_apps row but missed the ojas_services row, or
+    #    because of a half-finished delete from a prior boot. The
+    #    settings + admin panels both render this table directly,
+    #    so a ghost row shows a deleted app as still alive. The
+    #    deployment-time + per-app-delete + session-delete paths
+    #    ALSO drop the row, but this boot-time sweep is the safety
+    #    net for any future drift.
+    try:
+        with db._connect() as cx:   # noqa: SLF001
+            live_slugs = {
+                r[0] for r in cx.execute("SELECT slug FROM deployed_apps")
+            }
+            ghost_ids = [
+                r[0] for r in cx.execute(
+                    "SELECT id FROM ojas_services "
+                    "WHERE source = 'ojas-deployed'"
+                )
+                if r[0].split(":", 1)[1] not in live_slugs
+            ]
+            for gid in ghost_ids:
+                cx.execute("DELETE FROM ojas_services WHERE id = ?", (gid,))
+            if ghost_ids:
+                print(f"[ojas-boot] reaped {len(ghost_ids)} ghost ojas_services rows: {ghost_ids}")
+    except Exception as e:
+        print(f"[ojas-boot] ojas_services reconcile failed (non-fatal): {e}")
+
     # 1) Drop any stale PID rows from a previous boot. Deployed-app port
     #    rows (pid IS NULL) are kept -- they're tied to on-disk files, not
     #    a process. We'll re-add the still-running ones below.
@@ -1052,17 +1082,32 @@ def projects_delete(project_id: str, user: dict = Depends(require_user)):
     """Delete a project AND every cascade target. The workspace files on
     disk under <workspace>/<each session's subdir>/ ARE removed (since
     those were generated for that project). The root workspace path itself
-    is untouched if it was a folder you had before Ojas."""
+    is untouched if it was a folder you had before Ojas.
+
+    Order matters: cancel agent tasks + run the per-session filesystem /
+    DB cleanup BEFORE the cascade delete. That way each session's
+    deployed_apps rows + ojas_services rows + caddy fragments are
+    removed under the FK still being valid, and a half-finished
+    cleanup leaves the project in a recoverable state instead of
+    dangling ghost rows."""
     _project_or_404(project_id, user)
     sessions = db.list_sessions(project_id)
+    # 1. Cancel any in-flight turn task for these sessions.
     for s in sessions:
         task = _active_turns.get(s["id"])
         if task is not None and not task.done():
             task.cancel()
-    if not db.delete_project(project_id):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
+    # 2. Filesystem + DB cleanup for each session. This drops
+    #    deployed_apps rows, ojas_services rows, caddy fragments, and
+    #    on-disk dirs -- while the parent session row is still alive
+    #    so the FK on source_session_id is happy. _purge_session_everything
+    #    does NOT delete the session row itself; the cascade below does.
     for s in sessions:
         _purge_session_everything(s)
+    # 3. Project row → cascades to sessions (rows gone after this),
+    #    leaves deployed_apps rows already-cleaned (step 2).
+    if not db.delete_project(project_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "project not found")
     return {"ok": True}
 
 @app.delete("/api/sessions/{session_id}")
