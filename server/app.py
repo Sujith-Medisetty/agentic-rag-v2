@@ -998,6 +998,16 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
                 db.delete_deployed_app(slug)
             except Exception:
                 pass
+            # Drop the matching ojas_services row too — the Admin
+            # panel's "services & ports" view reads from this table,
+            # so a stale row here shows a deleted app as still
+            # "running". The per-app DELETE handler does this; the
+            # session-delete path used to skip it, leaving ghost
+            # rows in the admin panel until manual cleanup.
+            try:
+                db.delete_ojas_service(f"deployed:{slug}")
+            except Exception:
+                pass
         # One Caddy reload for the whole session, regardless of how
         # many apps we tore down. Matches the async-delete behaviour.
         if caddy_changed:
@@ -1978,6 +1988,18 @@ async def _run_delete_job(
                         for d in (row["app_dir"], str(OJAS_APPS_STOPPED_DIR / slug)):
                             if d and Path(d).exists():
                                 shutil.rmtree(d, ignore_errors=True)
+                        # 4. Drop the matching ojas_services row. The
+                        #    Admin panel's services & ports view reads
+                        #    from this table; a stale row here shows
+                        #    the deleted app as still "running" even
+                        #    though the deployed_apps row, caddy fragment,
+                        #    dir, and systemd unit are all gone. The
+                        #    per-app DELETE handler also calls this —
+                        #    keep both paths in sync.
+                        try:
+                            db.delete_ojas_service(f"deployed:{slug}")
+                        except Exception:
+                            pass
                         teardown_msgs.append(f"torn down {slug}")
                     except Exception as e:
                         teardown_msgs.append(f"{slug}: {e}")
