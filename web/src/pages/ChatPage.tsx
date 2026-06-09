@@ -1164,15 +1164,8 @@ export default function ChatPage() {
           running (and there's chat above to anchor it). */}
       {!isEmpty && <ChatStatusBar currentTurn={currentTurn} />}
 
-      {/* Context-used progress bar — Claude Code-style "75% used" indicator
-          pinned just above the compose input. Only renders once the server
-          has sent at least one context_update event for this session. */}
-      <ContextBar
-        used={contextUsed}
-        budget={contextBudget}
-        warning={contextWarning}
-        compacting={contextCompacting}
-      />
+      {/* Context-fill indicator now lives in the header chip (see ContextChip
+          in the right zone). No bottom progress bar — the chip is enough. */}
 
       {/* Input — pinned bottom, safe-area aware. While a turn is in flight the
           Send button morphs into Stop so cancelling is a single click.
@@ -1577,78 +1570,17 @@ function rebuildTranscript(events: LiveEvent[]): {
 }
 
 // ============================================================================
-// ContextBar — Claude Code-style "context used %" indicator.
-//
-// Renders a thin bar above the chat input that fills as the session grows.
-// Colour thresholds:
-//   < 25%  → subtle (low usage)
-//   25-60% → accent (warn — agent is past the warn tier)
-//   60-90% → warn (orange, compaction imminent)
-//   90%+   → danger (red, compaction likely firing)
-// When `compacting`, the bar is replaced with a "Compacting…" pill + spinner.
+// ContextChip — compact "X% context" pill in the chat header (right zone).
+// Always visible (when we have a value) so the user can see the fill state
+// at any moment — fresh session, mid-turn, idle between turns. The dot color
+// gives the fill state at a glance:
+//   < 60%       → calm (low usage, room left)
+//   60-89%      → warn (orange, getting full, compaction may fire soon)
+//   90%+        → danger (red, almost out)
+//   compacting  → pulsing accent dot, label reads "Compacting…"
 //
 // Hidden until the server has sent at least one context_update event for the
-// session (so the bar doesn't pop in for a fresh empty chat).
-// ============================================================================
-
-function ContextBar({
-  used, budget, warning, compacting,
-}: { used: number; budget: number; warning: boolean; compacting: boolean }) {
-  if (!used || !budget) return null;
-  const pct = Math.max(0, Math.min(100, Math.round((used / budget) * 100)));
-  // Colour tiers — same thresholds Claude Code uses
-  let fillCls = "bg-accent/40";          // < 25% — calm
-  if (pct >= 90)      fillCls = "bg-danger/70";
-  else if (pct >= 60) fillCls = "bg-warn/70";
-  else if (pct >= 25) fillCls = "bg-accent/60";
-
-  if (compacting) {
-    return (
-      <div className="bg-bg">
-        <div className="mx-auto max-w-4xl px-4 pb-2">
-          <div className="flex items-center gap-2 rounded-md border border-accent/30 bg-accent/10 px-3 py-1.5 font-sans text-[11px] text-accent">
-            <span className="stream-dot" />
-            <span className="font-semibold uppercase tracking-[0.14em]">
-              Compacting context…
-            </span>
-            <span className="text-subtle">
-              · summarising older turns to keep the session running smoothly
-            </span>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
-  return (
-    <div
-      className="bg-bg"
-      title={`${fmt(used)} of ${fmt(budget)} tokens used (${pct}%)`}
-    >
-      <div className="mx-auto max-w-4xl px-4 pb-2">
-        <div className="flex items-center gap-2 font-sans text-tx-xs text-subtle">
-          <span className="font-semibold uppercase tracking-[0.14em]">Context</span>
-          <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-border/60">
-            <div
-              className={`h-full transition-[width] duration-300 ${fillCls}`}
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-          <span className={`font-mono ${warning ? "text-warn" : ""}`}>
-            {pct}%{warning ? " · getting full" : ""}
-          </span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// ContextChip — compact "X% context" pill for the chat header. Always visible
-// (when we have a value) so the user can see the fill state at any moment,
-// not only during a turn. Click for a one-line breakdown; the full bar lives
-// in ContextBar above the compose input.
+// session (so the chip doesn't pop in for a fresh empty chat).
 // ============================================================================
 
 function ContextChip({
@@ -1658,22 +1590,26 @@ function ContextChip({
   const pct = budget > 0 ? Math.max(0, Math.min(100, Math.round((used / budget) * 100))) : 0;
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
-  let dotCls = "bg-accent/70";
+  // Tiers: < 60% calm (subtle accent dot), 60-69% accent (getting fuller),
+  // 70-89% warn/orange (getting full), 90%+ danger/red (almost out).
+  let dotCls = "bg-accent/40";
   let textCls = "text-text";
   let borderCls = "border-border/60 bg-elevated/60";
   if (compacting) {
     dotCls = "bg-accent animate-pulse-soft";
+    textCls = "text-accent";
     borderCls = "border-accent/40 bg-accent/[0.06]";
   } else if (pct >= 90) {
     dotCls = "bg-danger/80";
     textCls = "text-danger";
     borderCls = "border-danger/40 bg-danger/[0.06]";
-  } else if (pct >= 60) {
+  } else if (pct >= 70) {
     dotCls = "bg-warn/80";
     textCls = "text-warn";
     borderCls = "border-warn/40 bg-warn/[0.05]";
-  } else if (pct >= 25) {
+  } else if (pct >= 60) {
     dotCls = "bg-accent/80";
+    textCls = "text-accent";
   }
 
   const label = compacting
