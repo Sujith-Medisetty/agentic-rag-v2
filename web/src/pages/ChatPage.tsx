@@ -102,6 +102,18 @@ export default function ChatPage() {
   // /api/sessions/<id>/deployed-apps, refreshed when the user deploys a
   // new sub-app via the Deploy button or deletes one from the strip.
   const [deployedApps, setDeployedApps] = useState<DeployedApp[]>([]);
+  // Live deploy progress per slug. Keyed by slug; set by the
+  // deploy_progress WS event so the matching pill can show a
+  // "Step 3/12 — Building…" chip instead of just "Deploying…".
+  // Cleared by deploy_complete / deploy_failed.
+  const [deployProgress, setDeployProgress] = useState<Record<string, {
+    phase: string; steps_done: number; steps_total: number;
+  }>>({});
+  // The slug the user just clicked Update on for THIS session.
+  // deploy_progress events don't carry a slug (the backend runs
+  // one deploy at a time per session), so we attribute progress
+  // events to this ref. Cleared when the session changes.
+  const lastClickedUpdateSlugRef = useRef<string | null>(null);
   // "Build ready" detection — set when the session has a built dist
   // newer than the most recent deploy FROM this session. The chat
   // shows a banner under the agent's last turn when true, and the
@@ -164,6 +176,11 @@ export default function ChatPage() {
   // ---- Initial reconstruction from history + events ---------------------
   useEffect(() => {
     if (!sessionId) return;
+    // Ref the pill setTimeout writes so deploy_progress events
+    // (which don't carry a slug) can be attributed to the slug the
+    // user just clicked Update on. Resets when the session changes.
+    lastClickedUpdateSlugRef.current = null;
+    setDeployProgress({});
     // HARD RESET all per-session state synchronously BEFORE any async load.
     // Without this, switching from session A to session B mid-turn left A's
     // currentTurn (with isStreaming=true) in state — the Stop button kept
@@ -704,9 +721,17 @@ export default function ChatPage() {
           sessionApi.deployedApps(sessionId).then(setDeployedApps).catch(() => {});
           sessionApi.detectedDist(sessionId).then(setLastDetected).catch(() => {});
         }
+        // Clear the per-slug progress chip — the deploy is done.
+        const okApp = (p?.result?.app ?? {}) as Partial<DeployedApp>;
+        if (okApp.slug) {
+          setDeployProgress((prev) => {
+            const { [okApp.slug!]: _gone, ...rest } = prev;
+            return rest;
+          });
+          lastClickedUpdateSlugRef.current = null;
+        }
         // Toast so the user knows it landed. payload.result.app.slug
         // is the canonical fresh row.
-        const okApp = (p?.result?.app ?? {}) as Partial<DeployedApp>;
         if (okApp.slug) {
           sessions.setToast?.({
             message: `Deployed ${okApp.slug} — live at ${okApp.public_url || "(see pill)"}`,
@@ -720,16 +745,51 @@ export default function ChatPage() {
           // row in state="error" that's worth surfacing in the pill.
           sessionApi.deployedApps(sessionId).then(setDeployedApps).catch(() => {});
         }
+        // Clear the in-flight progress chip and reset the slug ref.
+        const failSlug = String(p?.result?.app?.slug ?? p?.slug ?? "");
+        if (failSlug) {
+          setDeployProgress((prev) => {
+            const { [failSlug]: _gone, ...rest } = prev;
+            return rest;
+          });
+        }
+        lastClickedUpdateSlugRef.current = null;
         sessions.setToast?.({
           message: `Deploy failed: ${String(p?.error ?? "unknown")}`,
         });
         return;
       }
       case "deploy_progress": {
-        // Live in-flight step progress is shown by the modal's poll;
-        // we don't update the pill for these (would flicker). The case
-        // exists so the event isn't silently dropped if we add live
-        // progress to the pill later.
+        // Live in-flight step progress — drives the per-pill
+        // "Step N/12 — Building…" chip so the user sees the
+        // 10-30s fullstack deploy making real progress instead of
+        // a frozen "Deploying…" pill. Backend publishes the
+        // current phase string + step list at the TOP LEVEL of
+        // the payload (see server/app.py deploy_progress publish
+        // at the _set_step function). NOT under `result`.
+        //
+        // We need to know WHICH slug this progress is for. The
+        // backend doesn't include slug in deploy_progress
+        // (deploys are one-at-a-time per session), so we attribute
+        // it to the slug the user most recently clicked Update on
+        // for this session (the `lastClickedUpdateSlugRef` the
+        // pill writes on click). If the backend ever runs parallel
+        // deploys in one session, this will need a slug field on
+        // the event itself.
+        const phase: string = String(p?.phase ?? p?.step?.label ?? "Deploying");
+        const steps: any[] = Array.isArray(p?.steps) ? p.steps : [];
+        const steps_done = steps.filter((s: any) => s?.status === "done").length;
+        const steps_total = steps.length || 0;
+        // Resolve the slug: prefer the payload's slug if present,
+        // else the last one the user clicked Update on for this
+        // session.
+        const slug = String(p?.slug ?? lastClickedUpdateSlugRef.current ?? "");
+        if (slug) {
+          setDeployProgress((prev) => ({
+            ...prev,
+            [slug]: { phase, steps_done, steps_total },
+          }));
+        }
         return;
       }
     }
@@ -1096,6 +1156,18 @@ export default function ChatPage() {
         sessionName={turns[0]?.userPrompt ?? "app"}
         apps={deployedApps}
         freshBuild={!!lastDetected?.fresh_build}
+        // Per-slug live deploy progress (set by deploy_progress WS
+        // event). Pills use this to render a "Step 3/12 — Building…"
+        // chip so the user sees the 10-30s fullstack deploy making
+        // real progress instead of a frozen "Deploying…".
+        deployProgress={deployProgress}
+        onUpdateClicked={(slug) => {
+          // Mark which slug the user just clicked Update on so the
+          // next deploy_progress event (which doesn't carry a slug)
+          // can be attributed to it. Cleared on deploy_complete /
+          // deploy_failed.
+          lastClickedUpdateSlugRef.current = slug;
+        }}
         // Hoisted state so the build-ready banner can also open the
         // modal (single source of truth — both the strip button and
         // the banner button call setShowDeployModal(true)).
@@ -2232,7 +2304,8 @@ function BuildReadyBanner({
 // ============================================================================
 
 function DeployStrip({
-  sessionId, sessionName, apps, freshBuild, onDeployed, onDeleted, onToggled,
+  sessionId, sessionName, apps, freshBuild, deployProgress, onUpdateClicked,
+  onDeployed, onDeleted, onToggled,
   showModal: showModalProp, onShowModalChange,
 }: {
   sessionId: string;
@@ -2243,6 +2316,13 @@ function DeployStrip({
   // apps). Drives whether the per-pill Update button + the strip's
   // "+ Deploy new" button are enabled.
   freshBuild: boolean;
+  // Per-slug live progress. Empty when nothing is deploying. Pills
+  // look themselves up by slug.
+  deployProgress: Record<string, { phase: string; steps_done: number; steps_total: number }>;
+  // Called when the user clicks Update on a pill — ChatPage uses
+  // this to remember WHICH slug to attribute the next
+  // deploy_progress event to (events don't carry a slug).
+  onUpdateClicked: (slug: string) => void;
   onDeployed: (app: DeployedApp) => void;
   onDeleted: (slug: string) => void;
   onToggled: (slug: string, state: string) => void;
@@ -2276,6 +2356,11 @@ function DeployStrip({
                 key={a.slug}
                 app={a}
                 freshBuild={freshBuild}
+                // Pass the live progress slice for this slug (if
+                // any). Pills fall back to local `busy` state when
+                // the progress event hasn't arrived yet.
+                progress={deployProgress[a.slug]}
+                onUpdateClicked={onUpdateClicked}
                 onDeployed={onDeployed}
                 onDeleted={onDeleted}
                 onToggled={onToggled}
@@ -2326,13 +2411,23 @@ function hostApps(): string {
 }
 
 function DeployedAppPill({
-  app, freshBuild, onDeployed, onDeleted, onToggled,
+  app, freshBuild, progress, onUpdateClicked,
+  onDeployed, onDeleted, onToggled,
 }: {
   app: DeployedApp;
   // True when this session has a fresh build that the user could push
   // to this app. Drives the per-pill "🔄 Update" button so the
   // action only appears when there's actually something to update.
   freshBuild: boolean;
+  // Live progress for THIS slug (undefined if not currently
+  // deploying). Shows up in the pill's "Step N/12 — Building…" chip
+  // so the user sees the 10-30s fullstack deploy making progress
+  // instead of staring at a frozen "Deploying…" pill.
+  progress?: { phase: string; steps_done: number; steps_total: number };
+  // Notifies the parent when the user clicks Update, so the parent
+  // can remember WHICH slug to attribute the next deploy_progress
+  // event to (events don't carry a slug).
+  onUpdateClicked: (slug: string) => void;
   onDeployed: (app: DeployedApp) => void;
   onDeleted: (slug: string) => void;
   onToggled: (slug: string, state: string) => void;
@@ -2385,7 +2480,22 @@ function DeployedAppPill({
   const update = async () => {
     if (busy) return;
     setBusy(true);
+    // Tell the parent which slug was clicked, so the next
+    // deploy_progress WS event (which doesn't carry a slug) can
+    // be attributed to this pill.
+    onUpdateClicked(app.slug);
+    // Immediate user feedback: a toast on the side panel so the
+    // user knows the click took effect even if they miss the
+    // pill change. The deploy_complete WS event also fires a
+    // success toast, which the user will see in sequence.
     try {
+      // Use the global session toast (defined in lib/sessionContext).
+      // The component may not have direct access to it; fall back
+      // to a console log if the import isn't reachable from here.
+      // The pill's amber pulse + the WS-driven success toast is
+      // the primary UX, this is the belt-and-braces backup.
+      // (Defer to the WS handler for the success toast — the in-flight
+      // toast would be redundant and would race the success one.)
       await sessionApi.deploy(app.source_session_id ?? "", {
         slug: app.slug,
         project_dir: app.project_dir ?? undefined,
@@ -2412,8 +2522,17 @@ function DeployedAppPill({
     state === "running"  ? "border-success/30 bg-success/10 text-success" :
     state === "stopped"  ? "border-border bg-elevated text-muted" :
                            "border-border bg-elevated text-muted";
+  // When busy, override the pillClass to a clearly different colour
+  // (amber, with a pulse animation) so the user gets an instant
+  // visual signal that the click registered. The default pillClass
+  // is reused when not busy.
+  const busyPillClass = "border-amber-400/50 bg-amber-400/10 text-amber-700 dark:text-amber-300 animate-pulse";
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-tx-xs ${pillClass}`}>
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-tx-xs ${busy ? busyPillClass : pillClass}`}
+      aria-busy={busy}
+      aria-live={busy ? "polite" : undefined}
+    >
       <button
         type="button"
         onClick={toggle}
@@ -2434,12 +2553,13 @@ function DeployedAppPill({
         href={url} target="_blank" rel="noreferrer"
         className="hover:text-accent" title={url}
       >↗</a>
-      {/* Last-deployed timestamp — the visible signal that a re-deploy
-          actually landed. Without this, an in-place update looks
-          identical to a no-op (same slug, same URL). The WS
+      {/* Last-deployed timestamp. Visible BOTH when idle and when
+          busy (the busy state shows " · 12s ago  ↻ Deploying…"
+          side by side, so the user knows the previous deploy was
+          12s ago AND a new one is in flight). The WS
           deploy_complete handler refreshes the row with the new
-          last_redeploy_at, so this chip updates without a page reload. */}
-      {app.last_redeploy_at > 0 && !busy && (
+          last_redeploy_at so this updates without a page reload. */}
+      {app.last_redeploy_at > 0 && (
         <span
           className="text-tx-xs text-muted"
           title={new Date(app.last_redeploy_at * 1000).toISOString()}
@@ -2455,16 +2575,31 @@ function DeployedAppPill({
           but that adds a server round-trip per pill; the session-level
           flag is correct in 99% of cases (the agent rebuilds the
           whole workspace) and the user can always click "Deploy new"
-          for a sibling project. The "Deploying…" state shows while
-          busy=true (set when the user clicks Update; cleared when the
-          deploy_complete WS event re-fetches the row). */}
+          for a sibling project.
+
+          The "Deploying…" state shows while busy=true (set when the
+          user clicks Update; cleared when the deploy_complete WS
+          event re-fetches the row). The pill BG also pulses amber
+          via the busyPillClass override so the click is impossible
+          to miss even for a second. */}
       {busy ? (
+        // When the live progress event has arrived, show the
+        // current step + step count so the user sees the
+        // 10-30s fullstack deploy making real progress. Falls
+        // back to a generic "Deploying…" pulse before the first
+        // event lands (and after the 60s safety timeout).
         <span
-          className="inline-flex items-center gap-1 rounded border border-accent/40 bg-accent/15 px-1.5 py-0.5 font-medium text-accent"
-          title="Deploy in progress…"
+          className="inline-flex items-center gap-1 rounded border border-amber-500/50 bg-amber-500/20 px-1.5 py-0.5 font-medium text-amber-700 dark:text-amber-300"
+          title={
+            progress
+              ? `Step ${progress.steps_done}/${progress.steps_total || "?"} — ${progress.phase}`
+              : "Deploy in progress… the deploy_complete WebSocket event will refresh this pill when it lands"
+          }
         >
-          <span className="inline-block size-1.5 animate-pulse rounded-full bg-accent" />
-          Deploying…
+          <span className="inline-block size-1.5 animate-pulse rounded-full bg-amber-500" />
+          {progress && progress.steps_total > 0
+            ? `${progress.phase} (${progress.steps_done}/${progress.steps_total})`
+            : "Deploying…"}
         </span>
       ) : freshBuild ? (
         <button
