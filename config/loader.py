@@ -56,8 +56,8 @@ class McpServerConfig:
 @dataclass
 class AgentConfig:
     """Fully merged runtime config."""
-    provider:          str             = "anthropic"
-    model:             str             = "claude-opus-4-6"
+    provider:          str             = "minimax"
+    model:             str             = "MiniMax-M3"
     # Default mode is danger-full-access; only used when no env var / config
     # file specifies an alternative.
     permission_mode:   PermissionMode  = PermissionMode.FULL_ACCESS

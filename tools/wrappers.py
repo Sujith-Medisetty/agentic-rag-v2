@@ -31,9 +31,6 @@ from tools.file_ops import (
     read_file as _read_file_impl,
     write_file as _write_file_impl,
     edit_file as _edit_file_impl,
-    grep_search as _grep_search_impl,
-    glob_search as _glob_search_impl,
-    GrepSearchInput,
 )
 from tools.bash import execute_bash, BashInput
 from tools.git import (
@@ -181,21 +178,6 @@ class EditFileInput(BaseModel):
     old_string: str = Field(description="Exact text to find and replace (whitespace-sensitive, must be unique unless replace_all)")
     new_string: str = Field(description="Replacement text (must differ from old_string)")
     replace_all: bool = Field(False, description="Replace every occurrence (default: just the first)")
-class GrepInput(BaseModel):
-    pattern: str = Field(description="Regex pattern to search for")
-    path: str | None = Field(None, description="Directory to search in")
-    glob: str | None = Field(None, description="File glob filter e.g. *.py")
-    output_mode: str | None = Field(None, description="files_with_matches | content | count")
-    before: int | None = Field(None, description="Lines of context before each match")
-    after: int | None = Field(None, description="Lines of context after each match")
-    case_insensitive: bool | None = Field(None, description="Case-insensitive search")
-    file_type: str | None = Field(None, description="Filter by extension e.g. py")
-    head_limit: int | None = Field(None, description="Cap total results")
-    multiline: bool | None = Field(None, description="Let `.` match newlines and `^`/`$` match line boundaries")
-    line_numbers: bool | None = Field(None, description="Show line numbers (default True)")
-class GlobInput(BaseModel):
-    pattern: str = Field(description="Glob pattern e.g. **/*.py")
-    path: str | None = Field(None, description="Base directory (default: cwd)")
 class BashInputSchema(BaseModel):
     command: str = Field(description="Shell command to execute")
     timeout: int | None = Field(None, description="Timeout in MILLISECONDS (max 600000, default 120000)")
@@ -384,72 +366,23 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
     except Exception as e:
         _hook_runner.post_tool_failure("edit_file", json.dumps(inp), str(e))
         return f"Error: {e}"
-@tool("grep_search", args_schema=GrepInput)
-def grep_search(
-    pattern: str,
-    path: str | None = None,
-    glob: str | None = None,
-    output_mode: str | None = None,
-    before: int | None = None,
-    after: int | None = None,
-    case_insensitive: bool | None = None,
-    file_type: str | None = None,
-    head_limit: int | None = None,
-    multiline: bool | None = None,
-    line_numbers: bool | None = None,
-) -> str:
-    """Regex search across files in the workspace. Use this (NOT `bash` with grep) for code search — it returns structured results with line numbers and respects `.gitignore`.
-    Usage:
-    - `pattern` is a regex; quote special characters.
-    - Scope the search with `path` (directory), `glob` (e.g. `**/*.py`), or `file_type` (extension, e.g. `py`).
-    - `output_mode`: `files_with_matches` (default) lists matching files; `content` returns matched lines; `count` returns per-file match counts.
-    - `before` / `after` add context lines around each match (useful with `output_mode=content`).
-    - `head_limit` caps total results; use it on broad searches.
-    - `multiline=true` lets `.` match newlines and `^`/`$` match line boundaries for cross-line patterns.
-    """
-    try:
-        inp = GrepSearchInput(
-            pattern=pattern, path=path, glob=glob,
-            output_mode=output_mode, before=before, after=after,
-            case_insensitive=case_insensitive, file_type=file_type,
-            head_limit=head_limit, multiline=multiline, line_numbers=line_numbers,
-        )
-        result = _grep_search_impl(inp)
-        if result.content:
-            return result.content
-        return f"Found in {result.numFiles} files: {', '.join(result.filenames[:10])}"
-    except Exception as e:
-        return f"Error: {e}"
-@tool("glob_search", args_schema=GlobInput)
-@_safe_tool("glob_search")
-def glob_search(pattern: str, path: str | None = None) -> str:
-    """Find files by glob pattern, sorted by modification time (newest first). Use this (NOT `bash` with find) when you need files matching a name or path pattern.
-    Examples: `**/*.py`, `src/**/test_*.ts`, `config/*.{yaml,yml}`.
-    """
-    result = _glob_search_impl(pattern, path)
-    if not result.filenames:
-        return "No files found."
-    lines = [f"Found {result.numFiles} files ({result.durationMs}ms):"] + result.filenames[:50]
-    if result.truncated:
-        lines.append("... (truncated to 100 results)")
-    return "\n".join(lines)
 # ============================================================================
 # BASH
 # ============================================================================
 @tool("bash", args_schema=BashInputSchema)
 def bash(command: str, timeout: int | None = None, run_in_background: bool = False) -> str:
-    """Execute a shell command in the workspace. Use ONLY for operations a dedicated tool doesn't cover (build, test, install, run, package managers, git operations beyond the `git` tool's actions).
+    """Execute a shell command in the workspace. Use this for operations a dedicated tool doesn't cover — build/test/install/run, package managers, file search (`grep`/`rg`/`find`), `git` operations outside the `git` tool's action set, and any other shell utility.
     DO NOT use bash for:
     - Reading files → use `read_file`.
     - Editing files → use `edit_file` / `write_file`.
-    - Searching code → use `grep_search` / `glob_search`.
+    - Searching code → use `bash` with `grep`/`rg`/`find` (with the default excludes below).
     - `cat`, `head`, `tail`, `sed`, `awk`, `echo >file`, `find` for code lookup — all have better dedicated tools above.
     Usage:
     - `timeout` is in MILLISECONDS (default 120000, max 600000).
     - Set `run_in_background=true` for long-running processes (dev servers, watchers); the call returns immediately.
     - Quote paths containing spaces with double quotes.
     - Run independent commands as PARALLEL tool calls in the same message, not chained sequentially. Use `&&` only when a later command truly depends on an earlier one succeeding; use `;` only when you don't care about earlier failures. Avoid splitting commands with newlines.
-    - When running `find`, search from `.` or a specific path — never from `/`.
+    - When running `find` or `grep`, scope to a specific subdirectory — never from `/` or the repo root when the project is large. Excludes for `node_modules`, `.git`, `dist`, `build`, `coverage`, `__pycache__` are applied by default.
     - Avoid leading `sleep` loops; the harness enforces caps. Prefer `run_in_background=true` and poll the result.
     Git commits (use ONLY when the user explicitly asks for a commit):
     - Always create NEW commits — never `--amend` unless the user asks.
@@ -467,6 +400,11 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
     err = _check_permission("bash", inp)
     if err:
         return f"BLOCKED: {err}"
+    # Inject default excludes for grep/rg/find so a broad search doesn't
+    # recurse into node_modules, .git, dist, build, etc. and return a 1MB blob
+    # (this is the failure mode that cost $40 on one todo session). Only
+    # adds flags the user didn't already pass.
+    command = _inject_search_excludes(command)
     # bash-specific validator
     val = validate_command(command, _permission_mode, _workspace)
     if val.is_blocked:
@@ -497,12 +435,85 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
                 parts.append(f"[{raw.return_code_interpretation}]")
             out = "\n".join(parts) or "(no output)"
         _hook_runner.post_tool_use("bash", json.dumps(inp), out[:500])
-        return out
+        # Cap output at 50 KB — the LLM doesn't need a 900 KB `grep` result,
+        # and a 900 KB message sits in the conversation history for every
+        # subsequent turn. Keep first 25K + last 5K + a clear truncation
+        # marker so the agent can re-run with a more specific filter.
+        return _truncate_output(out, max_chars=50_000)
     except Exception as e:
         _hook_runner.post_tool_failure("bash", json.dumps(inp), str(e))
         return f"Error: {e}"
+
+
+# Default noise dirs to skip on broad search/find commands. Matches the
+# excludes injected into the LLM-facing tool descriptions and the prompt.
+_SEARCH_EXCLUDE_DIRS = (
+    "node_modules", ".git", "dist", "build",
+    "coverage", "__pycache__", ".next", ".cache",
+)
+
+def _inject_search_excludes(command: str) -> str:
+    """Add default --exclude-dir flags to grep/rg/find commands if the user
+    didn't already pass any. The goal: a broad `grep -rn "foo" .` from the
+    project root doesn't return 900 KB of node_modules matches."""
+    if not command:
+        return command
+    cmd = command.strip()
+    low = cmd.lower()
+    try:
+        # ripgrep
+        if re.search(r"\brg\b", low) and "--no-ignore" not in low:
+            # rg respects .gitignore by default — leave it alone unless user
+            # disabled it. Just ensure a sensible -uu doesn't add noise.
+            return command
+        # grep / egrep
+        if re.search(r"\b(grep|egrep|fgrep)\b", low):
+            # Don't double-inject if user already passed --exclude-dir
+            if "--exclude-dir=" in cmd or "--exclude" in cmd:
+                return command
+            excl = " ".join(f"--exclude-dir={d}" for d in _SEARCH_EXCLUDE_DIRS)
+            return f"{cmd} {excl}"
+        # find
+        if re.search(r"\bfind\b", low):
+            # Skip if user already uses -path '*/X' or -prune
+            if "-prune" in cmd or "-path " in cmd:
+                return command
+            # Insert -path '*/<dir>' -prune before any -print / -o
+            # Simpler approach: just prefix the find with a prune clause
+            prune_parts = " ".join(
+                f"-path './{d}' -prune -o" for d in _SEARCH_EXCLUDE_DIRS
+            )
+            # The prune clauses need an "or" terminator — and find needs a
+            # default action at the end. Insert after the first path arg.
+            # We don't try to be clever — just append an "or print the rest"
+            # clause at the end of the find command.
+            return f"{cmd} \\( {prune_parts} -print \\)"
+    except Exception:
+        return command
+    return command
+
+
+def _truncate_output(out: str, *, max_chars: int = 50_000) -> str:
+    """Cap tool output at `max_chars` chars. Keeps the first 70% and last
+    15% so the agent still sees both the head and the tail (errors usually
+    appear at the end), with a clear marker in between saying what was
+    dropped and how to re-run with a tighter filter."""
+    if not out or len(out) <= max_chars:
+        return out
+    head_budget = int(max_chars * 0.70)
+    tail_budget = int(max_chars * 0.15)
+    head = out[:head_budget]
+    tail = out[-tail_budget:]
+    dropped = len(out) - head_budget - tail_budget
+    return (
+        head
+        + f"\n\n[…truncated {dropped:,} chars; re-run with a tighter filter "
+          f"(e.g. --include='*.ts', --exclude-dir=node_modules, "
+          f"\\| head -200) to see this section…]\n\n"
+        + tail
+    )
 # ============================================================================
-# GIT (write-mode full; git_read is the plan-mode subset)
+# GIT (single tool covering read + write; mode is gated by the safety layer)
 # ============================================================================
 def _git_dispatch(
     action: str,
@@ -513,7 +524,7 @@ def _git_dispatch(
     message: str | None = None,
     branch: str | None = None,
 ) -> str:
-    """Shared implementation behind both `git` and `git_read`. Routes the action
+    """Shared implementation behind the `git` tool. Routes the action
     to the matching tools.git helper and enforces permission checks on the
     write-side actions (add / commit / push)."""
     cwd = path or _workspace
@@ -564,20 +575,6 @@ def git(
 ) -> str:
     """Git write operations: `status`, `diff`, `log`, `show`, `blame`, `branch`, `checkout`, `add`, `commit`, `push`, `pull`, `stash`. Use this in preference to `bash git...` for the actions it covers.
     For anything outside this set (rebase, cherry-pick, complex log queries, or HEREDOC-formatted commit messages), fall back to `bash` and follow the git-commit protocol documented in the `bash` tool description.
-    """
-    return _git_dispatch(action, path, commit, staged, count, message, branch)
-@tool("git_read", args_schema=GitInput)
-def git_read(
-    action: str = "status",
-    path: str | None = None,
-    commit: str | None = None,
-    staged: bool | None = None,
-    count: int | None = None,
-    message: str | None = None,
-    branch: str | None = None,
-) -> str:
-    """Git read-only operations: `status`, `diff`, `log`, `show`, `blame`. Use this in plan/explore mode instead of `bash`.
-    For commit / push / branch-creating operations, use the full `git` tool (write mode only).
     """
     return _git_dispatch(action, path, commit, staged, count, message, branch)
 # ============================================================================
@@ -833,7 +830,7 @@ UTILITY_TOOLS = [
 # READ / WRITE TOOL LISTS
 # ============================================================================
 READ_TOOLS = [
-    read_file, grep_search, glob_search, WebFetch, WebSearch, git_read,
+    read_file, WebFetch, WebSearch,
 ] + UTILITY_TOOLS # utility tools are available in read/plan mode too
 WRITE_TOOLS = [
     write_file, edit_file, bash, git, WebFetch, WebSearch, github,
@@ -915,10 +912,10 @@ MULTI_AGENT_TOOLS = [Agent, AgentStatus]
 # ALL_TOOLS + public API
 # ============================================================================
 # Union of READ + WRITE + MULTI_AGENT, deduped while preserving order so the
-# read tools (read_file, grep_search, glob_search, git_read) actually reach
-# the LLM. Previously this was just WRITE_TOOLS + MULTI_AGENT_TOOLS, which
-# silently dropped every read tool — the model would call `read_file` and
-# get "not a valid tool" errors and fall back to bash.
+# read tools (read_file, WebFetch, WebSearch) actually reach the LLM.
+# Previously this was just WRITE_TOOLS + MULTI_AGENT_TOOLS, which silently
+# dropped every read tool — the model would call `read_file` and get "not
+# a valid tool" errors and fall back to bash.
 def _dedupe_tools(*groups):
     seen: set = set()
     out: list = []

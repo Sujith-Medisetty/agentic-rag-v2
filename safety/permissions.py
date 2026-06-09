@@ -36,8 +36,6 @@ class PermissionOutcome:
 TOOL_REQUIRED_MODES: dict[str, PermissionMode] = {
     # read-only tools
     "read_file": PermissionMode.READ_ONLY,
-    "grep_search": PermissionMode.READ_ONLY,
-    "glob_search": PermissionMode.READ_ONLY,
     "WebFetch": PermissionMode.READ_ONLY,
     "WebSearch": PermissionMode.READ_ONLY,
     "Sleep": PermissionMode.READ_ONLY,
@@ -50,7 +48,6 @@ TOOL_REQUIRED_MODES: dict[str, PermissionMode] = {
     "GitLog": PermissionMode.READ_ONLY,
     "GitShow": PermissionMode.READ_ONLY,
     "GitBlame": PermissionMode.READ_ONLY,
-    "git_read": PermissionMode.READ_ONLY,
 
     # workspace write tools
     "TodoWrite": PermissionMode.WORKSPACE_WRITE, # Rust: WorkspaceWrite

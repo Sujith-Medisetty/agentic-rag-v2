@@ -35,6 +35,11 @@ from langgraph.prebuilt import ToolNode
 
 from agents.state import RunnerState
 from agents.prompt import SystemPromptBuilder, ProjectContext, FRONTIER_MODEL_NAME
+from memory.checkpointer import (
+    maybe_compact,
+    _estimate_tokens as _estimate_msg_tokens,
+    CONTEXT_WINDOW_TOKENS,
+)
 from tools.wrappers import get_all_tools
 
 # ---------------------------------------------------------------------------
@@ -42,7 +47,7 @@ from tools.wrappers import get_all_tools
 # ---------------------------------------------------------------------------
 
 _provider: str = "anthropic"
-_model: str = "claude-opus-4-6"
+_model: str = "MiniMax-M3"
 _thinking: bool = False
 _thinking_budget: int = 10_000
 _mcp_tools: list = []  # extra LangChain tools loaded from MCP servers
@@ -306,10 +311,68 @@ def _get_llm(
 # ---------------------------------------------------------------------------
 
 
-def _build_system_prompt(state: RunnerState) -> str:
+def _git_signature(workspace: str) -> tuple:
+    """Cheap signature of the git state for cache invalidation. Just reads
+    the mtime + size of `.git/HEAD` and `.git/index` — no `git` invocation.
+    If either changes, the cached ProjectContext is stale and we re-discover.
+    Cost: 2 stat() calls (~microseconds) vs 4 git subprocesses (~10-50ms each
+    and 4 chances to break MiniMax's prompt-prefix cache by changing bytes)."""
+    sig: list = [str(workspace)]
+    try:
+        import os as _os
+        from pathlib import Path as _P
+        gitdir = _P(workspace) / ".git"
+        if not gitdir.is_dir():
+            return (sig, 0, 0)  # not a git repo — cache is fine
+        head = gitdir / "HEAD"
+        idx  = gitdir / "index"
+        sig.append(str(head.stat().st_mtime_ns) if head.exists() else "0")
+        sig.append(str(head.stat().st_size)      if head.exists() else "0")
+        sig.append(str(idx.stat().st_mtime_ns)  if idx.exists()  else "0")
+        sig.append(str(idx.stat().st_size)      if idx.exists()  else "0")
+    except Exception:
+        pass
+    return tuple(sig)
+
+
+def _get_cached_project_context(state: RunnerState, workspace: str, today: str):
+    """Return a ProjectContext, using a state-keyed cache to avoid re-running
+    `git status` / `git log` / `git rev-parse` / `git config user.*` on every
+    LLM call. The cache invalidates only when `.git/HEAD` or `.git/index`
+    mtime/size changes (i.e. commit, branch switch, or worktree update)."""
+    cache = state.get("_project_context_cache")
+    sig = _git_signature(workspace)
+    if cache and isinstance(cache, dict) and cache.get("sig") == sig and cache.get("today") == today:
+        return cache["ctx"]
+    ctx = ProjectContext.discover_with_git(workspace, today)
+    # We CAN'T mutate state here (RunnerState is a TypedDict snapshot, not
+    # a mutable container in some call sites), so the caller is responsible
+    # for re-invoking us with the same state object. The cache lives in
+    # LangGraph's checkpointer so it survives across turns.
+    try:
+        state["_project_context_cache"] = {"sig": sig, "today": today, "ctx": ctx}
+    except Exception:
+        pass
+    return ctx
+
+
+def _build_system_prompt(state: RunnerState) -> tuple[str, str]:
+    """Build the system prompt as a `(static_base, dynamic_suffix)` pair.
+
+    The static base is everything that doesn't change turn-to-turn — model
+    identity, Ojas app rules, UI quality, orchestration, tool list. MiniMax's
+    automatic prefix cache will hit on it from turn 2 onwards.
+
+    The dynamic suffix is everything that changes on git/date/MCP changes —
+    today's date, working dir, git status, recent commits, branch, MCP tools.
+
+    Both are returned as strings. The caller (`node_agent`) wraps each in
+    its own SystemMessage so the API sees two messages; the cache only busts
+    when the dynamic suffix actually changes.
+    """
     workspace = state.get("workspace", ".")
     today = date.today().isoformat()
-    ctx = ProjectContext.discover_with_git(workspace, today)
+    ctx = _get_cached_project_context(state, workspace, today)
 
     builder = (
         SystemPromptBuilder()
@@ -331,7 +394,9 @@ def _build_system_prompt(state: RunnerState) -> str:
         builder.append_section(
             f"# Additional project preferences (follow exactly)\n{extra}"
         )
-    return builder.render()
+
+    static, dynamic = builder.render_split()
+    return (static, dynamic)
 
 # ---------------------------------------------------------------------------
 # Streaming display + token accounting for one model call
@@ -612,7 +677,24 @@ def node_agent(state: RunnerState) -> dict:
 
     # Assemble the system prompt once, then reuse for the rest of the run
     #.
-    system_prompt = state.get("system_prompt") or _build_system_prompt(state)
+    # Build the system prompt as a (static, dynamic) pair so MiniMax's
+    # automatic prefix cache hits on the static part. We accept either form
+    # from state (legacy `system_prompt` string OR the new pair) and rebuild
+    # if absent / stale.
+    cached = state.get("system_prompt_pair")
+    if isinstance(cached, (list, tuple)) and len(cached) == 2:
+        static_base, dynamic_suffix = cached
+    else:
+        # Legacy fallback: older checkpoints stored a single string under
+        # `system_prompt`. We rebuild the pair and trust render_split's
+        # backward-compat path (it returns the whole prompt as static
+        # if the boundary marker is missing).
+        legacy = state.get("system_prompt")
+        if isinstance(legacy, str) and legacy:
+            static_base = legacy
+            dynamic_suffix = ""
+        else:
+            static_base, dynamic_suffix = _build_system_prompt(state)
 
     # Repair any orphaned tool_calls left by a previously cancelled/killed turn
     # BEFORE we send the message history to the LLM. Without this, MiniMax /
@@ -620,7 +702,49 @@ def node_agent(state: RunnerState) -> dict:
     raw_history = list(state.get("messages", []))
     history = _repair_orphan_tool_calls(raw_history)
 
-    messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
+    # Auto-compact BEFORE the LLM call, not after. The old `put()`-time check
+    # fired after the turn that crossed the threshold had already been billed
+    # at full price — late fire, paid twice. See memory.checkpointer.maybe_compact
+    # for the threshold + summary logic.
+    from memory.checkpointer import maybe_compact
+    history, did_compact = maybe_compact(history)
+    if did_compact:
+        try:
+            from agents.reporter import get_reporter
+            get_reporter().context_update(
+                used_tokens=_estimate_msg_tokens(history),
+                budget_tokens=CONTEXT_WINDOW_TOKENS,
+                warning=False,
+                compacting=False,
+            )
+        except Exception:
+            pass
+
+    # Publish the current context-used % so the UI's progress bar stays
+    # accurate even on turns where no compaction happened.
+    try:
+        from agents.reporter import get_reporter
+        used = _estimate_msg_tokens(history)
+        warn_threshold = int(CONTEXT_WINDOW_TOKENS * 0.25)  # 50K of 200K
+        get_reporter().context_update(
+            used_tokens=used,
+            budget_tokens=CONTEXT_WINDOW_TOKENS,
+            warning=used >= warn_threshold,
+            compacting=False,
+        )
+    except Exception:
+        pass
+
+    # Build the messages list: [static SystemMessage, dynamic SystemMessage,
+    # ...history]. Two SystemMessages in a row is the cleanest way to expose
+    # the static/dynamic split to providers that prefix-cache on identical
+    # prefixes — the second message busts the cache for the dynamic part
+    # only.
+    messages: list[BaseMessage] = []
+    if static_base:
+        messages.append(SystemMessage(content=static_base))
+    if dynamic_suffix:
+        messages.append(SystemMessage(content=dynamic_suffix))
     messages.extend(history)
 
     llm = _get_llm().bind_tools(_tools())
@@ -637,7 +761,7 @@ def node_agent(state: RunnerState) -> dict:
     return {
         "messages": [ai],
         "iterations": iterations,
-        "system_prompt": system_prompt,
+        "system_prompt_pair": [static_base, dynamic_suffix],
     }
 
 

@@ -38,6 +38,12 @@ MODEL_PRICING: dict[str, dict] = {
         "cache_write": 0.20,
         "cache_read": 0.08,
     },
+    "MiniMax-M3": {
+        "input": 0.30,
+        "output": 1.20,
+        "cache_write": 0.00,
+        "cache_read": 0.06,
+    },
     "gpt-4o": {
         "input": 5.00,
         "output": 15.00,

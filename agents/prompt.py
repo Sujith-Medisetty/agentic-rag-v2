@@ -22,7 +22,7 @@ from pathlib import Path
 # truncation logic can pivot on it. Currently unread inside this repo — the
 # constant is kept for and as a forward-compatible anchor.
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
-FRONTIER_MODEL_NAME = "Claude Opus 4.6"
+FRONTIER_MODEL_NAME = "MiniMax-M3"
 
 MAX_INSTRUCTION_FILE_CHARS = 4_000
 MAX_TOTAL_INSTRUCTION_CHARS = 12_000
@@ -228,9 +228,10 @@ def get_ojas_app_rules_section() -> str:
         " - **General knowledge that's stable** — \"what is the capital of "
         "France\", \"explain how TCP works\", \"write a debounce function\". "
         "Don't burn a tool call on these.",
-        " - **Repo / project context** — use `read_file` / `grep_search` / "
-        "`glob_search` for code that's on disk. Don't web-search your own "
-        "project.",
+        " - **Repo / project context** — use `read_file` (and `bash` with "
+        "`grep` / `rg` / `find`, which carry default excludes for "
+        "`node_modules`, `.git`, `dist`, `build`, `coverage`, `__pycache__`) "
+        "for code that's on disk. Don't web-search your own project.",
         " - **You just searched and the result is conclusive** — don't "
         "search again with a slightly different query. Either answer with "
         "what you have, or tell the user you couldn't find a reliable "
@@ -697,10 +698,10 @@ def get_using_tools_section() -> str:
         "# Using your tools",
         "",
         " - Prefer dedicated tools over `bash` when one fits: `read_file` for "
-        "reading files, `edit_file` / `write_file` for changing them, "
-        "`grep_search` / `glob_search` for searching. Reserve `bash` for "
-        "operations that genuinely require a shell (build, test, install, git "
-        "actions not covered by the `git` tool).",
+        "reading files, `edit_file` / `write_file` for changing them. Use "
+        "`bash` for shell-native operations (build, test, install, search via "
+        "`grep`/`rg`/`find` with default excludes, `git` actions not covered "
+        "by the `git` tool, anything else genuinely shell-shaped).",
         " - Reach for `WebSearch` (or `WebFetch` for a specific URL) BEFORE "
         "answering any question you can't verify from context — current "
         "time, weather, prices, \"latest\" / \"right now\" queries, a fact "
@@ -991,155 +992,44 @@ def get_orchestration_section() -> str:
     This is a decision framework, not a fixed recipe — the model decides whether and
     how to decompose based on the task in front of it.
     """
-    lines = [
+    return "\n".join([
         "# Orchestrating sub-agents",
         "",
         "Delegate large, separable work to background sub-agents with `Agent`; poll "
-        "them with `AgentStatus`. Sub-agents run in a FRESH context (they see only "
-        "your prompt + what they read from disk) and CANNOT spawn their own — so YOU "
-        "are the sole orchestrator. Do small or tightly-coupled work yourself.",
+        "with `AgentStatus`. Sub-agents run in a FRESH context and CANNOT spawn "
+        "their own — you are the sole orchestrator. Do small or tightly-coupled work "
+        "yourself.",
         "",
-        "## Autonomous builds (non-technical user — you are the only verifier)",
-        "No human reviews the code, so reliability comes from CONSTRAINING the work and "
-        "TESTING it by running it — not from clever decomposition.",
-        *prepend_bullets([
-            "ACCEPTANCE CHECKLIST FIRST: rewrite the request into concrete runnable "
-            "success criteria ('can sign up', 'task persists after refresh'). This is "
-            "the definition of DONE and what you will test.",
-            "CONSTRAIN THE STACK: pick ONE conventional stack and stick to it — filling "
-            "a known pattern is the single biggest reliability lever. No novel "
-            "approaches unless asked.",
-            "THE GATE IS RUNNING IT: actually build, run, and run automated end-to-end "
-            "tests of each checklist item. A green build + passing checklist is the "
-            "only proof; 'the agent said it works' is never proof.",
-            "SELF-CORRECT (bounded — see convergence): on red, read the error, fix, "
-            "re-run; don't move on while red.",
-            "PAUSE AND REPORT WHEN STUCK: never claim success you didn't verify.",
-            "PREFER PREVIEW-AND-ITERATE over one-shot: an app can pass tests yet not "
-            "match what the user imagined (and they can't debug it), so leave a runnable "
-            "result they can refine in plain English.",
-        ]),
+        "**Subagent types** (pick the narrowest that fits):",
+        "- `Explore` — read-only. For \"where is X / what references Y\".",
+        "- `Plan` — read + TodoWrite. For implementation roadmaps.",
+        "- `Verification` — read + bash. For running tests / type-checks / builds.",
+        "- `general-purpose` — full toolset. For self-contained build tasks.",
         "",
-        "## Delegate, then sequence vs. parallelize",
-        *prepend_bullets([
-            "Narrowest subagent_type that fits: `Explore` (read-only), `Plan` (roadmap "
-            "+ TodoWrite), `general-purpose` (writes/runs), `Verification` (tests).",
-            "SEQUENCE BY DEFAULT — a parallel agent is blind to the others, so it's only "
-            "safe when truly independent. Spawn a dependency, wait, then spawn the "
-            "dependent; never start a dependent on a guess.",
-            "Parallelize ONLY when ALL hold: (a) a VALIDATED contract pins the shared "
-            "surface; (b) each agent owns a DISJOINT DIRECTORY (frontend/ vs backend/) — "
-            "never two editing the same files; (c) no shared mutable state or ordering "
-            "dependency. If any fails, sequence it.",
-            "Don't parallelize the coupled FE-vs-BE axis (racing them trades speed for "
-            "reconciliation pain). The parallelism that pays off is TRIVIALLY-"
-            "INDEPENDENT UNITS within a layer (unrelated pages/endpoints). When in "
-            "doubt, sequence.",
-        ]),
-        "",
-        "## The contract gate — clear it BEFORE any build agent",
-        "A vague contract is the #1 cause of silent FE/BE drift. Treat it like code: it "
-        "passes a gate before you fan out.",
-        *prepend_bullets([
-            "MACHINE-CHECKABLE, NOT PROSE: a structured file (JSON Schema / OpenAPI / "
-            "typed interface) at a known path (e.g. contracts/api-spec.json) covering "
-            "every endpoint, request/response shape, error + auth behavior, with "
-            "examples — and it must validate.",
-            "REVIEW THE CONTRACT ADVERSARIALLY: spawn a reviewer whose only job is to "
-            "find gaps (under-specified, missing, ambiguous, untyped); fix + re-review "
-            "before fan-out.",
-            "BIND BOTH SIDES WITH TESTS (contract-as-tests): backend gets contract "
-            "tests it must pass; frontend gets types/mocks generated from the SAME "
-            "contract — so any divergence is a failing test, not a silent mismatch.",
-        ]),
-        "",
-        "## Refinement loops MUST converge — don't churn",
-        "Any 'review→fix→re-review' or 'test→fix→re-test' loop can spin forever or "
-        "regress. The no-progress detector will NOT catch this (each round looks "
-        "different), so bound them. Applies to the contract gate AND self-correct.",
-        *prepend_bullets([
-            "BOUND THE ROUNDS to ~2–3; don't loop 'until perfect'.",
-            "TRIAGE BLOCKING vs NICE-TO-HAVE: only blocking gaps trigger another round; "
-            "record the rest. Kills the endless-nitpicks spiral.",
-            "DETECT NON-CONVERGENCE: same gap resurfacing, or a fix reopening a fixed "
-            "item → STOP (oscillation).",
-            "EDIT, DON'T REWRITE: targeted edits to the specific gap; never regenerate "
-            "the whole artifact (rewrites regress agreed content).",
-            "EXIT CLEANLY: clear → proceed; rounds exhausted but blocked → PAUSE and "
-            "report. Never silently proceed on a broken artifact, never churn.",
-        ]),
-        "",
-        "## Approve the PLAN before building",
-        "Catching a wrong assumption at the plan is far cheaper than after building, "
-        "and a non-technical user can confirm intent in plain English (the only thing "
-        "they can truly judge).",
-        *prepend_bullets([
-            "After the contract gate, PRESENT a plain-English plan — feature list, "
-            "acceptance checklist, key business rules (who can do what, edge cases, "
-            "triggers). Offer the contract for detail; don't require reading it.",
-            "STOP and wait for explicit go-ahead — spawn no build agent until approved. "
-            "Mechanically: end your turn with the plan + question; the user's next "
-            "message resumes the build.",
-            "On requested changes, fold them into the plan/contract and re-confirm "
-            "before building.",
-        ]),
-        "",
-        "## Spawn → poll → read → adapt (and grounding)",
-        *prepend_bullets([
-            "`Agent` returns an `agent_id` + status `running`. Poll `AgentStatus` to "
-            "`completed`/`failed`.",
-            "On `completed`: READ the agent's `output_file` for its actual result — "
-            "don't assume. On `failed`: read the error, then adapt (fix input, retry "
-            "narrower, or spawn a debugger); never silently proceed past a failure.",
-            "GROUND IN FILES: pass downstream agents a POINTER + short orientation, and "
-            "require them to READ the canonical artifact (schema.sql, "
-            "contracts/api-spec.json) before dependent work — files are truth, your "
-            "summary only orients. Tell sub-agents to flag uncertainty / re-read "
-            "rather than guess.",
-            "VERIFY, DON'T TRUST: a dependent stage starts only after `completed` AND a "
-            "deterministic check passed (tests / type-check / validate / compile). "
-            "Mandatory.",
-        ]),
-        "",
-        "## Change requests on a built app",
-        "The code on disk is the source of truth; the hard part is finding the FULL "
-        "set of places a change touches and respecting their order. Classify first:",
-        *prepend_bullets([
-            "AMBIGUOUS ('make it nicer'): don't guess — restate your interpretation and "
-            "confirm before acting.",
-            "LOCALIZED (cosmetic / copy / one field — does NOT touch the contract or "
-            "schema): just read, edit, re-test the affected items. Solo, no fan-out.",
-            "CROSS-CUTTING (touches schema / API shape / a shared rule, e.g. 'add a "
-            "priority field'): it MOVES the contract that created isolation, so you "
-            "can't just fan out. Run the build discipline on the delta: (1) MAP THE "
-            "BLAST RADIUS — search for EVERY place it touches (schema + migration, "
-            "contract, backend + validation, frontend, tests); omission is the #1 risk. "
-            "(2) UPDATE + RE-GATE THE CONTRACT first (sequential). (3) THEN parallelize "
-            "the now-isolated backend/frontend edits in disjoint dirs. (4) REGRESSION-"
-            "TEST the existing suite + affected checklist, not just the new behavior.",
-            "Keep the checklist + contract current so they stay the source of truth for "
-            "the next change; preview/report rather than claim unverified success.",
-        ]),
-        "",
-        "## Worked example — task app (non-technical user, autonomous)",
-        *prepend_bullets([
-            "1. ACCEPTANCE CHECKLIST (sign up, log in, create task, persists after "
-            "refresh) + CONSTRAIN THE STACK.",
-            "2. `Explore`/`Plan` — map the build + write a machine-checkable contract.",
-            "3. CONTRACT GATE — reviewer attacks it; fix + re-review (bounded; stop on "
-            "oscillation). Generate contract tests + types/mocks.",
-            "4. PLAN APPROVAL — present plain-English plan + checklist + rules; STOP for "
-            "go-ahead; fold edits + re-confirm.",
-            "5. DB schema first (critical path); wait for completed + a passing check.",
-            "6. Backend then frontend (coupled → sequential); parallelize only "
-            "trivially-independent units in disjoint dirs, all reading the contract.",
-            "7. THE GATE — `Verification` runs the app + end-to-end tests for EVERY "
-            "checklist item; self-correct (bounded); don't declare done while red.",
-            "8. Report plainly what passes/fails; prefer a runnable result to refine in "
-            "plain English over a risky one-shot claim.",
-        ]),
-    ]
-    return "\n".join(lines)
+        "**Decision rules**:",
+        "- *Acceptance checklist first*: rewrite the request into runnable success "
+        "criteria. This is your definition of done.",
+        "- *Constrain the stack*: one conventional pattern; novel approaches are a "
+        "reliability tax.",
+        "- *Contract gate*: for multi-component builds, write a machine-checkable "
+        "schema (JSON Schema / OpenAPI) at a known path BEFORE fanning out. Both "
+        "sides get types/tests from the same contract.",
+        "- *Sequence by default*: parallel agents are blind to each other. Only "
+        "parallelize on (a) disjoint directories, (b) no shared state, (c) a "
+        "validated contract. The FE-vs-BE axis is coupled — sequence it.",
+        "- *Bound loops*: review→fix spins after ~2-3 rounds. Watch for the same "
+        "gap resurfacing (= oscillation) and STOP.",
+        "- *Approve the plan*: end your turn with a plain-English plan + checklist "
+        "+ business rules. STOP for explicit go-ahead before spawning build agents.",
+        "- *Spawn → poll → read → adapt*: `Agent` returns `agent_id`. Poll "
+        "`AgentStatus`. On completed, READ `output_file` — never assume. On "
+        "failed, read error, retry narrower, never silently proceed.",
+        "- *Verify, don't trust*: a dependent stage starts only after `completed` "
+        "AND a deterministic check passed. The gate is running it.",
+        "- *Change requests*: classify — AMBIGUOUS (restate + confirm), LOCALIZED "
+        "(just edit, no fan-out), CROSS-CUTTING (map blast radius, update "
+        "contract, then re-fan-out). Edit, don't rewrite.",
+    ])
 
 # ---------------------------------------------------------------------------
 # Project context discovery
@@ -1706,3 +1596,30 @@ class SystemPromptBuilder:
 
     def render(self) -> str:
         return "\n\n".join(self.build())
+
+    def render_split(self) -> tuple[str, str]:
+        """Return `(static_base, dynamic_suffix)` split at the dynamic boundary.
+
+        The static base is everything BEFORE the boundary marker — model
+        identity, intent rules, Ojas app rules, UI quality, orchestration,
+        tool list. It is byte-identical across turns within a session as
+        long as no static config changes, so MiniMax's automatic prefix
+        cache hits on it from turn 2 onwards.
+
+        The dynamic suffix is everything from the boundary onwards —
+        today's date, git status, recent commits, current branch, MCP tools.
+        It changes when the user makes a commit, switches branch, or restarts
+        the server, but should remain identical for most of the session.
+
+        Returns `(static, dynamic)`. If the boundary is missing (older config
+        that didn't use the marker), returns the whole prompt as static
+        and an empty dynamic string.
+        """
+        sections = self.build()
+        try:
+            idx = sections.index(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        except ValueError:
+            return ("\n\n".join(sections), "")
+        static = "\n\n".join(sections[:idx])
+        dynamic = "\n\n".join(sections[idx + 1 :])
+        return (static, dynamic)

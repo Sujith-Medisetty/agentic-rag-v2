@@ -27,7 +27,7 @@ from pathlib import Path
 # Constants (mirror lib.rs)
 # ---------------------------------------------------------------------------
 
-DEFAULT_AGENT_MODEL = "claude-opus-4-6"
+DEFAULT_AGENT_MODEL = "MiniMax-M3"
 # Hard cap on the sub-agent's LangGraph recursion. Lower than the orchestrator's
 # 50 because sub-agents are deliberately scoped: a focused search shouldn't need
 # more than a dozen turns. Cap on iters bounds worst-case cost even if the
@@ -53,30 +53,32 @@ HARD_AGENT_MAX_TOTAL_SECONDS      = 24 * 3600 # 24h hard ceiling
 
 # Tool allowlists per subagent type (lib.rs allowed_tools_for_subagent).
 # NOTE: `Agent` is intentionally absent from every set — sub-agents cannot spawn
-# further sub-agents.
+# further sub-agents. The grep/find work is now done via `bash` (which has
+# default excludes for noise directories), so `grep_search` / `glob_search` /
+# `git_read` are no longer in any allowlist.
 _ALLOWED_TOOLS_BY_TYPE: dict[str, set[str]] = {
     "Explore": {
-        "read_file", "glob_search", "grep_search", "WebFetch", "WebSearch",
+        "read_file", "WebFetch", "WebSearch",
         "ToolSearch", "Skill", "StructuredOutput",
     },
     "Plan": {
-        "read_file", "glob_search", "grep_search", "WebFetch", "WebSearch",
+        "read_file", "WebFetch", "WebSearch",
         "ToolSearch", "Skill", "TodoWrite", "StructuredOutput", "SendUserMessage",
     },
     "Verification": {
-        "bash", "read_file", "glob_search", "grep_search", "WebFetch", "WebSearch",
+        "bash", "read_file", "WebFetch", "WebSearch",
         "ToolSearch", "TodoWrite", "StructuredOutput", "SendUserMessage", "PowerShell",
     },
     "claw-guide": {
-        "read_file", "glob_search", "grep_search", "WebFetch", "WebSearch",
+        "read_file", "WebFetch", "WebSearch",
         "ToolSearch", "Skill", "StructuredOutput", "SendUserMessage",
     },
     "statusline-setup": {
-        "bash", "read_file", "write_file", "edit_file", "glob_search",
-        "grep_search", "ToolSearch",
+        "bash", "read_file", "write_file", "edit_file",
+        "ToolSearch",
     },
     "general-purpose": {
-        "bash", "read_file", "write_file", "edit_file", "glob_search", "grep_search",
+        "bash", "read_file", "write_file", "edit_file",
         "WebFetch", "WebSearch", "TodoWrite", "Skill", "ToolSearch", "NotebookEdit",
         "Sleep", "SendUserMessage", "Config", "StructuredOutput", "REPL", "PowerShell",
     },
@@ -113,7 +115,7 @@ def resolve_agent_model(model: str | None) -> str:
       1. Explicit `model` arg (what the orchestrator's Agent() call passed).
       2. The currently-configured orchestrator model (so sub-agents on a
          MiniMax / OpenAI-compat / Anthropic setup match the parent and we
-         don't accidentally send `claude-opus-4-6` to MiniMax's API).
+         don't accidentally send a wrong model string to MiniMax's API).
       3. The hardcoded fallback (only used in tests where configure_model
          was never called).
     """

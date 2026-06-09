@@ -121,6 +121,13 @@ class SessionBus:
                         f"+{payload.get('input_delta',0)} in / "
                         f"+{payload.get('output_delta',0)} out"
                     )
+                elif kind == "context_update":
+                    pct = payload.get("percent", 0)
+                    flags = []
+                    if payload.get("warning"): flags.append("warn")
+                    if payload.get("compacting"): flags.append("COMPACTING")
+                    flag_s = f" [{','.join(flags)}]" if flags else ""
+                    preview = f"{pct}% of {payload.get('budget_tokens',0):,}{flag_s}"
                 elif kind == "turn_summary":
                     preview = (
                         f"tools={payload.get('tools_used')} "
@@ -301,6 +308,22 @@ class WebReporter(ProgressReporter):
         self._pub("token_update", {
             "input_delta": int(input_delta or 0),
             "output_delta": int(output_delta or 0),
+        })
+
+    def context_update(
+        self,
+        *,
+        used_tokens: int,
+        budget_tokens: int,
+        warning: bool = False,
+        compacting: bool = False,
+    ) -> None:
+        self._pub("context_update", {
+            "used_tokens": int(used_tokens),
+            "budget_tokens": int(budget_tokens),
+            "percent": round(used_tokens / budget_tokens * 100, 1) if budget_tokens else 0,
+            "warning": bool(warning),
+            "compacting": bool(compacting),
         })
 
     def thinking_text(self, text: str, done: bool = False) -> None:

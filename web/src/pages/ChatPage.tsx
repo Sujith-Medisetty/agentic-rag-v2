@@ -110,6 +110,12 @@ export default function ChatPage() {
   // The Deploy modal lives in the DeployStrip; this flag is what the
   // build-ready banner flips on to open the same modal.
   const [showDeployModal, setShowDeployModal] = useState(false);
+  // Context-used progress for the bottom-of-chat bar. Updated by `context_update`
+  // WS events. 0 means "no data yet" (don't render the bar).
+  const [contextUsed, setContextUsed] = useState(0);
+  const [contextBudget, setContextBudget] = useState(200_000);
+  const [contextCompacting, setContextCompacting] = useState(false);
+  const [contextWarning, setContextWarning] = useState(false);
   // Follow-mode for the chat scroll: stick to bottom while new events
   // arrive UNLESS the user scrolls up to read. If they do, leave them where
   // they are and pop a floating "↓" button so they can catch back up on a
@@ -353,6 +359,20 @@ export default function ChatPage() {
             isStreaming: true,
           };
         });
+        return;
+      }
+      case "context_update": {
+        // Cumulative context-used % so the bottom bar can show "78% used" in
+        // Claude Code style. Published by the server after every LLM call and
+        // around auto-compaction. `warning` = at the warn tier. `compacting`
+        // = summarisation is happening right now.
+        const used  = Number(p.used_tokens  ?? 0);
+        const budget = Number(p.budget_tokens ?? 0);
+        if (used <= 0) return;
+        if (budget > 0) setContextBudget(budget);
+        setContextUsed(used);
+        setContextWarning(Boolean(p.warning));
+        setContextCompacting(Boolean(p.compacting));
         return;
       }
       case "token_update": {
@@ -1137,6 +1157,16 @@ export default function ChatPage() {
           running (and there's chat above to anchor it). */}
       {!isEmpty && <ChatStatusBar currentTurn={currentTurn} />}
 
+      {/* Context-used progress bar — Claude Code-style "75% used" indicator
+          pinned just above the compose input. Only renders once the server
+          has sent at least one context_update event for this session. */}
+      <ContextBar
+        used={contextUsed}
+        budget={contextBudget}
+        warning={contextWarning}
+        compacting={contextCompacting}
+      />
+
       {/* Input — pinned bottom, safe-area aware. While a turn is in flight the
           Send button morphs into Stop so cancelling is a single click.
           When the session is empty (no turns yet), the form is restyled to
@@ -1537,6 +1567,74 @@ function rebuildTranscript(events: LiveEvent[]): {
   // never appeared. Keeping isStreaming=true here is what unlocks the Stop
   // button rendering condition and the live spinner.
   return { turns: completed, currentTurn: curr, plan };
+}
+
+// ============================================================================
+// ContextBar — Claude Code-style "context used %" indicator.
+//
+// Renders a thin bar above the chat input that fills as the session grows.
+// Colour thresholds:
+//   < 25%  → subtle (low usage)
+//   25-60% → accent (warn — agent is past the warn tier)
+//   60-90% → warn (orange, compaction imminent)
+//   90%+   → danger (red, compaction likely firing)
+// When `compacting`, the bar is replaced with a "Compacting…" pill + spinner.
+//
+// Hidden until the server has sent at least one context_update event for the
+// session (so the bar doesn't pop in for a fresh empty chat).
+// ============================================================================
+
+function ContextBar({
+  used, budget, warning, compacting,
+}: { used: number; budget: number; warning: boolean; compacting: boolean }) {
+  if (!used || !budget) return null;
+  const pct = Math.max(0, Math.min(100, Math.round((used / budget) * 100)));
+  // Colour tiers — same thresholds Claude Code uses
+  let fillCls = "bg-accent/40";          // < 25% — calm
+  if (pct >= 90)      fillCls = "bg-danger/70";
+  else if (pct >= 60) fillCls = "bg-warn/70";
+  else if (pct >= 25) fillCls = "bg-accent/60";
+
+  if (compacting) {
+    return (
+      <div className="bg-bg">
+        <div className="mx-auto max-w-4xl px-4 pb-2">
+          <div className="flex items-center gap-2 rounded-md border border-accent/30 bg-accent/10 px-3 py-1.5 font-sans text-[11px] text-accent">
+            <span className="stream-dot" />
+            <span className="font-semibold uppercase tracking-[0.14em]">
+              Compacting context…
+            </span>
+            <span className="text-subtle">
+              · summarising older turns to keep the session running smoothly
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
+  return (
+    <div
+      className="bg-bg"
+      title={`${fmt(used)} of ${fmt(budget)} tokens used (${pct}%)`}
+    >
+      <div className="mx-auto max-w-4xl px-4 pb-2">
+        <div className="flex items-center gap-2 font-sans text-tx-xs text-subtle">
+          <span className="font-semibold uppercase tracking-[0.14em]">Context</span>
+          <div className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-border/60">
+            <div
+              className={`h-full transition-[width] duration-300 ${fillCls}`}
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <span className={`font-mono ${warning ? "text-warn" : ""}`}>
+            {pct}%{warning ? " · getting full" : ""}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ============================================================================

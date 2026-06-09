@@ -53,6 +53,19 @@ class ProgressReporter:
         ticking input/output token counts (rather than waiting for the
         end-of-turn summary). Deltas — frontend accumulates them per turn."""
 
+    def context_update(
+        self,
+        *,
+        used_tokens: int,
+        budget_tokens: int,
+        warning: bool = False,
+        compacting: bool = False,
+    ) -> None:
+        """Published on context-changing events (after each LLM call, around
+        auto-compaction) so the UI can show a Claude Code-style "75% used"
+        bar. `warning=True` means we're at the warn tier (~50K); `compacting=True`
+        means the agent is currently summarising old messages."""
+
     # ---- rich activity (Phase 2) --------------------------------------
     def todo_update(self, items: list[dict]) -> None:
         """Full current todo list after a TodoWrite call. Items are
