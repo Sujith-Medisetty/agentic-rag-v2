@@ -456,6 +456,14 @@ def _load_claude_md(workspace: str) -> str:
 _AUTO_RENAME_DEFAULT_PREFIXES = ("Session ", "Chat ")  # placeholder prefixes
 _AUTO_RENAME_MAX = 1                       # at most 1 auto-rename per session
 _AUTO_RENAME_HISTORY: set[str] = set()     # session_ids already auto-renamed
+# Title-suggestion LLM call budget. The configured model (e.g. MiniMax-M3)
+# thinks for 2-7s on a title-suggestion prompt and then generates ~10-20
+# tokens, so end-to-end is usually 3-9s. A 6s budget killed the call mid-
+# generation most of the time and silently fell back to the heuristic, so
+# the user kept seeing the placeholder. 20s is a comfortable ceiling that
+# still feels instant to a human (the rename runs in the background after
+# the turn).
+_AUTO_RENAME_LLM_TIMEOUT_S = 20.0
 
 import asyncio as _asyncio
 import re as _re
@@ -641,20 +649,37 @@ async def _maybe_auto_rename(session_id: str) -> None:
 async def _call_llm_for_title(prompt: str) -> str | None:
     """One-shot LLM call to generate a session title. Uses the same
     model the agent is configured with so titles match the agent's
-    "voice". Bounded latency: 6 seconds max — if the model is slow, we
-    skip the rename rather than make the user wait.
+    "voice". Bounded latency: see _AUTO_RENAME_LLM_TIMEOUT_S — the
+    model thinks for a few seconds on this prompt and then emits a
+    short answer, so the budget has to cover the FULL think + answer
+    round-trip, not just the answer.
 
     IMPORTANT: this model emits extended-thinking blocks even when
     asked not to, so the raw response usually looks like
     "<think>...reasoning...</think>\n\nFix Login Flow". We strip
     everything before the closing </think> tag and take what follows.
-    If there's no think block, the response is used as-is."""
+    If there's no think block, the response is used as-is.
+
+    The stripper has to be robust against several quirks of the
+    MiniMax / Claude / GPT families:
+      - think blocks whose content contains `</think>` (nested,
+        model slip) — greedy DOTALL match would eat the answer.
+      - think blocks followed by nothing (model thought but
+        forgot to answer) — log + return None so the heuristic
+        fallback kicks in.
+      - JSON-wrapped answers (`{"title": "..."}`) from models
+        that follow the "format as JSON" hint too literally.
+      - Markdown code-fence wrapping around the answer.
+    """
+    import sys as _sys
+    import time as _time
+    t0 = _time.monotonic()
     try:
         from agents.nodes import _get_llm
         llm = _get_llm(streaming=False, thinking=False)
         from langchain_core.messages import HumanMessage
         coro = llm.ainvoke([HumanMessage(content=prompt)])
-        msg = await _asyncio.wait_for(coro, timeout=6.0)
+        msg = await _asyncio.wait_for(coro, timeout=_AUTO_RENAME_LLM_TIMEOUT_S)
         # `msg.content` is either a string or a list of content blocks.
         raw = ""
         if isinstance(msg.content, str):
@@ -669,13 +694,38 @@ async def _call_llm_for_title(prompt: str) -> str | None:
         else:
             raw = str(msg.content)
         if not raw:
+            print(f"[auto-rename] LLM returned empty content blocks", file=_sys.stderr, flush=True)
             return None
-        # Strip <think>...</think> blocks (extended thinking).
-        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL)
-        # Also strip any markdown code fences the model might wrap the
-        # answer in (e.g. ```\nTitle\n```).
-        cleaned = _re.sub(r"^```[^\n]*\n", "", cleaned.strip())
-        cleaned = _re.sub(r"\n```$", "", cleaned.strip())
-        return cleaned.strip() or None
-    except Exception:
+        # Strip <think>...</think> blocks. Use a non-greedy match
+        # AND require the closing tag to actually appear. If the
+        # model emits an unclosed think block (truncation, model
+        # bug), fall back to the raw content rather than eating
+        # the whole response.
+        if "<think>" in raw and "</think>" in raw:
+            cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL)
+        elif "<think>" in raw:
+            # Unclosed think block — everything after <think> is the
+            # model's answer (or empty). Strip just the opening tag.
+            cleaned = raw.split("<think>", 1)[1]
+        else:
+            cleaned = raw
+        # JSON wrapping: some models follow a "format as JSON" hint
+        # too literally and return {"title": "..."} or {"answer": "..."}.
+        m = _re.search(r'"(?:title|answer|name)"\s*:\s*"([^"]+)"', cleaned)
+        if m:
+            cleaned = m.group(1)
+        # Markdown code fences: strip ```json\n...\n``` or ```\n...\n```
+        cleaned = _re.sub(r"^```[a-zA-Z]*\s*\n?", "", cleaned.strip())
+        cleaned = _re.sub(r"\n?```\s*$", "", cleaned.strip())
+        cleaned = cleaned.strip()
+        if not cleaned:
+            print(f"[auto-rename] LLM response stripped to empty after {_time.monotonic()-t0:.2f}s (raw was {raw[:200]!r})", file=_sys.stderr, flush=True)
+            return None
+        print(f"[auto-rename] LLM title OK in {_time.monotonic()-t0:.2f}s: {cleaned!r}", file=_sys.stderr, flush=True)
+        return cleaned
+    except _asyncio.TimeoutError:
+        print(f"[auto-rename] LLM title-suggestion timed out ({_AUTO_RENAME_LLM_TIMEOUT_S}s)", file=_sys.stderr, flush=True)
+        return None
+    except Exception as e:
+        print(f"[auto-rename] LLM title-suggestion error after {_time.monotonic()-t0:.2f}s: {e}", file=_sys.stderr, flush=True)
         return None
