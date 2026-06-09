@@ -170,7 +170,10 @@ def _summarize_messages(messages: list) -> str:
 
     parts: list[str] = []
     if last_user_msg:
-        parts.append(f"User's most recent request in this slice:\n  {last_user_msg[:500]}")
+        parts.append(
+            f"User's most recent request that was summarised (the very latest "
+            f"is in the kept tail below, verbatim):\n  {last_user_msg[:500]}"
+        )
     if sections["edits_made"]:
         parts.append("\nFiles edited:")
         parts.extend(f"  {e}" for e in sections["edits_made"][:15])
