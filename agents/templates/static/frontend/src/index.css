@@ -1,4 +1,10 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
+/* Self-hosted fonts (no Google CDN, no FOUT, no third-party request at
+ * runtime). The Geist variable font is one file covering every weight
+ * (100-900) and ships as a single woff2 with the full unicode range
+ * subsets already split — about 60% smaller than the Inter equivalent.
+ * Geist Mono covers code, numbers, and tables. */
+@import "@fontsource-variable/geist/index.css";
+@import "@fontsource-variable/geist-mono/index.css";
 
 @tailwind base;
 @tailwind components;
@@ -74,9 +80,12 @@
     --success: 142 71% 45%;
     --success-foreground: 0 0% 100%;
 
-    --border: 216 34% 17%;
-    --input: 216 34% 17%;
-    --ring: 216 34% 17%;
+    --border: 216 34% 22%;
+    --input: 216 34% 22%;
+    /* Focus ring: a slightly lighter brand blue so it's visible on the
+     * very-dark background. Previously --ring matched --background
+     * which made the focus ring invisible. */
+    --ring: 217 91% 60%;
   }
 }
 
@@ -91,12 +100,26 @@
   }
   body {
     @apply bg-background text-foreground antialiased;
-    font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    /* Geist Variable (sans) — single file covers all weights. The system
+     * stack below is the fallback if Geist fails to load (offline, blocked,
+     * dev mode without @fontsource installed). */
+    font-family:
+      "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont,
+      "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     /* iOS safe areas */
     padding-top: env(safe-area-inset-top);
     padding-bottom: env(safe-area-inset-bottom);
     padding-left: env(safe-area-inset-left);
     padding-right: env(safe-area-inset-right);
+  }
+  /* Geist Mono for any element with font-mono (code, numbers, prices).
+   * Useful for tabular data and inline code without bloating the body. */
+  code, kbd, pre, samp, .font-mono {
+    font-family:
+      "Geist Mono Variable", "Geist Mono", ui-monospace, SFMono-Regular,
+      "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+      monospace;
+    font-variant-numeric: tabular-nums;
   }
   /* Focus ring is visible but not garish on dark backgrounds. */
   :focus-visible {

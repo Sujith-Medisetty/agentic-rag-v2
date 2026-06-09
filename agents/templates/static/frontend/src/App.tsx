@@ -1,18 +1,27 @@
 import { useEffect } from "react";
 import SectionsExample from "@/components/sections-example";
+// import ProductExample from "@/components/product-example";
 
 /**
- * The agent's real app replaces this file. `SectionsExample` here
- * is a working example of the SINGLE-PAGE-SECTIONS layout the
- * agent will build 80% of the time: portfolio sites, landing
- * pages, docs front pages, marketing pages, "about me" pages.
- * The same shadcn primitives, theme, PWA bits, and animations --
- * just in the IA the user actually wants.
+ * The agent's real app replaces this file. The template ships TWO
+ * example IAs the agent can copy from (or use as-is if they fit):
  *
- * If the user's request is for an app with multiple pages (a
- * dashboard, a tool, a game, a productivity app), REPLACE this
- * SectionsExample with the right IA for the request -- the
- * template can't anticipate every shape.
+ *   SectionsExample — long-form text sections (Hero / Overview /
+ *                    Highlights / Connect). Best for portfolios,
+ *                    personal sites, docs fronts, "about me" pages,
+ *                    marketing landing pages.
+ *
+ *   ProductExample  — pricing tiers + feature comparison + FAQ.
+ *                    Best for SaaS landings, product launches, B2B
+ *                    pitch pages.
+ *
+ *   (both live in src/components/. Uncomment the import + swap the
+ *   return to try the other one.)
+ *
+ * If the user's request is for a multi-page app (a dashboard, a
+ * tool, a game, a productivity app), REPLACE these examples with
+ * the right IA for the request — the template can't anticipate
+ * every shape.
  */
 export default function App() {
   // Register the service worker so the browser will surface the

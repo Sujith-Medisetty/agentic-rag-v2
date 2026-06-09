@@ -17,60 +17,16 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-
-// ─── Module-scoped event capture ───────────────────────────────────────
-// The browser fires `beforeinstallprompt` once per page load, and only
-// when the install criteria are met. We capture it at module import
-// time so ANY component rendered anywhere in the tree can call .prompt()
-// via the `deferred` ref. Listeners are notified on the appinstalled
-// event so we can hide the button.
-interface BeforeInstallPromptEvent extends Event {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
-}
-
-let deferred: BeforeInstallPromptEvent | null = null;
-const listeners = new Set<() => void>();
-
-if (typeof window !== "undefined") {
-  window.addEventListener("beforeinstallprompt", (e) => {
-    e.preventDefault();
-    deferred = e as BeforeInstallPromptEvent;
-    listeners.forEach((l) => l());
-  });
-  window.addEventListener("appinstalled", () => {
-    deferred = null;
-    listeners.forEach((l) => l());
-  });
-}
-
-function isStandalone(): boolean {
-  if (typeof window === "undefined") return false;
-  return (
-    window.matchMedia("(display-mode: standalone)").matches ||
-    // iOS Safari exposes this when launched from the home screen
-    (window.navigator as unknown as { standalone?: boolean }).standalone ===
-      true
-  );
-}
-
-function isIOS(): boolean {
-  if (typeof navigator === "undefined") return false;
-  return /iPad|iPhone|iPod/.test(navigator.userAgent) && !/MSStream/.test(navigator.userAgent);
-}
+import { pwaInstall } from "@/lib/pwa-install";
+import { hover, tap } from "@/lib/motion";
 
 function useInstallState() {
+  // Force a re-render whenever the module-scoped event listener fires.
   const [, force] = useState(0);
-  useEffect(() => {
-    const cb = () => force((n) => n + 1);
-    listeners.add(cb);
-    return () => {
-      listeners.delete(cb);
-    };
-  }, []);
+  useEffect(() => pwaInstall.subscribe(() => force((n) => n + 1)), []);
   return {
-    canPrompt: deferred !== null,
-    installed: isStandalone(),
+    canPrompt: pwaInstall.getDeferred() !== null,
+    installed: pwaInstall.isStandalone(),
   };
 }
 
@@ -87,13 +43,14 @@ export default function InstallButton() {
   if (installed) return null;
 
   const handleClick = async () => {
+    const deferred = pwaInstall.getDeferred();
     if (deferred) {
       await deferred.prompt();
       const choice = await deferred.userChoice;
       if (choice.outcome === "accepted") {
         toast.success("Installed — find it on your home screen.");
       }
-      deferred = null;
+      pwaInstall.clearDeferred();
       return;
     }
     // No native prompt available (iOS, Firefox, etc.) — show hint.
@@ -105,8 +62,8 @@ export default function InstallButton() {
       <Tooltip>
         <TooltipTrigger asChild>
           <motion.div
-            whileTap={{ scale: 0.95 }}
-            transition={{ type: "spring", stiffness: 400, damping: 17 }}
+            whileHover={hover}
+            whileTap={tap}
             className="inline-flex"
           >
             <Button
@@ -131,7 +88,7 @@ export default function InstallButton() {
           <DialogHeader>
             <DialogTitle>Install this app</DialogTitle>
             <DialogDescription>
-              {isIOS() ? (
+              {pwaInstall.isIOS() ? (
                 <>
                   On iPhone or iPad: tap the{" "}
                   <span className="font-medium text-foreground">Share</span>{" "}

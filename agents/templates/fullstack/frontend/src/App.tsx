@@ -1,5 +1,11 @@
 import { useEffect } from "react";
 import Dashboard from "@/components/dashboard";
+// The fullstack template also has SectionsExample and ProductExample
+// from the static template's component set. The Dashboard here is the
+// default because fullstack apps usually have backend data to show.
+// Swap to <SectionsExample /> or <ProductExample /> if the user's
+// request is for a single-page product/portfolio site backed by the
+// FastAPI server (e.g. for a contact form, signup, or webhook).
 
 /**
  * The agent's real app replaces this file. The dashboard here is a
