@@ -1002,9 +1002,16 @@ export default function ChatPage() {
           <RunningTotals totals={totals} />
         </div>
 
-        {/* RIGHT — theme toggle + debug toggle. Both icon-only on mobile, the
-            debug button expands to a labeled pill on desktop. */}
+        {/* RIGHT — context chip + theme toggle + debug toggle. The chip is
+            always rendered (when we have data) so the user can see context
+            fill at any moment — fresh session, mid-turn, idle between turns. */}
         <div className="flex items-center gap-2 justify-self-end">
+          <ContextChip
+            used={contextUsed}
+            budget={contextBudget}
+            warning={contextWarning}
+            compacting={contextCompacting}
+          />
           <button
             type="button"
             onClick={toggleTheme}
@@ -1633,6 +1640,57 @@ function ContextBar({
           </span>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// ContextChip — compact "X% context" pill for the chat header. Always visible
+// (when we have a value) so the user can see the fill state at any moment,
+// not only during a turn. Click for a one-line breakdown; the full bar lives
+// in ContextBar above the compose input.
+// ============================================================================
+
+function ContextChip({
+  used, budget, warning, compacting,
+}: { used: number; budget: number; warning: boolean; compacting: boolean }) {
+  if (!used && !compacting) return null;
+  const pct = budget > 0 ? Math.max(0, Math.min(100, Math.round((used / budget) * 100))) : 0;
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
+
+  let dotCls = "bg-accent/70";
+  let textCls = "text-text";
+  let borderCls = "border-border/60 bg-elevated/60";
+  if (compacting) {
+    dotCls = "bg-accent animate-pulse-soft";
+    borderCls = "border-accent/40 bg-accent/[0.06]";
+  } else if (pct >= 90) {
+    dotCls = "bg-danger/80";
+    textCls = "text-danger";
+    borderCls = "border-danger/40 bg-danger/[0.06]";
+  } else if (pct >= 60) {
+    dotCls = "bg-warn/80";
+    textCls = "text-warn";
+    borderCls = "border-warn/40 bg-warn/[0.05]";
+  } else if (pct >= 25) {
+    dotCls = "bg-accent/80";
+  }
+
+  const label = compacting
+    ? "Compacting…"
+    : `${pct}% ctx`;
+
+  return (
+    <div
+      className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border ${borderCls} px-2 py-0.5 font-sans backdrop-blur-sm`}
+      title={
+        compacting
+          ? "Compacting context — summarising older turns to keep the session running"
+          : `Context used: ${fmt(used)} of ${fmt(budget)} tokens (${pct}%)${warning ? " — getting full" : ""}`
+      }
+    >
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
+      <span className={`text-tx-xs font-medium ${textCls}`}>{label}</span>
     </div>
   );
 }

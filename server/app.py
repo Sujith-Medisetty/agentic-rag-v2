@@ -2271,6 +2271,47 @@ async def stream(websocket: WebSocket, session_id: str):
     if not bus.is_bound():
         bus.bind_loop(asyncio.get_running_loop())
     bus.subscribe(websocket)
+    # Emit an initial context_update so the header chip + bottom bar show
+    # immediately on connect (not just on the first LLM call of the next
+    # turn). The estimate is computed from the persisted chat history in
+    # the session DB; for a fresh session with no messages, used_tokens
+    # stays 0 and the chip will only appear once the first turn produces
+    # data.
+    try:
+        from memory.checkpointer import (
+            _estimate_tokens, CONTEXT_WINDOW_TOKENS,
+        )
+        from server import db as _db
+        msgs = _db.list_messages(session_id)
+        # Reconstruct a list-of-contents shape that _estimate_tokens
+        # understands (list of strings, or list of {"content": str}).
+        # The session DB only stores role + content, so a char//4 estimate
+        # over the joined content is a good-enough proxy for the LLM
+        # input size.
+        from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+        reconstructed: list = []
+        for m in msgs:
+            content = m.get("content") or ""
+            role = m.get("role") or "human"
+            if role in ("human", "user"):
+                reconstructed.append(HumanMessage(content=content))
+            elif role in ("ai", "assistant"):
+                reconstructed.append(AIMessage(content=content))
+            else:
+                reconstructed.append(ToolMessage(content=content, name=role, tool_call_id=""))
+        if reconstructed:
+            used = _estimate_tokens(reconstructed)
+            warn = int(CONTEXT_WINDOW_TOKENS * 0.25)
+            bus.publish("context_update", {
+                "used_tokens":  used,
+                "budget_tokens": CONTEXT_WINDOW_TOKENS,
+                "percent": round(used / CONTEXT_WINDOW_TOKENS * 100, 1) if CONTEXT_WINDOW_TOKENS else 0,
+                "warning":  used >= warn,
+                "compacting": False,
+            })
+    except Exception:
+        # Don't let an initial-context hiccup break the WS upgrade
+        pass
     try:
         # Keep the socket alive while the bus pushes events. We don't need to
         # read anything else from the client; ignore inbound frames (used as
