@@ -55,22 +55,42 @@ self.addEventListener("fetch", (e) => {
     return;
   }
 
-  // Cache-first for everything else (assets/*, manifest, icons, etc).
-  // Vite content-hashes the assets so a new file = new URL = cache miss
-  // = network fetch. Old assets fall out of the cache when the new
-  // SW activates with a new CACHE name.
+  // Cache-first ONLY for Vite's content-hashed asset bundles
+  // (/assets/*). Other same-origin GETs (manifest, icons, anything
+  // else) go network-first so a redeploy is visible immediately
+  // and writes to /api/* (if the app has one) are never stale.
+  const isAsset = url.pathname.includes("/assets/");
+
+  if (isAsset) {
+    e.respondWith(
+      caches.match(e.request).then((cached) => {
+        if (cached) return cached;
+        return fetch(e.request)
+          .then((res) => {
+            if (res.ok && url.origin === self.location.origin) {
+              const clone = res.clone();
+              caches.open(CACHE).then((c) => c.put(e.request, clone));
+            }
+            return res;
+          })
+          .catch(() => cached || Response.error());
+      })
+    );
+    return;
+  }
+
+  // Network-first for everything else.
   e.respondWith(
-    caches.match(e.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(e.request)
-        .then((res) => {
-          if (res.ok && url.origin === self.location.origin) {
-            const clone = res.clone();
-            caches.open(CACHE).then((c) => c.put(e.request, clone));
-          }
-          return res;
-        })
-        .catch(() => cached || Response.error());
-    })
+    fetch(e.request)
+      .then((res) => {
+        if (res.ok && url.origin === self.location.origin) {
+          const clone = res.clone();
+          caches.open(CACHE).then((c) => c.put(e.request, clone));
+        }
+        return res;
+      })
+      .catch(() =>
+        caches.match(e.request).then((c) => c || Response.error())
+      )
   );
 });
