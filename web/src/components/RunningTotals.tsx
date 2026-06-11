@@ -1,7 +1,7 @@
 // RunningTotals — pinned chip in the chat header showing session-wide totals
 // computed by summing per-turn metrics.
 //
-// "12 turns · 184 tools · 84k in (74k cached · 10k new) / 51k out · $1.23"
+// "12 turns · 184 tools · 84k in (74k cached · 10k new) / 51k out · $1.23 (in $0.04 · cache $0.004 · out $0.06)"
 //
 //   - The In/Out pair is the headline token count.
 //   - The parenthetical splits input into cache hits (cheap, green) and
@@ -10,13 +10,17 @@
 //     of the model's input was served from the prompt cache vs paid for
 //     at full price.
 //   - The cost comes from the server's per-component sub-totals summed
-//     across turns; the (cache $X) parenthetical on the cost surfaces how
-//     much of the bill was for cache reads (cheap) so the savings of the
-//     prompt cache are visible in dollars, not just tokens.
+//     across turns. The compact parenthetical (in $X · cache $Y · out $Z)
+//     makes the per-component contribution visible inline; hover the chip
+//     for the full (tokens × rate) math.
 //   - Hidden entirely until the first turn finishes (totals.turns === 0).
 
 import type { SessionTotals } from "@/lib/types";
-import { formatTokens, formatCost, formatDuration } from "@/lib/format";
+import {
+  formatTokens, formatCost, formatDuration,
+  formatCostMath, formatCostMathMultiline, formatCostComponents,
+} from "@/lib/format";
+import { pricingForModel, MINIMAX_M3_PRICING } from "@/lib/pricing";
 
 export default function RunningTotals({ totals }: { totals: SessionTotals }) {
   if (totals.turns === 0) return null;
@@ -29,11 +33,24 @@ export default function RunningTotals({ totals }: { totals: SessionTotals }) {
   const newTokens = Math.max(0, totals.inputTokens - cached);
   // Sub-totals the server gave us per turn. Default to 0 for older sessions
   // whose summaries pre-date the cost_*_usd fields — display still works,
-  // just without the cache $ parenthetical.
+  // just without the per-component cost breakdown.
   const cacheCost = totals.costCacheReadUsd ?? 0;
   const inCost    = totals.costInputUsd     ?? 0;
   const outCost   = totals.costOutputUsd    ?? 0;
   const hasSubCosts = cacheCost > 0 || inCost > 0 || outCost > 0;
+  // Cost math — full multiline form goes in the tooltip; the chip shows
+  // the compact component breakdown inline. Pricing is per-model; default
+  // to MiniMax-M3 since that's what the server runs.
+  const pricing = pricingForModel(null);
+  const mathMultiline = formatCostMathMultiline(pricing, {
+    input:      totals.inputTokens,
+    output:     totals.outputTokens,
+    cacheRead:  totals.cacheReadTokens,
+    cacheWrite: totals.cacheWriteTokens,
+  }, totals.costUsd);
+  const inlineBreakdown = hasSubCosts
+    ? formatCostComponents({ in: inCost, cache: cacheCost, out: outCost })
+    : "";
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border border-border bg-elevated/50 px-2 py-1 text-[11px] text-muted">
       <span className="text-text">{totals.turns}</span>
@@ -77,14 +94,14 @@ export default function RunningTotals({ totals }: { totals: SessionTotals }) {
             className="text-text"
             title={
               hasSubCosts
-                ? `Cost split — in: ${formatCost(inCost)} · out: ${formatCost(outCost)} · cache: ${formatCost(cacheCost)}`
-                : undefined
+                ? `${mathMultiline}\n\nRates: input $${MINIMAX_M3_PRICING.input}/M · output $${MINIMAX_M3_PRICING.output}/M · cache_read $${MINIMAX_M3_PRICING.cache_read}/M · cache_write $${MINIMAX_M3_PRICING.cache_write}/M`
+                : `${mathMultiline}\n\nRates: input $${MINIMAX_M3_PRICING.input}/M · output $${MINIMAX_M3_PRICING.output}/M · cache_read $${MINIMAX_M3_PRICING.cache_read}/M · cache_write $${MINIMAX_M3_PRICING.cache_write}/M`
             }
           >
             {formatCost(totals.costUsd)}
-            {cacheCost > 0 && (
-              <span className="text-success/80" title={`${formatCost(cacheCost)} of the bill was cache reads`}>
-                {" "}({formatCost(cacheCost)} cache)
+            {inlineBreakdown && (
+              <span className="text-subtle" title={mathMultiline}>
+                {" "}({inlineBreakdown})
               </span>
             )}
           </span>

@@ -1,35 +1,53 @@
 // TurnFooter — prominent per-turn stats card.
 //
-//   ┌──────────────────────────────────────────────────────────────────┐
-//   │ DURATION 23.4s · TOOLS 5 · IN 3.4k (2.6k cached · 800 new) ·    │
-//   │   OUT 1.2k · COST $0.04                                          │
-//   └──────────────────────────────────────────────────────────────────┘
+//   ┌──────────────────────────────────────────────────────────────────────┐
+//   │ DURATION 23.4s · TOOLS 5 · IN 3.4k (2.6k cached · 800 new) ·         │
+//   │   OUT 1.2k · COST $0.04                                              │
+//   │     (800 new × $0.30) + (2.6k cached × $0.06) + (1.2k out × $1.20)   │
+//   └──────────────────────────────────────────────────────────────────────┘
 //
 // Each metric is labelled so the user can read it at a glance instead of
 // guessing which number is which. The IN parenthetical splits the input
 // into cache hits (green) and "new" tokens (uncached + cache_creation),
 // so the user can see how much of the prompt the cache served vs what
-// the model had to read in fresh. Cost tooltip shows the in/out/cache
-// sub-totals when the server sent them.
+// the model had to read in fresh. The COST sub-line shows the full cost
+// math — tokens × rate for each component — so the bill is auditable
+// without having to click a tooltip.
 
 import type { TurnSummary } from "@/lib/types";
-import { formatTokens, formatCost, formatDuration } from "@/lib/format";
+import { formatTokens, formatCost, formatDuration, formatCostMath, formatCostMathMultiline } from "@/lib/format";
+import { pricingForModel, MINIMAX_M3_PRICING } from "@/lib/pricing";
 
 export default function TurnFooter({ summary }: { summary: TurnSummary }) {
   const totalTok = summary.input_tokens + summary.output_tokens;
   const cached = summary.cache_read_tokens ?? 0;
   const newTokens = Math.max(0, summary.input_tokens - cached);
+  // Pricing is per-model; we don't have it on the wire yet (TODO: send from
+  // server), so default to MiniMax-M3. When the server starts emitting a
+  // per-turn `pricing` field, this is the line to swap.
+  const pricing = pricingForModel(null);
   // Sub-totals from the server (per-component cost). Optional on the type —
   // older replays won't have them, in which case the cost chip just shows
-  // the total without a breakdown tooltip.
+  // the total without a breakdown.
   const costIn   = summary.cost_input_usd      ?? 0;
   const costOut  = summary.cost_output_usd     ?? 0;
   const costCR   = summary.cost_cache_read_usd ?? 0;
   const costCW   = summary.cost_cache_write_usd?? 0;
-  const hasSubCosts = costIn > 0 || costOut > 0 || costCR > 0 || costCW > 0;
-  const costTitle = hasSubCosts
-    ? `Cost split — in: ${formatCost(costIn)} · out: ${formatCost(costOut)} · cache_read: ${formatCost(costCR)} · cache_write: ${formatCost(costCW)}`
-    : undefined;
+  // Cost math — visible inline as the parenthetical, full version in
+  // tooltip. Built from the rates × the same token counts the IN/OUT
+  // stats show, so the multiplication is verifiable by eye.
+  const mathString = formatCostMath(pricing, {
+    input:      summary.input_tokens,
+    output:     summary.output_tokens,
+    cacheRead:  summary.cache_read_tokens,
+    cacheWrite: summary.cache_write_tokens,
+  });
+  const mathMultiline = formatCostMathMultiline(pricing, {
+    input:      summary.input_tokens,
+    output:     summary.output_tokens,
+    cacheRead:  summary.cache_read_tokens,
+    cacheWrite: summary.cache_write_tokens,
+  }, summary.cost_usd);
   return (
     <div className="mt-5 rounded-lg border border-border/70 bg-elevated/40 px-3 py-2 font-sans backdrop-blur-sm">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-tx-xs">
@@ -77,11 +95,21 @@ export default function TurnFooter({ summary }: { summary: TurnSummary }) {
               label="Cost"
               value={formatCost(summary.cost_usd)}
               valueClass="text-text"
-              title={costTitle}
+              // Full math (one term per line) for hover-to-inspect; the
+              // visible part below the value already shows the inline form.
+              title={mathMultiline}
             />
           </>
         )}
       </div>
+      {summary.cost_usd > 0 && mathString && (
+        <div
+          className="mt-1.5 font-mono text-[10px] leading-snug text-subtle"
+          title={`${mathMultiline}\n\nRates: input $${MINIMAX_M3_PRICING.input}/M · output $${MINIMAX_M3_PRICING.output}/M · cache_read $${MINIMAX_M3_PRICING.cache_read}/M · cache_write $${MINIMAX_M3_PRICING.cache_write}/M`}
+        >
+          = {mathString}
+        </div>
+      )}
     </div>
   );
 }
