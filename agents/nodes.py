@@ -587,24 +587,31 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
 # ---------------------------------------------------------------------------
 # Cache-field extraction
 # ---------------------------------------------------------------------------
-# Provider `usage` dicts come in three known shapes depending on the model /
-# endpoint:
-#   1. Anthropic: top-level `cache_creation_input_tokens` /
+# Provider `usage` dicts come in several known shapes depending on the model
+# / endpoint:
+#   1. Anthropic native: top-level `cache_creation_input_tokens` /
 #      `cache_read_input_tokens` (separate write/read breakdown).
-#   2. OpenAI / OpenAI-compatible (including MiniMax-M3): nested
-#      `prompt_tokens_details.cached_tokens` (read-only — no write side).
-#   3. Flat / unknown: nothing — return 0/0 and let the UI display "no cache
-#      info" rather than crashing.
-# We log the raw usage once per process so we can pin down M3's actual shape
-# and drop the diagnostic once it's confirmed.
+#   2. OpenAI standard: nested `prompt_tokens_details.cached_tokens`
+#      (read-only — no write side).
+#   3. OpenAI-compatible (MiniMax-M3, as confirmed by live probe): nested
+#      `input_token_details.cache_read` — same idea, different key name.
+#      Returns the read count as `cache_read` (singular) instead of the
+#      OpenAI-standard `cached_tokens` (plural). Without probing both keys
+#      the cache rate reads as 0 even though the provider IS serving from
+#      cache (verified: 754/828 = 91% hit on the 2nd call with the same
+#      system prompt).
+#   4. Flat / unknown: return (0, 0) and let the UI display "no cache info"
+#      rather than crashing.
+# We log the raw usage once per process so we can pin down the shape and
+# drop the diagnostic once it's confirmed across providers.
 _cache_shape_logged = False
 
 
 def _extract_cache_fields(usage: dict) -> tuple[int, int]:
     """Return (cache_creation_tokens, cache_read_tokens) from a provider
-    usage dict. Probes the three known shapes and returns (0, 0) if the
-    provider doesn't surface cache info. Logs the raw usage once per
-    process so we can confirm M3's actual shape."""
+    usage dict. Probes the known shapes and returns (0, 0) if the provider
+    doesn't surface cache info. Logs the raw usage once per process so we
+    can confirm the active provider's actual shape."""
     global _cache_shape_logged
     if not usage:
         return 0, 0
@@ -622,18 +629,32 @@ def _extract_cache_fields(usage: dict) -> tuple[int, int]:
             )
             _cache_shape_logged = True
         return cw, cr
-    # 2. OpenAI / OpenAI-compatible shape (nested prompt_tokens_details).
-    details = usage.get("prompt_tokens_details") or usage.get("input_token_details") or {}
-    if isinstance(details, dict) and details.get("cached_tokens"):
-        cr = int(details["cached_tokens"] or 0)
-        if not _cache_shape_logged:
-            import logging
-            logging.getLogger(__name__).info(
-                "[cache-debug] provider returned OpenAI-shape usage: %r", usage
-            )
-            _cache_shape_logged = True
-        return 0, cr
-    # 3. Unknown — log once so we know the shape, then return 0/0.
+    # 2 + 3. OpenAI-compatible shapes. The exact nesting and key name vary
+    # by provider (OpenAI uses `prompt_tokens_details.cached_tokens`,
+    # MiniMax-M3 uses `input_token_details.cache_read`), so probe both.
+    details = (
+        usage.get("prompt_tokens_details")
+        or usage.get("input_token_details")
+        or {}
+    )
+    if isinstance(details, dict):
+        cr = (
+            int(details.get("cached_tokens") or 0)
+            or int(details.get("cache_read") or 0)  # MiniMax-M3 shape
+        )
+        cw = (
+            int(details.get("cache_creation_tokens") or 0)
+            or int(details.get("cache_creation") or 0)
+        )
+        if cr or cw:
+            if not _cache_shape_logged:
+                import logging
+                logging.getLogger(__name__).info(
+                    "[cache-debug] provider returned OpenAI-shape usage: %r", usage
+                )
+                _cache_shape_logged = True
+            return cw, cr
+    # 4. Unknown — log once so we know the shape, then return 0/0.
     if not _cache_shape_logged:
         import logging
         logging.getLogger(__name__).info(
