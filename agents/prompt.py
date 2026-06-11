@@ -1505,6 +1505,63 @@ def render_mcp_tools_section(mcp_tools: list) -> str:
     ])
     return "\n".join(lines)
 
+
+def render_plan_section(workspace: str) -> str:
+    """Render the current TodoWrite plan as a compact markdown section.
+
+    Reads `<workspace>/.clawd-todos.json` (the file the TodoWrite tool
+    maintains). Returns "" if no plan / file missing / file malformed —
+    the empty path stays a no-op for non-plan sessions and never breaks
+    the prompt build on a malformed todo file.
+
+    The plan is small (~200-500 tokens for a typical 5-10 step plan) and
+    goes in the dynamic suffix (after the boundary marker), so it rides
+    the dynamic cache for consecutive turns where the plan didn't
+    change. A TodoWrite call busts the dynamic cache once; the static
+    prefix stays cached.
+    """
+    import json
+    from pathlib import Path
+    try:
+        if not workspace:
+            return ""
+        p = Path(workspace) / ".clawd-todos.json"
+        if not p.exists():
+            return ""
+        try:
+            todos = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        if not isinstance(todos, list) or not todos:
+            return ""
+        lines = ["# Plan (TodoWrite state — live)",
+                 "",
+                 "Current step-by-step plan maintained by the TodoWrite tool. "
+                 "Use it as the live source of truth for which step you're on; "
+                 "mark items in_progress before starting them and completed when done."]
+        for i, t in enumerate(todos, 1):
+            if not isinstance(t, dict):
+                continue
+            content = str(t.get("content") or "").strip()
+            if not content:
+                continue
+            status = str(t.get("status") or "pending").lower()
+            if status == "completed":
+                mark = "✓"
+            elif status == "in_progress":
+                mark = "▶"
+            else:
+                mark = "○"
+            lines.append(f" {i}. [{mark}] {content}")
+        # Defensive: if every item had empty content, we rendered only the
+        # header. Return "" so we don't add a half-empty section to the prompt.
+        if len(lines) <= 2:
+            return ""
+        return "\n".join(lines)
+    except Exception:
+        # Never break the prompt build on a malformed todo file.
+        return ""
+
 # ---------------------------------------------------------------------------
 # SystemPromptBuilder
 # ---------------------------------------------------------------------------
@@ -1603,6 +1660,16 @@ class SystemPromptBuilder:
             sections.append(get_orchestration_section())
         sections.append(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
         sections.append(self._environment_section())
+        # Plan (TodoWrite state) — dynamic, but stable across consecutive
+        # turns when the agent is in deep work on one step. Goes in the
+        # dynamic suffix so it rides the dynamic cache; a TodoWrite call
+        # busts the dynamic cache once but the static prefix stays cached.
+        workspace_for_plan = (
+            str(self.project_context.cwd) if self.project_context else ""
+        )
+        plan_section = render_plan_section(workspace_for_plan)
+        if plan_section:
+            sections.append(plan_section)
         if self.project_context is not None:
             sections.append(render_project_context(self.project_context))
             if self.project_context.instruction_files:
