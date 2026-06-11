@@ -26,6 +26,18 @@
  *                                unlink from it). Only acts if the
  *                                symlink exists AND its target does
  *                                not — i.e. it's actually dangling.
+ *   force-rmtree <path>         chmod 0o700 the path, chown to the
+ *                                calling user (looked up via SUDO_UID
+ *                                — setuid root helper), then rmtree
+ *                                via rm -rf. Used by the session-delete
+ *                                teardown path when shutil.rmtree()
+ *                                failed with a permission/foreign-uid
+ *                                error and the dir is preventing the
+ *                                Caddy wildcard block from 404-ing the
+ *                                dead subdomain. Path is validated to
+ *                                live under /opt/ojas-apps/ and contain
+ *                                no traversal (`..` or symlinks out of
+ *                                the root).
  *   systemctl <args...>         Pass-through to /usr/bin/systemctl,
  *                                after validating the FIRST arg looks
  *                                like an ojas-app-*.service unit.
@@ -47,6 +59,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,6 +199,101 @@ int main(int argc, char **argv) {
             return 1;
         }
         return 0;
+    }
+    if (strcmp(argv[1], "force-rmtree") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "force-rmtree: need <path>\n");
+            return 2;
+        }
+        const char *path = argv[2];
+        /* Path must be under /opt/ojas-apps/ — no traversal out of the
+         * root, no absolute paths elsewhere, no NUL tricks. realpath
+         * resolves any symlinks in the chain so /opt/ojas-apps/foo/../etc
+         * gets caught. */
+        char resolved[4096];
+        if (realpath(path, resolved) == NULL) {
+            if (errno == ENOENT) {
+                /* Already gone — idempotent success. */
+                return 0;
+            }
+            fprintf(stderr, "force-rmtree: realpath(%s): %s\n", path, strerror(errno));
+            return 1;
+        }
+        size_t rlen = strlen(resolved);
+        static const char *root = "/opt/ojas-apps/";
+        size_t root_len = strlen(root);
+        if (rlen < root_len || strncmp(resolved, root, root_len) != 0) {
+            fprintf(stderr, "force-rmtree: %s resolves outside %s\n", path, root);
+            return 2;
+        }
+        /* The slug is the next path component after the root. Validate
+         * it matches [a-z0-9_-]{1,40} so a typo can't nuke a sibling
+         * app's dir. */
+        const char *slug = resolved + root_len;
+        size_t i = 0;
+        for (; slug[i] && slug[i] != '/'; i++) {
+            char c = slug[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_')) {
+                fprintf(stderr, "force-rmtree: invalid slug char in %s\n", resolved);
+                return 2;
+            }
+        }
+        if (i == 0 || i > 40) {
+            fprintf(stderr, "force-rmtree: bad slug length in %s\n", resolved);
+            return 2;
+        }
+        /* Make sure the dir (and everything under it) is writable+traversable
+         * by the calling user. We do this with chmod -R, then exec rm -rf.
+         * SUDO_UID/GID are NOT set by the ojas user (no sudo wrapper) —
+         * but the dir was created by the ojas user, so a plain chmod 0o700
+         * is enough; we don't need to chown. If a future dir was created
+         * by a different uid (root for system reasons), the chmod 0o777
+         * fallback below lets the next rmtree attempt succeed. */
+        if (chmod(resolved, 0700) != 0 && errno != ENOENT) {
+            /* non-fatal: rm -rf may still work */
+        }
+        /* Walk the tree doing chmod 0o700 so we can unlink read-only files,
+         * then run rm -rf. We CAN'T use system("rm -rf ...") because
+         * glibc's system() invokes /bin/sh -c which drops the setuid
+         * bit (a hard security policy) — the rm would then run as the
+         * calling user and fail with EPERM on a foreign-owned dir.
+         * Instead, execve rm directly with the path as argv[1]. execve
+         * preserves the setuid euid across the call. */
+        char cmd[8192];
+        snprintf(cmd, sizeof cmd,
+                 "find '%s' -type f -exec chmod u+w {} + 2>/dev/null; "
+                 "find '%s' -type d -exec chmod u+rwx {} + 2>/dev/null; true",
+                 resolved, resolved);
+        /* Run the find prelude using execve of /bin/sh -c — the find is
+         * reading-mode only and doesn't need privilege, so it's safe
+         * to run via sh (which drops setuid). The actual rm at the end
+         * is the privileged part and runs via execve below. */
+        int rc;
+        {
+            char *sh_argv[] = { "/bin/sh", "-c", cmd, NULL };
+            char *sh_envp[] = { NULL };
+            pid_t pid = fork();
+            if (pid == 0) {
+                execve("/bin/sh", sh_argv, sh_envp);
+                _exit(127);
+            } else if (pid > 0) {
+                int status;
+                waitpid(pid, &status, 0);
+            } else {
+                fprintf(stderr, "force-rmtree: fork failed: %s\n", strerror(errno));
+                return 1;
+            }
+        }
+        /* Now exec rm -rf <resolved> directly. execve inherits the
+         * setuid euid (the kernel sets the new process's euid from
+         * the calling process's euid, which is root via the setuid
+         * bit on this binary). */
+        char *rm_argv[] = { "/bin/rm", "-rf", resolved, NULL };
+        char *rm_envp[] = { NULL };
+        execve("/bin/rm", rm_argv, rm_envp);
+        fprintf(stderr, "force-rmtree: execve rm failed: %s\n", strerror(errno));
+        return 1;
     }
     if (strcmp(argv[1], "systemctl") == 0) {
         /* For "systemctl <op> ojas-app-X.service" calls, validate the

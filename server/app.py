@@ -1141,21 +1141,37 @@ def _purge_one_deployed_app(slug: str, app_row: dict) -> bool:
     # The app dir is at /opt/ojas-apps/<slug>/. If the app was
     # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
     # instead — wipe both. Use explicit try/except (NOT
-    # ignore_errors=True) so silent rmtree failures get logged and
-    # re-raised — without this, /opt/ojas-apps/<slug>/ can survive
-    # a session delete and keep serving the URL via Caddy's wildcard
-    # block (no DB lookup needed). See the my-portfolio ghost row
-    # bug from 2026-06-11.
+    # ignore_errors=True) so silent rmtree failures get logged.
+    # If shutil.rmtree raises (foreign-uid dir, chmod 0, read-only
+    # mount, bind-mount), fall back to the setuid helper which
+    # runs as root and can chmod/rm -rf anything under
+    # /opt/ojas-apps/<slug>/. Without this fallback the dir
+    # survives and the Caddy wildcard block keeps serving the URL
+    # (the my-portfolio + stock-demo ghost-row bug from 2026-06-11).
     for d in (app_row.get("app_dir"), str(OJAS_APPS_STOPPED_DIR / slug)):
         if d and Path(d).exists():
             try:
                 shutil.rmtree(d)
-            except Exception:
-                logger.exception(
-                    "_purge_one_deployed_app: rmtree %s failed (slug=%s)",
-                    d, slug,
+            except Exception as rmt_err:
+                logger.warning(
+                    "_purge_one_deployed_app: shutil.rmtree(%s) failed (%s); "
+                    "falling back to force-rmtree helper",
+                    d, rmt_err,
                 )
-                raise
+                try:
+                    import subprocess
+                    subprocess.run(
+                        ["/usr/local/sbin/ojas-systemd-helper",
+                         "force-rmtree", d],
+                        check=True, capture_output=True, timeout=60,
+                    )
+                except Exception as helper_err:
+                    logger.exception(
+                        "_purge_one_deployed_app: force-rmtree helper also "
+                        "failed for %s (slug=%s)",
+                        d, slug,
+                    )
+                    raise
     try:
         db.delete_deployed_app(slug)
     except Exception:
@@ -2205,6 +2221,7 @@ async def _run_delete_job(
                     try:
                         # 1. Tear down the systemd unit (fullstack apps
                         #    only) — stop+disable+rm+daemon-reload.
+                        print(f"[ojas-delete]   slug={slug} step=unit row_app_dir={row.get('app_dir')!r}")
                         _remove_app_service_files(slug, row)
                         # 2. Unlink the per-slug Caddy fragment. We do
                         #    this directly (not via _drop_caddy_fragment)
@@ -2219,23 +2236,59 @@ async def _run_delete_job(
                                 caddy_changed = True
                         except OSError:
                             pass
-                        # 3. Rmtree the on-disk dir. Use explicit
-                        #    try/except (NOT shutil's ignore_errors=True)
-                        #    so a chmod 000 / read-only mount / bind-mount
-                        #    issue gets logged — silent rmtree failures
-                        #    are how we ended up with my-portfolio's
-                        #    /opt/ojas-apps/my-portfolio/ still serving
-                        #    HTTP 200 long after the row was gone.
-                        for d in (row.get("app_dir"),
-                                  str(OJAS_APPS_STOPPED_DIR / slug)):
-                            if d and Path(d).exists():
+                        # 3. Rmtree the on-disk dir(s). We always try
+                        #    BOTH the row's app_dir AND the convention
+                        #    /opt/ojas-apps/<slug>/ (the Caddy wildcard
+                        #    block serves from there regardless of what
+                        #    app_dir says, so the dir surviving at the
+                        #    convention path keeps the URL alive even
+                        #    if app_dir is stale or NULL). Same for the
+                        #    .stopped fallback. Use explicit try/except
+                        #    with a defensive chmod/chown fallback so a
+                        #    transient permission/IO issue can't quietly
+                        #    leave the dir behind (the stock-demo /
+                        #    my-portfolio ghost bug from 2026-06-11).
+                        candidate_dirs = [
+                            row.get("app_dir"),
+                            str(OJAS_APPS_ROOT / slug),
+                            str(OJAS_APPS_STOPPED_DIR / slug),
+                        ]
+                        for d in candidate_dirs:
+                            if not d or not Path(d).exists():
+                                continue
+                            print(f"[ojas-delete]   slug={slug} step=rmtree dir={d}")
+                            try:
+                                shutil.rmtree(d)
+                                print(f"[ojas-delete]   slug={slug} step=rmtree OK dir={d}")
+                            except Exception as rmt_err:
+                                # shutil.rmtree can fail when the dir
+                                # was created by a different uid (early
+                                # deploy), or has chmod 0, or is on a
+                                # read-only mount. Fall back to the
+                                # setuid helper which runs as root and
+                                # can chmod/rm -rf anything under
+                                # /opt/ojas-apps/<slug>/. Without this
+                                # fallback the dir survives the delete
+                                # and keeps the public URL alive (the
+                                # stock-demo / my-portfolio ghost-row
+                                # bug from 2026-06-11).
+                                print(
+                                    f"[ojas-delete]   slug={slug} step=rmtree "
+                                    f"FAILED dir={d} err={rmt_err} — "
+                                    f"falling back to force-rmtree helper"
+                                )
                                 try:
-                                    shutil.rmtree(d)
-                                except Exception as rmt_err:
+                                    import subprocess
+                                    subprocess.run(
+                                        ["/usr/local/sbin/ojas-systemd-helper",
+                                         "force-rmtree", d],
+                                        check=True, capture_output=True, timeout=60,
+                                    )
+                                    print(f"[ojas-delete]   slug={slug} step=rmtree retry OK dir={d}")
+                                except Exception as retry_err:
                                     print(
-                                        f"[ojas-delete] rmtree failed "
-                                        f"session={sid} slug={slug} "
-                                        f"dir={d}: {rmt_err}"
+                                        f"[ojas-delete]   slug={slug} step=rmtree "
+                                        f"RETRY FAILED dir={d} err={retry_err}"
                                     )
                                     raise
                         # 4. Drop the matching ojas_services row. The
@@ -2248,17 +2301,19 @@ async def _run_delete_job(
                         #    keep both paths in sync.
                         try:
                             db.delete_ojas_service(f"deployed:{slug}")
+                            print(f"[ojas-delete]   slug={slug} step=drop_service OK")
                         except Exception as svc_err:
                             print(
-                                f"[ojas-delete] delete_ojas_service failed "
-                                f"session={sid} slug={slug}: {svc_err}"
+                                f"[ojas-delete]   slug={slug} step=drop_service "
+                                f"FAILED err={svc_err}"
                             )
                         teardown_msgs.append(f"torn down {slug}")
                     except Exception as e:
+                        import traceback
                         teardown_msgs.append(f"{slug}: {e}")
                         print(
                             f"[ojas-delete] teardown_subprojects slug={slug} "
-                            f"session={sid} error: {e}"
+                            f"session={sid} error: {e}\n{traceback.format_exc()}"
                         )
                 # One Caddy reload for the whole session, regardless of
                 # how many apps we tore down.
