@@ -37,7 +37,7 @@ import type {
   TimelineBlock,
 } from "@/lib/types";
 import PlanPanel from "@/components/PlanPanel";
-import TurnCard from "@/components/TurnCard";
+import TurnCard, { ActiveTurnCard } from "@/components/TurnCard";
 import RunningTotals from "@/components/RunningTotals";
 import { formatDuration } from "@/lib/format";
 
@@ -1227,7 +1227,7 @@ export default function ChatPage() {
             <TurnCard key={t.id} turn={t} index={i} />
           ))}
           {currentTurn && (
-            <TurnCard turn={currentTurn} index={turns.length} />
+            <ActiveTurnCard turn={currentTurn} index={turns.length} />
           )}
           {turns.length === 0 && !currentTurn && !loadErr && (
             <EmptyState />

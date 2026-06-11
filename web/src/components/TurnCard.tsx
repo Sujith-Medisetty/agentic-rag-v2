@@ -29,7 +29,7 @@
 //
 //   ───── 23.4s · 5 tools · 1 agent · 3.4k in / 1.2k out ─────
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type {
   Turn, ToolEvent, FileChange, AgentRecord, CommitRecord, TimelineBlock, LlmCall,
 } from "@/lib/types";
@@ -41,7 +41,12 @@ import { formatDuration } from "@/lib/format";
 // TurnCard
 // ============================================================================
 
-export default function TurnCard({ turn, index }: { turn: Turn; index: number }) {
+// TurnCard is the per-turn renderer used in two places:
+//   - the historical list (turns.map) — wrapped in React.memo so non-active
+//     turns skip re-render when only the active turn changed
+//   - the live tail (currentTurn) — ActiveTurnCard (non-memo) so the active
+//     turn always re-renders as events stream in
+function TurnCardImpl({ turn, index }: { turn: Turn; index: number }) {
   // Build a lookup of orchestrator-level tools so the timeline's `tool` blocks
   // can resolve their current ToolEvent state (status, duration, preview)
   // without each block having to carry a copy.
@@ -98,11 +103,24 @@ export default function TurnCard({ turn, index }: { turn: Turn; index: number })
   );
 }
 
+// Memoized default export: shallow-prop comparison is correct because
+// ChatPage builds `turn`/`turn.tools`/`turn.agents` once per event and
+// reuses the same references for unchanged historical turns. With memo,
+// only the active turn (passed to <ActiveTurnCard>) re-renders per event.
+const TurnCard = memo(TurnCardImpl);
+export default TurnCard;
+
+// Non-memoized named export for the live-tail card. The active turn
+// re-renders on every WS event by design (text streams, tool results
+// patch) — memo would never skip it anyway since `turn` is a new ref
+// every event, so we use a plain component to make the intent obvious.
+export const ActiveTurnCard = TurnCardImpl;
+
 // ============================================================================
 // TimelineBlockRow — dispatch on block.kind to render the right component.
 // ============================================================================
 
-function TimelineBlockRow({
+function TimelineBlockRowImpl({
   block, toolById, agents, isStreaming,
 }: {
   block: TimelineBlock;
@@ -131,6 +149,7 @@ function TimelineBlockRow({
       return <LlmCallBlock inputTokens={block.inputTokens} outputTokens={block.outputTokens} cacheReadTokens={block.cacheReadTokens ?? 0} cacheCreationTokens={block.cacheCreationTokens ?? 0} />;
   }
 }
+const TimelineBlockRow = memo(TimelineBlockRowImpl);
 
 // ============================================================================
 // LlmCallBlock — chronological marker for one model call inside the turn.
@@ -141,7 +160,7 @@ function TimelineBlockRow({
 // paying full price on ~10% of the input.
 // ============================================================================
 
-function LlmCallBlock({
+function LlmCallBlockImpl({
   inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
 }: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }) {
   // Right-aligned, borderless, subtle. Used to mark every model call inside a
@@ -175,6 +194,7 @@ function LlmCallBlock({
     </div>
   );
 }
+const LlmCallBlock = memo(LlmCallBlockImpl);
 
 // ============================================================================
 // SubAgentCallsBreakdown — collapsible per-call token list shown inside a
@@ -182,7 +202,7 @@ function LlmCallBlock({
 // default; the card stays compact unless the user wants the detail.
 // ============================================================================
 
-function SubAgentCallsBreakdown({ calls }: { calls: LlmCall[] }) {
+function SubAgentCallsBreakdownImpl({ calls }: { calls: LlmCall[] }) {
   const [open, setOpen] = useState(false);
   const totalIn  = calls.reduce((a, c) => a + c.inputTokens, 0);
   const totalOut = calls.reduce((a, c) => a + c.outputTokens, 0);
@@ -228,13 +248,14 @@ function SubAgentCallsBreakdown({ calls }: { calls: LlmCall[] }) {
     </div>
   );
 }
+const SubAgentCallsBreakdown = memo(SubAgentCallsBreakdownImpl);
 
 // ============================================================================
 // TextBlockView — response prose, rendered as markdown so headings, bold,
 // tables, code blocks, etc. format correctly instead of showing raw syntax.
 // ============================================================================
 
-function TextBlockView({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+function TextBlockViewImpl({ text, isStreaming }: { text: string; isStreaming: boolean }) {
   return (
     <div className="relative">
       <Markdown text={text} />
@@ -242,6 +263,7 @@ function TextBlockView({ text, isStreaming }: { text: string; isStreaming: boole
     </div>
   );
 }
+const TextBlockView = memo(TextBlockViewImpl);
 
 // ============================================================================
 // ThinkingBlockView — collapsible inline. Short label by default; click to
@@ -249,7 +271,7 @@ function TextBlockView({ text, isStreaming }: { text: string; isStreaming: boole
 // so it's unmistakably "internal reasoning, not the answer".
 // ============================================================================
 
-function ThinkingBlockView({ text }: { text: string }) {
+function ThinkingBlockViewImpl({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   return (
     <div>
@@ -270,13 +292,14 @@ function ThinkingBlockView({ text }: { text: string }) {
     </div>
   );
 }
+const ThinkingBlockView = memo(ThinkingBlockViewImpl);
 
 // ============================================================================
 // LiveProgress — ticking stats card shown while a turn is still streaming.
 // Mirrors TurnFooter's layout so the final swap (live → final) is seamless.
 // ============================================================================
 
-function LiveProgress({ turn }: { turn: Turn }) {
+function LiveProgressImpl({ turn }: { turn: Turn }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 250);
@@ -334,8 +357,9 @@ function LiveProgress({ turn }: { turn: Turn }) {
     </div>
   );
 }
+const LiveProgress = memo(LiveProgressImpl);
 
-function LiveStat({
+function LiveStatImpl({
   label, value, valueClass = "text-text",
 }: { label: string; value: string; valueClass?: string }) {
   return (
@@ -347,10 +371,12 @@ function LiveStat({
     </div>
   );
 }
+const LiveStat = memo(LiveStatImpl);
 
 function Divider() {
   return <span className="text-subtle">·</span>;
 }
+// memo would be a no-op for an empty-props component, so leave Divider plain.
 
 function formatTokensCompact(n: number): string {
   if (n < 1000) return String(n);
@@ -362,7 +388,7 @@ function formatTokensCompact(n: number): string {
 // Turn divider — sans eyebrow "TURN 3 · 09:42:15" with a thin connecting line
 // ============================================================================
 
-function TurnDivider({ index, startedAt }: { index: number; startedAt: number }) {
+function TurnDividerImpl({ index, startedAt }: { index: number; startedAt: number }) {
   return (
     <div className="mb-5 flex items-center gap-3">
       <span className="font-sans text-[10px] font-bold uppercase tracking-[0.22em] text-accent">
@@ -375,10 +401,11 @@ function TurnDivider({ index, startedAt }: { index: number; startedAt: number })
     </div>
   );
 }
+const TurnDivider = memo(TurnDividerImpl);
 
 // ---- Tool ----------------------------------------------------------------
 
-function ToolNode({ tool }: { tool: ToolEvent }) {
+function ToolNodeImpl({ tool }: { tool: ToolEvent }) {
   // Preview can be up to ~500 chars from the backend; show only the first
   // line truncated to 110 chars by default with a "show more" toggle so the
   // tree stays compact but the full output is one click away. Double-click
@@ -445,10 +472,11 @@ function ToolNode({ tool }: { tool: ToolEvent }) {
     </div>
   );
 }
+const ToolNode = memo(ToolNodeImpl);
 
 // LiveDuration — ticks every 250ms while running, freezes when ended.
 // Used on tools AND agents so any in-flight item shows real-time elapsed.
-function LiveDuration({
+function LiveDurationImpl({
   startedAt, endedAt, running,
 }: { startedAt: number; endedAt?: number; running: boolean }) {
   const [now, setNow] = useState(() => Date.now());
@@ -464,8 +492,9 @@ function LiveDuration({
     </span>
   );
 }
+const LiveDuration = memo(LiveDurationImpl);
 
-function StatusIcon({ status }: { status: "running" | "done" | "error" }) {
+function StatusIconImpl({ status }: { status: "running" | "done" | "error" }) {
   if (status === "running") {
     return <span className="text-warn animate-pulse-soft text-tx-xs">⏳</span>;
   }
@@ -474,10 +503,11 @@ function StatusIcon({ status }: { status: "running" | "done" | "error" }) {
   }
   return <span className="text-success text-tx-xs">✓</span>;
 }
+const StatusIcon = memo(StatusIconImpl);
 
 // ---- File change ---------------------------------------------------------
 
-function FileNode({ file }: { file: FileChange }) {
+function FileNodeImpl({ file }: { file: FileChange }) {
   const [open, setOpen] = useState(false);
   const { add, rem } = countDiffLines(file.diff);
   const isCreate = file.kind === "create";
@@ -531,6 +561,7 @@ function FileNode({ file }: { file: FileChange }) {
     </div>
   );
 }
+const FileNode = memo(FileNodeImpl);
 
 function countDiffLines(diff: string): { add: number; rem: number } {
   let add = 0, rem = 0;
@@ -548,7 +579,7 @@ function countDiffLines(diff: string): { add: number; rem: number } {
 // yet, so we show the agent header (type/description/model) clearly and
 // surface its output file when it lands. Status drives the right-side icon.
 
-function AgentNode({ agent }: { agent: AgentRecord }) {
+function AgentNodeImpl({ agent }: { agent: AgentRecord }) {
   const isDone = agent.status === "completed";
   const isFail = agent.status === "failed";
   const isRunning = agent.status === "running";
@@ -655,11 +686,12 @@ function AgentNode({ agent }: { agent: AgentRecord }) {
     </div>
   );
 }
+const AgentNode = memo(AgentNodeImpl);
 
 
 // ---- Commit --------------------------------------------------------------
 
-function CommitNode({ commit }: { commit: CommitRecord }) {
+function CommitNodeImpl({ commit }: { commit: CommitRecord }) {
   const skipped = !commit.sha;
   return (
     <div className="rounded-md px-1 py-0.5">
@@ -696,6 +728,7 @@ function CommitNode({ commit }: { commit: CommitRecord }) {
     </div>
   );
 }
+const CommitNode = memo(CommitNodeImpl);
 
 // ============================================================================
 // Helpers
