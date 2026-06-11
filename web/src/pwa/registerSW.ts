@@ -45,6 +45,23 @@ export function registerSW(): void {
   wb.addEventListener("controlling", () => {
     if (reloaded) return;
     reloaded = true;
+    // Wipe ANY leftover Workbox runtime caches from older SW builds before
+    // reloading. Older builds had different runtimeCaching rules — an
+    // even older build may have cached /api/admin/services, and a stale
+    // cache entry there makes the admin panel show "ghost" deployed apps
+    // that have already been deleted server-side. The current config
+    // marks /api/* as NetworkOnly, so nuking the legacy cache buckets
+    // is safe — they'll just get re-created from the (now non-cached)
+    // network responses. See the BookWise ghost-row bug from 2026-06.
+    if ("caches" in self) {
+      caches.keys()
+        .then((keys) => Promise.all(
+          keys
+            .filter((k) => k.startsWith("workbox-precache") || k === "app-shell-html" || k === "app-shell-assets")
+            .map((k) => caches.delete(k)),
+        ))
+        .catch(() => { /* non-fatal; reload will still happen */ });
+    }
     window.location.reload();
   });
 
