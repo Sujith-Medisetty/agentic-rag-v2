@@ -53,6 +53,12 @@ MAX_INSTRUCTION_FILE_CHARS = 4_000
 MAX_TOTAL_INSTRUCTION_CHARS = 12_000
 MAX_GIT_DIFF_CHARS = 50_000
 
+# Tail of `.ojas-fixlog.md` (auto-appended on every edit) to surface in the
+# dynamic system-prompt suffix. ~4k chars / ~1k tokens — matches the
+# instruction-file cap. Newer fixes are appended at the bottom, so the
+# tail slice is the most-recent trail.
+FIX_LOG_MAX_CHARS = 4_000
+
 # ---------------------------------------------------------------------------
 # Static sections (verbatim from prompt.rs)
 # ---------------------------------------------------------------------------
@@ -1562,6 +1568,51 @@ def render_plan_section(workspace: str) -> str:
         # Never break the prompt build on a malformed todo file.
         return ""
 
+
+def render_fix_log_section(workspace: str) -> str:
+    """Render the tail of `<workspace>/.ojas-fixlog.md` as a compact
+    markdown section.
+
+    The fix log is auto-appended by the `edit_file` and `write_file` tools
+    on every edit (see `_append_fix_log` in `tools/wrappers.py`). It lives
+    on disk, NOT in the conversation, and is therefore immune to
+    auto-compaction — the regex summary in
+    `memory.checkpointer._summarize_messages` truncates edits to 15
+    entries, which would lose ~85% of the trail for a 100-bug session.
+    The log on disk preserves the full trail verbatim.
+
+    We surface the *tail* (newest N lines) in the dynamic system-prompt
+    suffix so the next LLM call sees recent fixes verbatim. Older fixes
+    remain in the file and are one `Read .ojas-fixlog.md` call away.
+
+    Returns "" when the file is missing/empty/malformed — the empty
+    path is a no-op for sessions with no edits yet, and never breaks
+    the prompt build on a malformed log.
+
+    Cap: `FIX_LOG_MAX_CHARS` (~4k chars / ~1k tokens), matching the
+    instruction-file budget. Newer fixes are appended at the bottom, so
+    `body[-FIX_LOG_MAX_CHARS:]` is the right slice to surface.
+    """
+    if not workspace:
+        return ""
+    p = Path(workspace) / ".ojas-fixlog.md"
+    try:
+        if not p.exists():
+            return ""
+        body = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    if not body.strip():
+        return ""
+    tail = body[-FIX_LOG_MAX_CHARS:]
+    return (
+        "# Fix log (auto-appended on every edit — survives compaction)\n\n"
+        "One line per `edit_file` / `write_file` call. Newest at the "
+        "bottom. Use `Read .ojas-fixlog.md` to see the full log if the "
+        "tail shown here is truncated.\n\n"
+        f"```\n{tail}```\n"
+    )
+
 # ---------------------------------------------------------------------------
 # SystemPromptBuilder
 # ---------------------------------------------------------------------------
@@ -1670,6 +1721,14 @@ class SystemPromptBuilder:
         plan_section = render_plan_section(workspace_for_plan)
         if plan_section:
             sections.append(plan_section)
+        # Fix log — same dynamic-suffix placement as the plan. Tail-only
+        # (newest N lines) so it doesn't bloat the live window, but the
+        # full file is on disk and immune to compaction. The next LLM
+        # call that needs to enumerate past fixes can `Read
+        # .ojas-fixlog.md` to see the full history.
+        fix_log_section = render_fix_log_section(workspace_for_plan)
+        if fix_log_section:
+            sections.append(fix_log_section)
         if self.project_context is not None:
             sections.append(render_project_context(self.project_context))
             if self.project_context.instruction_files:

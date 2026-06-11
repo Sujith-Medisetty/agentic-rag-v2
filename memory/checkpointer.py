@@ -274,6 +274,19 @@ def _summarize_messages(messages: list) -> str:
             + ", ".join(f"{n}×{name}" for name, n in ctr.most_common(8))
         )
 
+    # Pointer to the durable per-workspace fix log on disk. The regex
+    # summary above is lossy (15-edit cap), so a long session — say
+    # 100 bug fixes — would lose ~85% of the trail here. The full trail
+    # lives in `<workspace>/.ojas-fixlog.md` and is one `Read` away;
+    # the dynamic system-prompt suffix surfaces the tail automatically,
+    # but mentioning the path here means the next turn has a fallback
+    # even if the dynamic section was missed.
+    parts.append(
+        "\nFix trail: see `.ojas-fixlog.md` in the workspace for "
+        "one-line summaries of every `edit_file` call (this list is "
+        "auto-appended and survives compaction)."
+    )
+
     return "\n".join(parts) or "Previous conversation."
 
 def _compact_messages(messages: list) -> list:

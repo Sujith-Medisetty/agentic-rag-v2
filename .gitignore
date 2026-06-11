@@ -29,6 +29,7 @@ agents/templates/**/backend/data/
 .agentic-rag/            # web backend state
 .clawd-agents/           # spawned sub-agent manifests
 .clawd-todos.json        # per-workspace todo list
+.ojas-fixlog.md          # per-workspace edit trail (auto-appended by edit_file / write_file)
 
 # Secrets — .env holds API keys + root password, never goes to git.
 # See .env.example for the variable names a fresh clone needs to set.

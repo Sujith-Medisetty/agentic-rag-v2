@@ -22,6 +22,7 @@ import functools
 import inspect
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -312,10 +313,73 @@ def write_file(path: str, content: str) -> str:
         _hook_runner.post_tool_use(
             "write_file", json.dumps({"path": path}), f"{verb}: {result.filePath}"
         )
+        # Append to the durable per-workspace fix log. Same rationale as
+        # `edit_file` above — survives auto-compaction. Skip "create"
+        # cases: a brand-new file isn't a "fix", and the log is meant to
+        # capture the trail of edits to existing code.
+        if result.type != "create":
+            _append_fix_log(result.filePath, content)
         return f"{verb}: {result.filePath} ({len(result.content)} bytes)"
     except Exception as e:
         _hook_runner.post_tool_failure("write_file", json.dumps({"path": path}), str(e))
         return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Fix log — durable per-workspace edit trail
+# ---------------------------------------------------------------------------
+#
+# Every successful `edit_file` (and `write_file` overwriting an existing file)
+# appends a one-line summary to `<workspace>/.ojas-fixlog.md`. The log lives
+# on disk, so it survives auto-compaction — the compaction summary in
+# `memory/checkpointer._summarize_messages` truncates edits to 15 entries,
+# which would lose ~85% of the trail for a 100-bug session. The next LLM
+# call that needs to enumerate past fixes can `Read .ojas-fixlog.md` and
+# see the full history verbatim.
+#
+# Best-effort: any I/O failure (read-only mount, disk full, permission
+# error) is swallowed. The fix log is a runtime nicety, not a correctness
+# boundary — a logging failure must never turn a successful edit into a
+# tool result that says "Error: …".
+#
+# File is gitignored (see /.gitignore, alongside .clawd-todos.json) so it
+# stays out of source control.
+_FIX_LOG_NAME = ".ojas-fixlog.md"
+_FIX_LOG_PREVIEW_CHARS = 200  # one-line cap; matches the regex summary
+
+
+def _append_fix_log(file_path: str, new_string: str) -> None:
+    """Append a one-line fix-trail entry for a successful edit.
+
+    Args:
+        file_path: The path that was edited (relative or absolute). The
+            fix log lives at `<cwd>/.ojas-fixlog.md` — the agent runs
+            in the project root, so cwd == workspace.
+        new_string: The new content that replaced the old. We log a
+            single-line preview of this (newlines → " ⏎ "), truncated
+            to `_FIX_LOG_PREVIEW_CHARS` chars so the log stays readable.
+    """
+    try:
+        workspace = Path.cwd()
+        # Cap per-line to keep the log readable. Most bug fixes fit in
+        # one short diff. Truncate at 200 chars with a trailing ellipsis.
+        preview = (new_string or "").replace("\n", " ⏎ ")[:_FIX_LOG_PREVIEW_CHARS]
+        if len(new_string or "") > _FIX_LOG_PREVIEW_CHARS:
+            preview += "…"
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        line = f"- {ts}  `{file_path}`: → `{preview}`\n"
+        log = workspace / _FIX_LOG_NAME
+        # mkdir(parents=True, exist_ok=True) is a no-op when the workspace
+        # already exists (the common case); only does work on a fresh
+        # workspace where the user is editing a brand-new project.
+        workspace.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        # Never break the tool result on a logging failure.
+        pass
+
+
 @tool("edit_file", args_schema=EditFileInput)
 def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
     """Make a precise text replacement in an existing file. Strongly preferred over `write_file` for any change to an existing file.
@@ -361,6 +425,12 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
             diff=diff_text, bytes_count=len(updated),
         ))
         out = f"Edited: {result.filePath}\nReplacements: {reps}"
+        # Append to the durable per-workspace fix log. Lives on disk, so it
+        # survives auto-compaction (the regex summary in
+        # `memory.checkpointer._summarize_messages` truncates edits to 15
+        # entries, which would lose ~85% of the trail for a 100-bug
+        # session). Best-effort, never raises.
+        _append_fix_log(result.filePath, new_string)
         _hook_runner.post_tool_use("edit_file", json.dumps(inp), out)
         return out
     except Exception as e:
