@@ -248,34 +248,37 @@ def _hb_state(counter: int, *calls: tuple[str, str]) -> dict:
 
 def test_heartbeat_allows_calls_below_threshold():
     state = _hb_state(0, ("1", "bash"))
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert synth == []
-    assert state["tools_since_last_todowrite"] == 1
+    # The function returns the new counter (it does NOT mutate state —
+    # the caller is responsible for merging the value into its return
+    # so LangGraph's reducer system persists it).
+    assert new_counter == 1
     assert _remaining_call_names(state) == ["bash"]
 
 
 def test_heartbeat_allows_exactly_threshold_calls():
     # Counter at 4, one more call goes to 5 — still allowed.
     state = _hb_state(4, ("1", "bash"))
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert synth == []
-    assert state["tools_since_last_todowrite"] == 5
+    assert new_counter == 5
 
 
 def test_heartbeat_blocks_call_at_threshold():
     # Counter at 5, next call should be blocked.
     state = _hb_state(5, ("1", "bash"))
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert len(synth) == 1
     # Blocked call does NOT increment the counter (it didn't run).
-    assert state["tools_since_last_todowrite"] == 5
+    assert new_counter == 5
     # The call is stripped from the AIMessage.
     assert _remaining_call_names(state) == []
 
 
 def test_heartbeat_blocked_message_includes_counter():
     state = _hb_state(7, ("1", "bash"))
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert len(synth) == 1
     # The message should mention the count so the model knows how long
     # it's been. We accept any reasonable phrasing as long as the number
@@ -291,9 +294,9 @@ def test_heartbeat_todowrite_always_allowed_and_does_not_increment():
     # counter increment for it is wrong (the drain zeroes it via the
     # sentinel — incrementing here would partially undo that).
     state = _hb_state(5, ("1", "TodoWrite"))
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert synth == []
-    assert state["tools_since_last_todowrite"] == 5  # unchanged
+    assert new_counter == 5  # unchanged from the input
     assert _remaining_call_names(state) == ["TodoWrite"]
 
 
@@ -304,12 +307,12 @@ def test_heartbeat_blocks_only_first_call_in_message():
     # will see the BLOCKED in the next iteration and call TodoWrite
     # (or ExitPlanMode, etc.) in response.
     state = _hb_state(5, ("1", "bash"), ("2", "read_file"), ("3", "write_file"))
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert len(synth) == 1
     # bash is blocked, the rest are allowed.
     assert _remaining_call_names(state) == ["read_file", "write_file"]
     # Counter: 5 (no increment for blocked) + 2 (read_file + write_file) = 7.
-    assert state["tools_since_last_todowrite"] == 7
+    assert new_counter == 7
 
 
 def test_heartbeat_does_not_increment_for_blocked_calls():
@@ -317,14 +320,17 @@ def test_heartbeat_does_not_increment_for_blocked_calls():
     # doesn't count, so the next allowed call is also at the threshold,
     # not threshold+1.
     state = _hb_state(5, ("1", "bash"))
-    _gate_for_todo_heartbeat(state)
-    assert state["tools_since_last_todowrite"] == 5
-    # Run the pre-scan again on the SAME state (idempotency).
-    _gate_for_todo_heartbeat(state)
-    assert state["tools_since_last_todowrite"] == 5
+    _synth1, c1 = _gate_for_todo_heartbeat(state)
+    assert c1 == 5
+    # Re-apply on the SAME state, simulating LangGraph merging the
+    # previous return into the state. (In a real run the caller does
+    # this; here we do it manually.)
+    state["tools_since_last_todowrite"] = c1
+    _synth2, c2 = _gate_for_todo_heartbeat(state)
+    assert c2 == 5  # still 5, because the second-blocked call doesn't count either
 
 
-def test_heartbeat_threshold_zero_disables(monkeypatch=None):
+def test_heartbeat_threshold_zero_disables():
     # Simulate OJAS_TODO_HEARTBEAT=0. We test by patching the threshold
     # directly because the module-level constant is captured at import.
     import agents.nodes as nodes_mod
@@ -332,12 +338,10 @@ def test_heartbeat_threshold_zero_disables(monkeypatch=None):
     nodes_mod._HEARTBEAT_THRESHOLD = 0
     try:
         state = _hb_state(100, ("1", "bash"), ("2", "write_file"))
-        synth = _gate_for_todo_heartbeat(state)
+        synth, new_counter = _gate_for_todo_heartbeat(state)
         assert synth == []
-        # Counter still increments even when disabled? No — the function
-        # returns early when threshold <= 0, so the counter is unchanged.
-        # (Not a useful state in practice; the disabled mode is meant
-        # for "trust the prompt" debugging.)
+        # Disabled: function returns early, counter is unchanged from input.
+        assert new_counter == 100
     finally:
         nodes_mod._HEARTBEAT_THRESHOLD = original
 
@@ -358,7 +362,7 @@ def test_heartbeat_composes_with_plan_mode():
         )],
     }
     _gate_for_plan_mode(state)
-    _gate_for_todo_heartbeat(state)
+    _synth_hb, _new_counter = _gate_for_todo_heartbeat(state)
     blocked = _blocked_in_state(state)
     # 1 from plan-mode (write_file) + 1 from heartbeat (read_file).
     assert len(blocked) == 2
@@ -370,7 +374,10 @@ def test_heartbeat_composes_with_plan_mode():
 
 def test_heartbeat_no_ai_message_is_noop():
     state = {"tools_since_last_todowrite": 5, "messages": []}
-    assert _gate_for_todo_heartbeat(state) == []
+    synth, new_counter = _gate_for_todo_heartbeat(state)
+    assert synth == []
+    # Counter unchanged because the function returned early.
+    assert new_counter == 5
 
 
 def test_heartbeat_no_tool_calls_is_noop():
@@ -378,9 +385,10 @@ def test_heartbeat_no_tool_calls_is_noop():
         "tools_since_last_todowrite": 5,
         "messages": [AIMessage(content="hello", tool_calls=[])],
     }
-    assert _gate_for_todo_heartbeat(state) == []
-    # Counter is unchanged because the function returns early.
-    assert state["tools_since_last_todowrite"] == 5
+    synth, new_counter = _gate_for_todo_heartbeat(state)
+    assert synth == []
+    # Counter unchanged because the function returned early.
+    assert new_counter == 5
 
 
 def test_heartbeat_default_counter_when_key_missing():
@@ -388,9 +396,9 @@ def test_heartbeat_default_counter_when_key_missing():
     # total=False, so .get(..., 0) must return 0 and the function must
     # not blow up.
     state = {"messages": [_ai_with_calls(("1", "bash"))]}
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert synth == []
-    assert state["tools_since_last_todowrite"] == 1
+    assert new_counter == 1
 
 
 def test_heartbeat_full_lifecycle_matches_session_reality():
@@ -402,33 +410,35 @@ def test_heartbeat_full_lifecycle_matches_session_reality():
     # Block 1: 5 reads, then TodoWrite is forced on the 6th.
     for i in range(5):
         state["messages"] = [_ai_with_calls((str(i), "read_file"))]
-        synth = _gate_for_todo_heartbeat(state)
+        synth, new_counter = _gate_for_todo_heartbeat(state)
         assert synth == [], f"unexpected block at iteration {i}"
+        state["tools_since_last_todowrite"] = new_counter
     # 6th call would be blocked.
     state["messages"] = [_ai_with_calls(("6", "write_file"))]
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert len(synth) == 1  # blocked
     # Counter unchanged at 5 because the blocked call didn't run.
-    assert state["tools_since_last_todowrite"] == 5
+    assert new_counter == 5
 
-    # The model calls TodoWrite (drain zeroes the counter for the next
-    # AIMessage).
+    # The model calls TodoWrite. The drain (in node_agent) is what
+    # zeroes the counter, not the pre-scan. We simulate that here.
     state["messages"] = [_ai_with_calls(("7", "TodoWrite"))]
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert synth == []
-    # Counter unchanged in this AIMessage; the drain happens in
-    # node_agent and materialises the reset on the next iteration.
-    # The pre-scan here is a no-op for TodoWrite; the test of the
-    # drain lives in the integration flow, not in this unit test.
+    # The pre-scan doesn't reset; the drain does. So in this isolated
+    # test, the counter is unchanged. The integration flow sees the
+    # drain in node_agent and the reset value flows into the next
+    # pre-scan.
+    state["tools_since_last_todowrite"] = 0  # simulate the drain
 
     # Sanity: after 5 more calls, the cycle repeats.
-    state["tools_since_last_todowrite"] = 0  # simulate the drain
     for i in range(5):
         state["messages"] = [_ai_with_calls((str(i), "bash"))]
-        synth = _gate_for_todo_heartbeat(state)
+        synth, new_counter = _gate_for_todo_heartbeat(state)
         assert synth == [], f"unexpected block at iteration {i+5}"
+        state["tools_since_last_todowrite"] = new_counter
     state["messages"] = [_ai_with_calls(("x", "write_file"))]
-    synth = _gate_for_todo_heartbeat(state)
+    synth, new_counter = _gate_for_todo_heartbeat(state)
     assert len(synth) == 1
 
 

@@ -87,7 +87,7 @@ def _current_thread_id() -> str:
         return ""
 
 
-def _drain_plan_mode_into_state(state: RunnerState) -> None:
+def _drain_plan_mode_into_state(state: RunnerState) -> dict:
     """Drain pending per-thread tool-body flag flips into state. Called
     at the top of node_agent so subsequent reads in the same iteration
     (and the following node_tools pre-scan) see the same view.
@@ -97,21 +97,29 @@ def _drain_plan_mode_into_state(state: RunnerState) -> None:
       - `reset_todo_counter` (bool, one-shot): TodoWrite body signals
         that the heartbeat counter in state should be zeroed.
 
-    Mutates `state` in place — the checkpointer sees the change on the
-    next checkpoint write."""
+    Returns a dict of drained values for the caller to merge into its
+    return. Mutates `state` in place as a best-effort hint for any
+    in-iteration reads, but the return value is the source of truth —
+    plain field mutations on `state` are NOT reliably persisted by
+    LangGraph's reducer system; only fields returned from the node
+    function are merged."""
     from tools.wrappers import _drain_turn_flags
     thread_id = _current_thread_id()
+    drained: dict = {}
     if not thread_id:
-        return
+        return drained
     pending = _drain_turn_flags(thread_id)
     for key, value in pending.items():
         # Only known flags are materialised — anything else is a bug
         # we want to surface, not silently drop.
         if key == "plan_mode_active" and isinstance(value, bool):
             state["plan_mode_active"] = value
+            drained["plan_mode_active"] = value
         elif key == "reset_todo_counter" and value is True:
             # One-shot: TodoWrite fired, zero the heartbeat counter.
             state["tools_since_last_todowrite"] = 0
+            drained["tools_since_last_todowrite"] = 0
+    return drained
 
 
 def _gate_for_plan_mode(state: RunnerState) -> list[ToolMessage]:
@@ -195,34 +203,40 @@ def _gate_for_plan_mode(state: RunnerState) -> list[ToolMessage]:
 _HEARTBEAT_THRESHOLD = int(os.getenv("OJAS_TODO_HEARTBEAT", "5"))
 
 
-def _gate_for_todo_heartbeat(state: RunnerState) -> list[ToolMessage]:
+def _gate_for_todo_heartbeat(state: RunnerState) -> tuple[list[ToolMessage], int]:
     """Block non-TodoWrite tool calls when the model has gone too long
     without updating the plan. Mirrors the shape of `_gate_for_plan_mode`
     so the two pre-scans compose cleanly (plan-mode first, then heartbeat).
+
+    Returns a tuple of (synthesised_blocked_messages, new_counter). The
+    caller MUST include `new_counter` in its return dict — plain field
+    mutations on `state` are NOT persisted by LangGraph's reducer
+    system; only fields returned from the node function are merged.
+    (The pre-scan in node_tools would be a no-op otherwise — the counter
+    would be 0 on every call and the threshold would never be reached.)
 
     Logic:
       - Read state['tools_since_last_todowrite'] (default 0).
       - For each non-TodoWrite tool call in the last AIMessage, in order:
         - If counter >= THRESHOLD and we haven't already blocked a call
           in this pre-scan pass: strip + synthesise BLOCKED message.
-          (Once we've blocked once, the rest of the AIMessage's calls
-          are allowed through — the model needs to do *something* to
-          react to the BLOCKED, and a TodoWrite is the canonical fix.)
-          Wait, scratch that — the model emits ONE AIMessage per turn.
-          The pre-scan runs once per AIMessage. If the threshold is hit,
-          we block the FIRST non-TodoWrite call only; the rest are
-          allowed. Reason: blocking the entire AIMessage would mean the
-          model has no way to actually respond in that turn.
+          Reason: blocking the entire AIMessage would mean the model has
+          no way to actually respond in that turn.
         - Else: allow + increment counter.
       - Blocked calls do NOT increment the counter (they didn't run).
 
-    Mutates state['tools_since_last_todowrite'] and the AIMessage's
-    tool_calls. Idempotent in the sense that a second call with the
-    same state and AIMessage has the same effect.
+    Mutates the AIMessage's tool_calls (same as plan-mode). The
+    synthesised ToolMessages are also appended to state['messages']
+    so the UI sees them in the activity stream immediately; LangGraph's
+    add_messages reducer will persist them across the node boundary.
     """
     threshold = _HEARTBEAT_THRESHOLD
     if threshold <= 0:
-        return []  # disabled
+        # Disabled: pass the counter through unchanged so the caller's
+        # return is consistent. (The drain + TodoWrite reset still work;
+        # the heartbeat is just not enforced.)
+        counter = int(state.get("tools_since_last_todowrite") or 0)
+        return [], counter
     counter = int(state.get("tools_since_last_todowrite") or 0)
     messages = state.get("messages") or []
     last_ai: AIMessage | None = None
@@ -231,10 +245,10 @@ def _gate_for_todo_heartbeat(state: RunnerState) -> list[ToolMessage]:
             last_ai = m
             break
     if last_ai is None:
-        return []
+        return [], counter
     tool_calls = getattr(last_ai, "tool_calls", None) or []
     if not tool_calls:
-        return []
+        return [], counter
 
     # We allow at most ONE block per pre-scan pass. Once a TodoWrite
     # (or any other allowed call) comes through in the *next* AIMessage,
@@ -278,8 +292,11 @@ def _gate_for_todo_heartbeat(state: RunnerState) -> list[ToolMessage]:
 
     if blocked_once:
         last_ai.tool_calls = surviving
-    state["tools_since_last_todowrite"] = counter
-    return synthesised
+    # DO NOT mutate state['tools_since_last_todowrite'] here — LangGraph
+    # would discard the change. The caller MUST return the new counter
+    # in its return dict so the reducer system picks it up. (See the
+    # docstring above for the long version of this gotcha.)
+    return synthesised, counter
 
 # ---------------------------------------------------------------------------
 # Global config — set once at startup by server.app
@@ -1088,7 +1105,10 @@ def node_agent(state: RunnerState) -> dict:
     # they don't get a state handle; we materialise the pending flags here
     # so subsequent reads in this iteration (and the next node_tools call)
     # see the same view. No-op when nothing was flipped.
-    _drain_plan_mode_into_state(state)
+    # CRITICAL: merge the returned dict into our return value below —
+    # the state mutation alone is silently dropped by LangGraph's reducer
+    # system (same gotcha as the heartbeat counter).
+    drained = _drain_plan_mode_into_state(state)
 
     pause = _run_budget.check()
     if pause is not None:
@@ -1193,6 +1213,7 @@ def node_agent(state: RunnerState) -> dict:
     # orphans remain in checkpoint but the repair runs again next turn (cheap
     # and idempotent).
     return {
+        **drained,  # plan_mode_active / tools_since_last_todowrite reset
         "messages": [ai],
         "iterations": iterations,
         "system_prompt_pair": [static_base, dynamic_suffix],
@@ -1231,7 +1252,9 @@ def node_tools(state: RunnerState) -> dict:
     # sees both BLOCKED messages and the tool_done stream surfaces
     # both to the UI. The counter is reset to 0 by TodoWrite's body
     # via the tool-body micro-cache (drained at the top of node_agent).
-    _gate_for_todo_heartbeat(state)
+    # CRITICAL: the returned counter MUST be merged into the return
+    # dict below — mutating state[...] is silently dropped by LangGraph.
+    _synth_heartbeat, new_counter = _gate_for_todo_heartbeat(state)
 
     result = ToolNode(_tools()).invoke(state)
 
@@ -1253,4 +1276,9 @@ def node_tools(state: RunnerState) -> dict:
         )
         reporter.tool_done(name, content or "(no output)", error=is_error)
 
+    # Merge the heartbeat counter into the result so LangGraph's reducer
+    # system persists it. The state mutation in _gate_for_todo_heartbeat
+    # is a no-op from LangGraph's perspective — the only way to update
+    # a non-reduced field is to include it in the return value here.
+    result["tools_since_last_todowrite"] = new_counter
     return result

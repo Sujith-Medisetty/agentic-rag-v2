@@ -817,7 +817,8 @@ def TodoWrite(todos: list) -> str:
         # `tools_since_last_todowrite` counter. Without this, the
         # pre-scan in node_tools would block every non-TodoWrite call
         # after a few more iterations. The drain in node_agent turns
-        # this sentinel into a state assignment.
+        # this sentinel into a state assignment (and includes it in
+        # node_agent's return so LangGraph's reducer persists it).
         _set_turn_flag(
             _thread_id_from_reporter(),
             "reset_todo_counter",
