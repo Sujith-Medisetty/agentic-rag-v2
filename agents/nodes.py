@@ -38,6 +38,7 @@ from agents.prompt import SystemPromptBuilder, ProjectContext, current_model_nam
 from memory.checkpointer import (
     maybe_compact,
     _estimate_tokens as _estimate_msg_tokens,
+    _truncate_tool_result,
     CONTEXT_WINDOW_TOKENS,
 )
 from tools.wrappers import get_all_tools
@@ -730,6 +731,39 @@ def _repair_orphan_tool_calls(messages: list[BaseMessage]) -> list[BaseMessage]:
     return cleaned
 
 
+def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Return a new list with oversized ToolMessage bodies replaced by a
+    one-line pointer. Preserves the tool CALL (on the preceding AIMessage)
+    verbatim — the agent's intent is what matters, not the response body.
+
+    Cheap to run on every turn (O(n) over a list of ~80 messages); no
+    reason to cache it. Uses `model_copy(update=...)` (LangChain
+    `BaseMessage` has `model_copy` since langchain-core>=0.1) so the
+    checkpoint history isn't mutated in place — the on-disk record
+    keeps the full body, only the per-turn request gets the trimmed
+    view.
+    """
+    out: list[BaseMessage] = []
+    n_truncated = 0
+    for m in messages:
+        if isinstance(m, ToolMessage):
+            new_content = _truncate_tool_result(m.content)
+            if new_content is not m.content:
+                n_truncated += 1
+                out.append(m.model_copy(update={"content": new_content}))
+            else:
+                out.append(m)
+        else:
+            out.append(m)
+    if n_truncated:
+        import logging
+        logging.getLogger(__name__).info(
+            "[history-trim] truncated %d oversized tool result(s) for the live window",
+            n_truncated,
+        )
+    return out
+
+
 def node_agent(state: RunnerState) -> dict:
     """One model call = one
 
@@ -795,6 +829,13 @@ def node_agent(state: RunnerState) -> dict:
             )
         except Exception:
             pass
+
+    # Truncate oversized ToolMessage bodies so a single `Read` of a 30k-token
+    # log file doesn't bloat the live window for the rest of the session.
+    # The agent can re-invoke the tool if it needs the fresh content; we keep
+    # the tool CALL (path + args) on the preceding AIMessage verbatim so the
+    # agent's intent stays intact. Cheap O(n) pass; no need to cache it.
+    history = _truncate_live_history(history)
 
     # Publish the current context-used % so the UI's progress bar stays
     # accurate even on turns where no compaction happened.

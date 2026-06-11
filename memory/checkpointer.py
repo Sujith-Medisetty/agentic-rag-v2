@@ -23,20 +23,39 @@ from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
 
 # --- Auto-compaction thresholds ---
 # COMPACT_BUDGET: when estimated message-list tokens cross this, auto-compact
-# fires BEFORE the next LLM call. Lowered from 100K → 80K (with a UI warning
-# tier at 50K) so we catch the ~80K outliers (chess, splitwise, instacart)
-# without over-compacting cheap sessions (calculator, portfolio, snake).
+# fires BEFORE the next LLM call. Lowered from 80K → 50K (with a UI warning
+# tier at 25% of CONTEXT_WINDOW) so the live window stays lean for the
+# 30+ turn salon-build sessions — the long tail of edits otherwise piles
+# up and we'd be re-sending the same stale file contents on every call.
 #
 # CONTEXT_WINDOW: the working context the LLM can actually reason over. Used
 # for the UI context-used percentage bar — Claude Code-style "75% used"
 # indicator. MiniMax-M3-512k nominally fits 512K, but quality holds up to
 # ~200K. Tune via env if needed.
-DEFAULT_AUTO_COMPACT_INPUT_TOKENS = 80_000
-AUTO_COMPACT_THRESHOLD_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
+DEFAULT_AUTO_COMPACT_INPUT_TOKENS = 50_000
+AUTO_COMPACT_THRESHOLD_ENV_VAR = "OJAS_AUTO_COMPACT_INPUT_TOKENS"  # was CLAUDE_CODE_…
+AUTO_COMPACT_THRESHOLD_LEGACY_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 CONTEXT_WINDOW_TOKENS = 200_000  # what the UI's 100% fill represents
 
 CHARS_PER_TOKEN = 4
-PRESERVE_RECENT = 4  # CompactionConfig.preserve_recent_messages
+# How many of the most-recent messages to keep VERBATIM when compacting.
+# Was 4 (≈1 turn) — that forced constant re-derivation on long sessions.
+# 80 ≈7 turns is the sweet spot: the agent can see its recent reasoning
+# + tool calls + the file edits from the last few iterations without
+# either re-reading them or watching them get summarised away mid-thought.
+PRESERVE_RECENT = 80
+PRESERVE_RECENT_ENV_VAR = "OJAS_PRESERVE_RECENT"
+
+# --- Tool-result truncation ---
+# A single `Read` of a 30k-token log file would otherwise fill most of the
+# live window with stale content. The agent can re-`Read` if it needs the
+# fresh content — we keep the tool CALL (path + args) verbatim, since
+# that's the agent's intent, but replace the oversized result body with
+# a one-line pointer. ~200 tokens / 800 chars keeps the live window lean
+# while still letting the agent recognise "oh, that's the file I just
+# read" via the head snippet.
+TOOL_RESULT_TRUNCATE_AT_CHARS = 800
+TOOL_RESULT_TRUNCATE_ENV_VAR = "OJAS_TRUNCATE_TOOL_RESULT_AT"
 
 # COMPACT_DIRECT_RESUME_INSTRUCTION (compact.rs)
 COMPACT_PREAMBLE = (
@@ -52,14 +71,70 @@ COMPACT_DIRECT_RESUME_INSTRUCTION = (
 )
 
 def _auto_compact_threshold() -> int:
-    """Auto-compaction token threshold."""
-    raw = os.getenv(AUTO_COMPACT_THRESHOLD_ENV_VAR)
+    """Auto-compaction token threshold.
+
+    Reads `OJAS_AUTO_COMPACT_INPUT_TOKENS` (new name) first, then
+    `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` (legacy alias, kept for
+    backward compatibility with anything that still sets the old var)."""
+    for var in (AUTO_COMPACT_THRESHOLD_ENV_VAR, AUTO_COMPACT_THRESHOLD_LEGACY_ENV_VAR):
+        raw = os.getenv(var)
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+    return DEFAULT_AUTO_COMPACT_INPUT_TOKENS
+
+
+def _preserve_recent() -> int:
+    """How many of the most-recent messages to keep verbatim when compacting.
+    Override at runtime via `OJAS_PRESERVE_RECENT` (e.g. to bump down on
+    especially tight budgets, or up for code-review style sessions where
+    the agent loops over the same diff repeatedly)."""
+    raw = os.getenv(PRESERVE_RECENT_ENV_VAR)
     if raw:
         try:
             return int(raw)
         except ValueError:
             pass
-    return DEFAULT_AUTO_COMPACT_INPUT_TOKENS
+    return PRESERVE_RECENT
+
+
+def _tool_result_truncate_at() -> int:
+    """Char threshold above which a ToolMessage body gets collapsed to a
+    one-line pointer. Override at runtime via `OJAS_TRUNCATE_TOOL_RESULT_AT`."""
+    raw = os.getenv(TOOL_RESULT_TRUNCATE_ENV_VAR)
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return TOOL_RESULT_TRUNCATE_AT_CHARS
+
+
+def _truncate_tool_result(content) -> str:
+    """Replace an oversized tool result body with a one-line pointer so the
+    live window stays small. The agent can re-`Read` / re-invoke the tool
+    if it needs the actual content again.
+
+    Keeping the first ~200 chars in the pointer is enough for the agent
+    to recognise the content (file header, first error line, command
+    output's first row). Non-string content (lists, dicts) is returned
+    unchanged — that's typically structured tool output (file diffs, JSON
+    responses) that should not be silently truncated.
+    """
+    if not isinstance(content, str):
+        return content
+    limit = _tool_result_truncate_at()
+    if len(content) <= limit:
+        return content
+    head = content[:limit].replace("\n", " ⏎ ")
+    approx_tokens = len(content) // CHARS_PER_TOKEN
+    return (
+        f"[output truncated: {len(content):,} chars (~{approx_tokens:,} tokens); "
+        f"first {limit} chars: {head!r}… "
+        f"re-invoke the tool to see the full body]"
+    )
 
 def _estimate_block_tokens(block: Any) -> int:
     """Per content-block estimate.
@@ -237,7 +312,8 @@ def _compact_messages(messages: list) -> list:
     there's nothing to summarise (cut walked all the way to 0), returns
     the original list unchanged.
     """
-    if len(messages) <= PRESERVE_RECENT:
+    preserve = _preserve_recent()
+    if len(messages) <= preserve:
         return messages
 
     # Pre-filter: drop any SystemMessage in the history. They don't belong
@@ -245,10 +321,10 @@ def _compact_messages(messages: list) -> list:
     # is in `state["system_prompt_pair"]` and rebuilt every turn), but if
     # a stale one slipped in we don't want to leak it through compaction.
     messages = [m for m in messages if not isinstance(m, SystemMessage)]
-    if len(messages) <= PRESERVE_RECENT:
+    if len(messages) <= preserve:
         return messages
 
-    cut = len(messages) - PRESERVE_RECENT
+    cut = len(messages) - preserve
 
     # Walk the cut BACKWARDS past any tool-result blocks so we don't
     # summarise the AIMessage that owns them while keeping its result
@@ -320,7 +396,7 @@ def maybe_compact(messages: list) -> tuple[list, bool]:
     Returns `(messages, did_compact)`. If `did_compact` is True, the caller
     should publish a `compacting` event to the UI.
     """
-    if len(messages) <= PRESERVE_RECENT:
+    if len(messages) <= _preserve_recent():
         return messages, False
     if _estimate_tokens(messages) < _auto_compact_threshold():
         return messages, False
@@ -374,7 +450,7 @@ class CompactingCheckpointer(SqliteSaver):
 
         # preserve_recent messages AND the estimate crosses the threshold.
         if (
-            len(messages) > PRESERVE_RECENT
+            len(messages) > _preserve_recent()
             and _estimate_tokens(messages) >= _auto_compact_threshold()
         ):
             compacted = _compact_messages(messages)
