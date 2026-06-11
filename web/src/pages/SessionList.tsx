@@ -1,22 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams, useNavigate } from "react-router-dom";
 import {
-  projectsApi, sessionsApi, sessionApi, ApiError,
+  projectsApi, sessionsApi, sessionApi,
   type DeleteJobStart,
 } from "@/lib/api";
 import type { Project, Session } from "@/lib/types";
 import ProjectSettings from "@/components/ProjectSettings";
-import { useSessions } from "@/lib/sessionContext";
 import DeleteProgressModal from "@/components/DeleteProgressModal";
+
+// Sessions per page. The page is always sorted newest-first by the
+// server (ORDER BY last_active_at DESC) so page 1 is the most recent.
+const PAGE = 50;
 
 export default function SessionList() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
   const [project, setProject] = useState<Project | null>(null);
-  // Sessions live in the shared SessionContext — same one the chat page
-  // writes to. We just read here; the chat page's WS handler does the
-  // writes via context.
-  const sessionsStore = useSessions();
+  // Local list state — this page does NOT write to the shared
+  // SessionContext. The sidebar in Workspace loads its own list on
+  // mount, and the SessionList page lives at /p/:id/sessions (no
+  // sidebar), so mutating the shared context from here would just
+  // risk clobbering the sidebar's own (possibly larger) list with
+  // a 50-item subset.
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -44,20 +52,28 @@ export default function SessionList() {
     existingId: string;
     existingName: string;
   } | null>(null);
+
+  // Fetch the project (once) + the current page of sessions.
+  // Re-runs when the projectId or the offset (page) changes.
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
+    setLoading(true);
+    setErr(null);
     (async () => {
-      setLoading(true);
-      setErr(null);
       try {
-        const [p, ss] = await Promise.all([
-          projectsApi.get(projectId),
-          sessionsApi.list(projectId),
+        // Project is fetched only on the first page (offset === 0) so
+        // paging back/forward doesn't re-fetch the project header.
+        const [p, page] = await Promise.all([
+          offset === 0
+            ? projectsApi.get(projectId)
+            : Promise.resolve(project),
+          sessionsApi.list(projectId, { limit: PAGE, offset }),
         ]);
         if (cancelled) return;
-        setProject(p);
-        sessionsStore.setAll(projectId, ss);
+        if (p) setProject(p);
+        setSessions(page.items);
+        setTotal(page.total);
       } catch (e: any) {
         if (!cancelled) setErr(e?.message ?? "failed to load");
       } finally {
@@ -67,7 +83,10 @@ export default function SessionList() {
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+    // `project` is intentionally NOT in the dep list — we only use it
+    // as a placeholder on subsequent pages to avoid an extra request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, offset]);
 
   // Focus the input when edit mode opens.
   useEffect(() => {
@@ -76,6 +95,13 @@ export default function SessionList() {
       editInputRef.current.select();
     }
   }, [editingId]);
+
+  // Pagination helpers. Newest-first means page 1 is offset 0 and
+  // the "Next" button moves to higher offsets (older sessions).
+  const pageCount = Math.max(1, Math.ceil(total / PAGE));
+  const currentPage = Math.floor(offset / PAGE) + 1;
+  const hasPrev = offset > 0;
+  const hasNext = offset + PAGE < total;
 
   const startNew = async () => {
     if (!projectId) return;
@@ -117,13 +143,19 @@ export default function SessionList() {
     try {
       const { session, wasSuffixed, actualName } =
         await sessionsApi.renameWithSufStatus(s.id, trimmed);
-      sessionsStore.rename(s.id, session.name);
+      // Update the row in the local list so the new name shows
+      // immediately. If the new name collides with another session
+      // we don't show the conflict modal here (the server suffix
+      // already handled it); the toast below tells the user.
+      setSessions((prev) =>
+        prev.map((x) => (x.id === s.id ? session : x)),
+      );
       if (wasSuffixed && actualName !== trimmed) {
-        // Server auto-suffixed the name to avoid a collision (X → X-2,
-        // X-3, …). Show a small toast telling the user what happened.
-        sessionsStore.setToast({
-          message: `Renamed to "${actualName}" — "${trimmed}" was already taken.`,
-        });
+        setErr(
+          `Renamed to "${actualName}" — "${trimmed}" was already taken.`,
+        );
+        // Clear the message after a few seconds so it doesn't linger.
+        setTimeout(() => setErr(null), 4000);
       }
       cancelEdit();
     } catch (e: any) {
@@ -143,13 +175,23 @@ export default function SessionList() {
     )) return;
     // 1. Cancel any in-flight agent turn (best-effort).
     sessionApi.cancel(s.id).catch(() => {});
-    // 2. Optimistic sidebar removal.
-    sessionsStore.remove(s.id);
+    // 2. Optimistic local removal.
+    setSessions((prev) => prev.filter((x) => x.id !== s.id));
+    setTotal((t) => Math.max(0, t - 1));
     // 3. Kick off the async server-side teardown + open the progress
-    //    modal.
+    //    modal. If the current page just became empty AND there are
+    //    older sessions to show, jump back one page so the user
+    //    isn't stranded on an empty page.
     try {
       const job = await sessionApi.startDelete(s.id);
       setDeletingSession({ id: s.id, name: s.name, job });
+      setSessions((prev) => {
+        if (prev.length === 0 && offset > 0) {
+          // Will re-trigger the fetch effect.
+          setOffset((o) => Math.max(0, o - PAGE));
+        }
+        return prev;
+      });
     } catch (e: any) {
       setErr(e?.message ?? "delete failed to start");
     }
@@ -206,7 +248,7 @@ export default function SessionList() {
         </div>
       )}
 
-      {!loading && !err && (projectId ? sessionsStore.list(projectId) : []).length === 0 && (
+      {!loading && !err && total === 0 && (
         <div className="glass-card-soft p-10 text-center">
           <div className="text-base text-text">No sessions yet</div>
           <div className="mt-1 text-sm text-muted">
@@ -216,7 +258,7 @@ export default function SessionList() {
       )}
 
       <div className="grid gap-2.5">
-        {(projectId ? sessionsStore.list(projectId) : []).map((s) => {
+        {sessions.map((s) => {
           const isEditing = editingId === s.id;
           return (
             <div
@@ -309,6 +351,39 @@ export default function SessionList() {
           );
         })}
       </div>
+
+      {/* Pagination controls. The page is sorted newest-first, so
+          "Next" moves to older sessions (higher offset) and "Prev"
+          moves to newer sessions. The label is always "Page X of Y ·
+          N total" so the user knows exactly how many sessions exist
+          and where they are in the list. */}
+      {!loading && !err && total > 0 && (
+        <div className="flex flex-col items-center justify-between gap-2 pt-2 sm:flex-row">
+          <div className="text-tx-xs text-muted">
+            Page {currentPage} of {pageCount} · {total} {total === 1 ? "session" : "sessions"} total
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setOffset((o) => Math.max(0, o - PAGE))}
+              disabled={!hasPrev}
+              className="btn-ghost min-h-touch disabled:opacity-40"
+              aria-label="Previous page (newer sessions)"
+            >
+              ← Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => setOffset((o) => o + PAGE)}
+              disabled={!hasNext}
+              className="btn-ghost min-h-touch disabled:opacity-40"
+              aria-label="Next page (older sessions)"
+            >
+              Next →
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Name-conflict modal — a real React dialog, not a native alert(). */}
       {conflict && (

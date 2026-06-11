@@ -82,24 +82,27 @@ export default function Workspace() {
         if (cancelled) return;
         setProject(p);
         setMe(user);
-        const ss = await sessionsApi.list(p.id);
+        const ss = await sessionsApi.list(p.id, { limit: 100, offset: 0 });
         if (cancelled) return;
+        // The /sessions endpoint now returns a paginated { items, total,
+        // ... } envelope. The sidebar only needs the rows.
+        const apiItems = ss.items;
         // Merge: if startNew() ran while we were loading, the new session
         // is already in the context (from sessions.add()) but not in
-        // `ss` (a stale snapshot). Keep locally-added sessions so they
+        // `apiItems` (a stale snapshot). Keep locally-added sessions so they
         // don't vanish from the sidebar.
         sessionsStore.setAll(p.id, (() => {
-          const apiIds = new Set(ss.map((s) => s.id));
+          const apiIds = new Set(apiItems.map((s) => s.id));
           const localOnly = sessionsStore.list(p.id).filter(
             (s) => !apiIds.has(s.id),
           );
-          return localOnly.length > 0 ? [...localOnly, ...ss] : ss;
+          return localOnly.length > 0 ? [...localOnly, ...apiItems] : apiItems;
         })());
         // Auto-open the most recent session when the user lands with no
         // session selected (e.g. logging in on a new device). Use the ref
         // so we read the *current* URL param, not the stale closure value.
-        if (ss.length > 0 && !activeSessionIdRef.current) {
-          navigate(`/s/${ss[0].id}`, { replace: true });
+        if (apiItems.length > 0 && !activeSessionIdRef.current) {
+          navigate(`/s/${apiItems[0].id}`, { replace: true });
         }
       } catch (e) {
         if (!cancelled) setLoadErr(e instanceof ApiError ? e.message : "failed to load workspace");
