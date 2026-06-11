@@ -1156,6 +1156,7 @@ export default function ChatPage() {
         sessionName={turns[0]?.userPrompt ?? "app"}
         apps={deployedApps}
         freshBuild={!!lastDetected?.fresh_build}
+        freshMtime={lastDetected?.fresh_mtime ?? 0}
         // Per-slug live deploy progress (set by deploy_progress WS
         // event). Pills use this to render a "Step 3/12 — Building…"
         // chip so the user sees the 10-30s fullstack deploy making
@@ -2304,17 +2305,16 @@ function BuildReadyBanner({
 // ============================================================================
 
 function DeployStrip({
-  sessionId, sessionName, apps, freshBuild, deployProgress, onUpdateClicked,
+  sessionId, sessionName, apps, freshBuild, freshMtime, deployProgress, onUpdateClicked,
   onDeployed, onDeleted, onToggled,
   showModal: showModalProp, onShowModalChange,
 }: {
   sessionId: string;
   sessionName: string;
   apps: DeployedApp[];
-  // True when a fresh build exists for this session (i.e. dist/ mtime is
-  // newer than the most recent last_redeploy_at of any of this session's
-  // apps). Drives whether the per-pill Update button + the strip's
-  // "+ Deploy new" button are enabled.
+  // Session-wide "any build newer than any deploy" flag. Used by the
+  // strip's "+ Deploy new" button. For the per-pill "🔄 Update"
+  // button, see `freshMtime` below.
   freshBuild: boolean;
   // Per-slug live progress. Empty when nothing is deploying. Pills
   // look themselves up by slug.
@@ -2326,6 +2326,14 @@ function DeployStrip({
   onDeployed: (app: DeployedApp) => void;
   onDeleted: (slug: string) => void;
   onToggled: (slug: string, state: string) => void;
+  // mtime (epoch seconds) of the freshest dist in this session, or
+  // 0 if none. Pills use this to compute per-app staleness
+  // (freshMtime > this_app.last_redeploy_at) so only the genuinely
+  // stale pills show "🔄 Update". The session-wide `freshBuild` flag
+  // is still used for the strip's "+ Deploy new" button — that one
+  // asks "is there *anything* to publish?", which is the right
+  // question for an additive publish, not a per-app refresh.
+  freshMtime: number;
   // The build-ready banner also opens this dialog. State is hoisted
   // to ChatPage so the banner and the strip share one source of
   // truth. If the prop is omitted (e.g. in tests), we fall back to
@@ -2356,6 +2364,7 @@ function DeployStrip({
                 key={a.slug}
                 app={a}
                 freshBuild={freshBuild}
+                freshMtime={freshMtime}
                 // Pass the live progress slice for this slug (if
                 // any). Pills fall back to local `busy` state when
                 // the progress event hasn't arrived yet.
@@ -2411,14 +2420,20 @@ function hostApps(): string {
 }
 
 function DeployedAppPill({
-  app, freshBuild, progress, onUpdateClicked,
+  app, freshBuild, freshMtime, progress, onUpdateClicked,
   onDeployed, onDeleted, onToggled,
 }: {
   app: DeployedApp;
-  // True when this session has a fresh build that the user could push
-  // to this app. Drives the per-pill "🔄 Update" button so the
-  // action only appears when there's actually something to update.
+  // Session-wide "any dist newer than any deploy" flag. Used by the
+  // strip's "+ Deploy new" button — the right question there is
+  // "is there *anything* to publish?", not "is *this* app stale?".
   freshBuild: boolean;
+  // mtime (epoch seconds) of the freshest dist in this session, or
+  // 0 when there's no build. The pill uses this to compute
+  // `appFreshBuild` — per-app, not session-wide — so a just-deployed
+  // pill shows "✓ Up to date" even when the session still has a
+  // fresh build waiting for the other pills.
+  freshMtime: number;
   // Live progress for THIS slug (undefined if not currently
   // deploying). Shows up in the pill's "Step N/12 — Building…" chip
   // so the user sees the 10-30s fullstack deploy making progress
@@ -2441,6 +2456,25 @@ function DeployedAppPill({
   const [busy, setBusy] = useState(false);
   const state = app.state ?? "running";
   const isOff = state === "stopped" || state === "error";
+  // Per-app "this build is newer than my last deploy" — drives the
+  // per-pill "🔄 Update" button. The previous version used the
+  // session-wide `freshBuild` flag, which meant that after a single
+  // rebuild, EVERY pill in the strip showed "🔄 Update" — even the
+  // ones the user had just deployed. By comparing freshMtime against
+  // *this app's* last_redeploy_at, only the stale ones show Update.
+  // freshMtime === 0 means "no build yet" → no pill should claim
+  // there's something to push, regardless of last_redeploy_at.
+  const appFreshBuild = freshMtime > 0 && freshMtime > (app.last_redeploy_at ?? 0);
+  // Reset busy when the deploy settles. The parent clears
+  // `deployProgress[slug]` for this slug in BOTH the
+  // `deploy_complete` and `deploy_failed` WS handlers, so flipping
+  // from { phase, … } to undefined is the canonical "deploy is
+  // settled, refresh the row" signal. Without this, the pill would
+  // stay amber + "Deploying…" until the 60 s safety timeout fired,
+  // which made a successful 12 s fullstack deploy look frozen.
+  useEffect(() => {
+    if (busy && !progress) setBusy(false);
+  }, [busy, progress]);
   const remove = async () => {
     if (!confirm(`Take down ${app.slug}? The public URL will stop working.`)) return;
     try {
@@ -2601,7 +2635,7 @@ function DeployedAppPill({
             ? `${progress.phase} (${progress.steps_done}/${progress.steps_total})`
             : "Deploying…"}
         </span>
-      ) : freshBuild ? (
+      ) : appFreshBuild ? (
         <button
           type="button"
           onClick={update}
