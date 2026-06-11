@@ -228,11 +228,85 @@ def _reconcile_deployed_apps_on_boot() -> None:
                 slug = unit_name[len("ojas-app-"):-len(".service")]
                 _remove_app_service_files(slug, None)
                 reaped_units += 1
-        if reaped_fragments or reaped_staging or reaped_units:
+        # 3b. Dangling symlinks in multi-user.target.wants/. The glob
+        #     above only catches files directly in /etc/systemd/system/
+        #     (the canonical unit location). On boxes that predate the
+        #     current cleanup, the symlink in multi-user.target.wants/
+        #     survives even after the target unit file is gone. The
+        #     symlink is harmless (systemd auto-disables a broken link)
+        #     but we reap it for cleanliness, and so `systemctl list-unit-files`
+        #     stops showing it as a zombie.
+        #
+        #     Note: this dir is root-owned 0755, so the ojas user can't
+        #     unlink from it. Route through the setuid helper (the same
+        #     one used for Caddy reloads + unit writes) which validates
+        #     the name pattern and runs as root.
+        wants_dir = Path("/etc/systemd/system/multi-user.target.wants")
+        if wants_dir.exists():
+            for symlink in wants_dir.glob("ojas-app-*.service"):
+                try:
+                    if not symlink.resolve().exists():
+                        # Dangling — ask the helper to unlink it. The
+                        # helper re-validates the name + lstat/realpath
+                        # so this is safe to call for every symlink in
+                        # the dir (a live symlink is a no-op).
+                        import subprocess
+                        subprocess.run(
+                            ["/usr/local/sbin/ojas-systemd-helper",
+                             "rm-wants-symlink", symlink.name],
+                            check=False, capture_output=True, timeout=5,
+                        )
+                        reaped_units += 1
+                except OSError:
+                    pass
+        # 4. Orphan app dirs at /opt/ojas-apps/<slug>/. THIS is the
+        #    piece that was missing before — Caddy's wildcard block
+        #    serves ANY <slug>.<root> from /opt/ojas-apps/<slug>/ with
+        #    no DB lookup, so a dir that survives a session/user delete
+        #    keeps the URL alive. Reap any dir whose slug is not in
+        #    the deployed_apps table. We also reap /opt/ojas-apps/
+        #    .stopped/<slug>/ for the same reason (paused apps whose
+        #    row was deleted without first un-pausing).
+        reaped_orphan_dirs = 0
+        if OJAS_APPS_ROOT.exists():
+            for d in OJAS_APPS_ROOT.iterdir():
+                # Skip the meta dirs we want to keep:
+                #   .deploying/  -- in-flight deploy staging
+                #   .paused/     -- shared "this app is paused" page
+                #   .stopped/    -- paused apps land here (handled below)
+                if d.name.startswith("."):
+                    continue
+                if not d.is_dir():
+                    continue
+                if d.name in live_slugs:
+                    continue  # live app — leave it alone
+                # No matching DB row → orphan. rmtree so the Caddy
+                # wildcard block 404s the URL on the next request.
+                # ignore_errors=True so a single bad dir (chmod 000,
+                # NFS hiccup, bind-mount) doesn't block the rest.
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    reaped_orphan_dirs += 1
+                except OSError:
+                    pass
+        stopped_root = OJAS_APPS_STOPPED_DIR
+        if stopped_root.exists():
+            for d in stopped_root.iterdir():
+                if not d.is_dir():
+                    continue
+                if d.name in live_slugs:
+                    continue
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    reaped_orphan_dirs += 1
+                except OSError:
+                    pass
+        if reaped_fragments or reaped_staging or reaped_units or reaped_orphan_dirs:
             print(
                 f"[ojas] boot orphan cleanup: reaped {reaped_fragments} "
                 f"Caddy fragments, {reaped_staging} stale staging dirs, "
-                f"{reaped_units} orphan systemd units"
+                f"{reaped_units} orphan systemd units, "
+                f"{reaped_orphan_dirs} orphan app dirs"
             )
     except Exception:
         # Best-effort; if the reaper itself fails, the next deploy's
@@ -5054,6 +5128,38 @@ def admin_user_delete(
     except LookupError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
     return {"ok": True}
+
+
+@app.post("/api/admin/reap-orphans")
+def admin_reap_orphans(_root: dict = Depends(require_root)):
+    """Re-run the boot-time orphan reaper on demand. Idempotent.
+
+    Useful when:
+      • the backend has been up for a while and a partial crash left
+        orphan app dirs / Caddy fragments / systemd units behind
+      • a manual DB edit (e.g. dropping a `deployed_apps` row by hand)
+        left on-disk residue
+      • the user is asking "why is <slug>.<root> still serving?" and
+        the answer is "orphan dir" — clicking this kills the URL
+
+    Safe to call repeatedly. Returns 200 with a summary of what was
+    reaped (caddy fragments / staging dirs / systemd units / app dirs).
+
+    Why a separate endpoint instead of just restarting the backend:
+    a restart is heavy (drops in-flight agent turns), and the orphan
+    reaper is the ONLY thing in `_reconcile_deployed_apps_on_boot()`
+    that depends on the disk being dirty. Letting the admin trigger
+    it on demand means the fix is one click, not a service restart.
+    """
+    # _reconcile_deployed_apps_on_boot() prints its own summary to
+    # stdout. Capture the reaper output for the response so the admin
+    # sees what was actually cleaned up.
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        _reconcile_deployed_apps_on_boot()
+    return {"ok": True, "log": buf.getvalue()}
 
 @app.post("/api/admin/users/{user_id}/password")
 def admin_user_reset_password(

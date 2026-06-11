@@ -17,6 +17,15 @@
  *                                /etc/systemd/system/<name>. Validates
  *                                the name matches ojas-app-*.service.
  *   rm-unit <name>              Remove /etc/systemd/system/<name>
+ *   rm-wants-symlink <name>     Remove the symlink in
+ *                                /etc/systemd/system/multi-user.target.wants/
+ *                                pointing at ojas-app-<name>.service.
+ *                                Used by the boot orphan reaper to clean
+ *                                dangling wants/ entries (the dir is
+ *                                root-owned 0755, so non-root can't
+ *                                unlink from it). Only acts if the
+ *                                symlink exists AND its target does
+ *                                not — i.e. it's actually dangling.
  *   systemctl <args...>         Pass-through to /usr/bin/systemctl,
  *                                after validating the FIRST arg looks
  *                                like an ojas-app-*.service unit.
@@ -131,6 +140,47 @@ int main(int argc, char **argv) {
         }
         char dst[256];
         snprintf(dst, sizeof dst, "/etc/systemd/system/%s", argv[2]);
+        if (unlink(dst) != 0 && errno != ENOENT) {
+            fprintf(stderr, "unlink(%s): %s\n", dst, strerror(errno));
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(argv[1], "rm-wants-symlink") == 0) {
+        if (argc != 3) {
+            fprintf(stderr, "rm-wants-symlink: need <name>\n");
+            return 2;
+        }
+        if (!unit_name_valid(argv[2])) {
+            fprintf(stderr, "rm-wants-symlink: invalid unit name %s\n", argv[2]);
+            return 2;
+        }
+        char dst[512];
+        snprintf(dst, sizeof dst,
+            "/etc/systemd/system/multi-user.target.wants/%s", argv[2]);
+        /* Only unlink if (a) the symlink exists and (b) its target
+         * does NOT exist — i.e. it's a dangling symlink. We stat()
+         * the path through lstat (so we don't follow the symlink) and
+         * then the resolved path to see if the target is gone. If the
+         * symlink doesn't exist, return 0 (idempotent). If the symlink
+         * DOES exist AND its target exists, return 0 (don't unlink a
+         * live symlink). Only unlink in the dangling case. */
+        struct stat lst;
+        if (lstat(dst, &lst) != 0) {
+            if (errno == ENOENT) return 0;
+            fprintf(stderr, "lstat(%s): %s\n", dst, strerror(errno));
+            return 1;
+        }
+        if (!S_ISLNK(lst.st_mode)) {
+            /* not a symlink — leave it alone */
+            return 0;
+        }
+        char resolved[4096];
+        if (realpath(dst, resolved) != NULL) {
+            /* Target exists — this is a live symlink, don't touch it */
+            return 0;
+        }
+        /* Dangling — unlink. */
         if (unlink(dst) != 0 && errno != ENOENT) {
             fprintf(stderr, "unlink(%s): %s\n", dst, strerror(errno));
             return 1;
