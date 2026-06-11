@@ -301,12 +301,46 @@ def _reconcile_deployed_apps_on_boot() -> None:
                     reaped_orphan_dirs += 1
                 except OSError:
                     pass
-        if reaped_fragments or reaped_staging or reaped_units or reaped_orphan_dirs:
+        # 4b. Reap any ojas_services ghost row whose slug is no longer
+        #     live AND whose on-disk app dir is gone. The earlier ghost
+        #     reaper (in _register_ojas_services) only checks the DB —
+        #     if the deployed_apps row was dropped without dropping the
+        #     ojas_services row, the panel shows a "still running" entry
+        #     for an app whose dir is gone. Belt + suspenders: this
+        #     extra sweep drops the ojas_services row whenever the
+        #     dir on disk is missing, which is the truest source of
+        #     "this app is gone" (Caddy's wildcard serves from there).
+        reaped_ghost_services = 0
+        try:
+            with db._connect() as cx:
+                ghost_svcs = [
+                    r[0] for r in cx.execute(
+                        "SELECT id FROM ojas_services WHERE source = 'ojas-deployed'"
+                    )
+                    if r[0].split(":", 1)[1] not in live_slugs
+                ]
+                for gid in ghost_svcs:
+                    slug = gid.split(":", 1)[1]
+                    app_dir = OJAS_APPS_ROOT / slug
+                    stopped_dir = stopped_root / slug
+                    if app_dir.exists() or stopped_dir.exists():
+                        # Dir is still on disk — the orphan-dir reaper
+                        # above should have reaped it; if it didn't, we
+                        # don't either. Let the user notice and we'll
+                        # re-investigate.
+                        continue
+                    cx.execute("DELETE FROM ojas_services WHERE id = ?", (gid,))
+                    reaped_ghost_services += 1
+        except Exception:
+            pass
+        if (reaped_fragments or reaped_staging or reaped_units
+                or reaped_orphan_dirs or reaped_ghost_services):
             print(
                 f"[ojas] boot orphan cleanup: reaped {reaped_fragments} "
                 f"Caddy fragments, {reaped_staging} stale staging dirs, "
                 f"{reaped_units} orphan systemd units, "
-                f"{reaped_orphan_dirs} orphan app dirs"
+                f"{reaped_orphan_dirs} orphan app dirs, "
+                f"{reaped_ghost_services} ghost ojas_services rows"
             )
     except Exception:
         # Best-effort; if the reaper itself fails, the next deploy's
@@ -1106,16 +1140,22 @@ def _purge_one_deployed_app(slug: str, app_row: dict) -> bool:
         )
     # The app dir is at /opt/ojas-apps/<slug>/. If the app was
     # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
-    # instead — wipe both. ignore_errors=True on rmtree so a
-    # partially-mounted dir doesn't poison the rest of the batch.
+    # instead — wipe both. Use explicit try/except (NOT
+    # ignore_errors=True) so silent rmtree failures get logged and
+    # re-raised — without this, /opt/ojas-apps/<slug>/ can survive
+    # a session delete and keep serving the URL via Caddy's wildcard
+    # block (no DB lookup needed). See the my-portfolio ghost row
+    # bug from 2026-06-11.
     for d in (app_row.get("app_dir"), str(OJAS_APPS_STOPPED_DIR / slug)):
         if d and Path(d).exists():
             try:
-                shutil.rmtree(d, ignore_errors=True)
+                shutil.rmtree(d)
             except Exception:
                 logger.exception(
-                    "_purge_one_deployed_app: rmtree %s failed", d,
+                    "_purge_one_deployed_app: rmtree %s failed (slug=%s)",
+                    d, slug,
                 )
+                raise
     try:
         db.delete_deployed_app(slug)
     except Exception:
@@ -2125,8 +2165,43 @@ async def _run_delete_job(
                 app_rows = db.list_deployed_apps_for_session(sid)
                 teardown_msgs: list[str] = []
                 caddy_changed = False
-                for row in app_rows:
-                    slug = row["slug"]
+                # 3a. The DB may have ALREADY lost the deployed_apps row
+                #     (e.g. an FK cascade fired before this step ran, or a
+                #     previous run of the same job partially succeeded).
+                #     We can't enumerate those slugs from `app_rows`, so we
+                #     additionally scan ojas_services for any
+                #     `deployed:<slug>` row tagged with this session — that
+                #     covers the ghost-row case (the BookWise / my-portfolio
+                #     "URL still alive, panel still shows it" bug from
+                #     2026-06-11). The union of the two is the real cleanup
+                #     surface for this session.
+                with db._connect() as cx:   # noqa: SLF001
+                    svc_slugs = [
+                        r[0] for r in cx.execute(
+                            "SELECT id FROM ojas_services "
+                            "WHERE source = 'ojas-deployed' "
+                            "AND id IN (SELECT 'deployed:' || slug "
+                            "           FROM deployed_apps "
+                            "           WHERE source_session_id = ?)",
+                            (sid,),
+                        )
+                    ]
+                svc_slugs = [s.split(":", 1)[1] for s in svc_slugs]
+                db_slugs = [row["slug"] for row in app_rows]
+                all_slugs: list[str] = []
+                seen: set[str] = set()
+                for s in db_slugs + svc_slugs:
+                    if s not in seen:
+                        seen.add(s)
+                        all_slugs.append(s)
+                if all_slugs:
+                    print(
+                        f"[ojas-delete] teardown_subprojects session={sid} "
+                        f"slugs={all_slugs} (db_rows={len(db_slugs)}, "
+                        f"svc_rows={len(svc_slugs)})"
+                    )
+                for slug in all_slugs:
+                    row = next((r for r in app_rows if r["slug"] == slug), None) or {}
                     try:
                         # 1. Tear down the systemd unit (fullstack apps
                         #    only) — stop+disable+rm+daemon-reload.
@@ -2144,10 +2219,25 @@ async def _run_delete_job(
                                 caddy_changed = True
                         except OSError:
                             pass
-                        # 3. Rmtree the on-disk dir.
-                        for d in (row["app_dir"], str(OJAS_APPS_STOPPED_DIR / slug)):
+                        # 3. Rmtree the on-disk dir. Use explicit
+                        #    try/except (NOT shutil's ignore_errors=True)
+                        #    so a chmod 000 / read-only mount / bind-mount
+                        #    issue gets logged — silent rmtree failures
+                        #    are how we ended up with my-portfolio's
+                        #    /opt/ojas-apps/my-portfolio/ still serving
+                        #    HTTP 200 long after the row was gone.
+                        for d in (row.get("app_dir"),
+                                  str(OJAS_APPS_STOPPED_DIR / slug)):
                             if d and Path(d).exists():
-                                shutil.rmtree(d, ignore_errors=True)
+                                try:
+                                    shutil.rmtree(d)
+                                except Exception as rmt_err:
+                                    print(
+                                        f"[ojas-delete] rmtree failed "
+                                        f"session={sid} slug={slug} "
+                                        f"dir={d}: {rmt_err}"
+                                    )
+                                    raise
                         # 4. Drop the matching ojas_services row. The
                         #    Admin panel's services & ports view reads
                         #    from this table; a stale row here shows
@@ -2158,11 +2248,18 @@ async def _run_delete_job(
                         #    keep both paths in sync.
                         try:
                             db.delete_ojas_service(f"deployed:{slug}")
-                        except Exception:
-                            pass
+                        except Exception as svc_err:
+                            print(
+                                f"[ojas-delete] delete_ojas_service failed "
+                                f"session={sid} slug={slug}: {svc_err}"
+                            )
                         teardown_msgs.append(f"torn down {slug}")
                     except Exception as e:
                         teardown_msgs.append(f"{slug}: {e}")
+                        print(
+                            f"[ojas-delete] teardown_subprojects slug={slug} "
+                            f"session={sid} error: {e}"
+                        )
                 # One Caddy reload for the whole session, regardless of
                 # how many apps we tore down.
                 if caddy_changed:
