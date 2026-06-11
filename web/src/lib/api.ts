@@ -384,38 +384,14 @@ export const deployedAppsApi = {
 
 // ---- Sessions ------------------------------------------------------------
 
-// Paginated response from GET /api/projects/{id}/sessions. The server
-// returns a page (limit/offset) + the total row count so the UI can
-// render "Page X of Y · N total" without a second round trip. The page
-// is always sorted newest-first (ORDER BY last_active_at DESC) so the
-// first page is the most recent.
-export interface SessionsPage {
-  items: Session[];
-  total: number;
-  limit: number;
-  offset: number;
-}
-
+// All sessions for a project, newest-first. The server returns the full
+// list — no pagination — so the SessionList page and the Workspace
+// sidebar both get every row in one round trip.
 export const sessionsApi = {
-  list: (
-    projectId: string,
-    params?: { limit?: number; offset?: number },
-  ) => {
-    // Build the query string only when the caller actually wants
-    // pagination. The default server limit is 50, but Workspace's
-    // sidebar asks for 100, and SessionList always passes PAGE=50.
-    const qs =
-      params?.limit != null
-        ? "?" +
-          new URLSearchParams({
-            limit: String(params.limit),
-            offset: String(params.offset ?? 0),
-          } as Record<string, string>).toString()
-        : "";
-    return request<SessionsPage>(
-      `/api/projects/${encodeURIComponent(projectId)}/sessions${qs}`,
-    );
-  },
+  list: (projectId: string) =>
+    request<Session[]>(
+      `/api/projects/${encodeURIComponent(projectId)}/sessions`,
+    ),
   create: (projectId: string, name: string) =>
     request<Session>(
       `/api/projects/${encodeURIComponent(projectId)}/sessions`,

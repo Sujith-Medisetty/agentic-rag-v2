@@ -82,11 +82,9 @@ export default function Workspace() {
         if (cancelled) return;
         setProject(p);
         setMe(user);
-        const ss = await sessionsApi.list(p.id, { limit: 100, offset: 0 });
+        const apiItems = await sessionsApi.list(p.id);
         if (cancelled) return;
-        // The /sessions endpoint now returns a paginated { items, total,
-        // ... } envelope. The sidebar only needs the rows.
-        const apiItems = ss.items;
+        // /sessions returns the full list (newest-first), no envelope.
         // Merge: if startNew() ran while we were loading, the new session
         // is already in the context (from sessions.add()) but not in
         // `apiItems` (a stale snapshot). Keep locally-added sessions so they

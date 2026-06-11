@@ -519,29 +519,6 @@ def list_sessions(project_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def list_sessions_paginated(
-    project_id: str, limit: int, offset: int,
-) -> tuple[list[dict], int]:
-    """Paginated variant of `list_sessions`. Returns (rows, total) where
-    `total` is the unpaginated row count so the UI can render
-    "Page X of Y · N total". Same sort order (newest first) so the first
-    page is always the most recent — matches the SessionList page's
-    "newest at the top" expectation.
-    """
-    with _connect() as cx:
-        total = cx.execute(
-            "SELECT COUNT(*) FROM sessions WHERE project_id = ?",
-            (project_id,),
-        ).fetchone()[0]
-        rows = cx.execute(
-            f"SELECT {_SESSION_COLS} FROM sessions "
-            f"WHERE project_id = ? ORDER BY last_active_at DESC "
-            f"LIMIT ? OFFSET ?",
-            (project_id, limit, offset),
-        ).fetchall()
-    return [dict(r) for r in rows], int(total or 0)
-
-
 def list_sessions_for_user(user_id: str) -> list[dict]:
     """All sessions belonging to one user, across all their projects."""
     with _connect() as cx:

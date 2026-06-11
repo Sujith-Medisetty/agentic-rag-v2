@@ -8,10 +8,6 @@ import type { Project, Session } from "@/lib/types";
 import ProjectSettings from "@/components/ProjectSettings";
 import DeleteProgressModal from "@/components/DeleteProgressModal";
 
-// Sessions per page. The page is always sorted newest-first by the
-// server (ORDER BY last_active_at DESC) so page 1 is the most recent.
-const PAGE = 50;
-
 export default function SessionList() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -23,8 +19,6 @@ export default function SessionList() {
   // risk clobbering the sidebar's own (possibly larger) list with
   // a 50-item subset.
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [total, setTotal] = useState(0);
-  const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -53,8 +47,8 @@ export default function SessionList() {
     existingName: string;
   } | null>(null);
 
-  // Fetch the project (once) + the current page of sessions.
-  // Re-runs when the projectId or the offset (page) changes.
+  // Fetch the project + ALL sessions for the project in one round trip.
+  // The server returns the full list (newest-first) — no pagination.
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
@@ -62,18 +56,13 @@ export default function SessionList() {
     setErr(null);
     (async () => {
       try {
-        // Project is fetched only on the first page (offset === 0) so
-        // paging back/forward doesn't re-fetch the project header.
-        const [p, page] = await Promise.all([
-          offset === 0
-            ? projectsApi.get(projectId)
-            : Promise.resolve(project),
-          sessionsApi.list(projectId, { limit: PAGE, offset }),
+        const [p, list] = await Promise.all([
+          projectsApi.get(projectId),
+          sessionsApi.list(projectId),
         ]);
         if (cancelled) return;
-        if (p) setProject(p);
-        setSessions(page.items);
-        setTotal(page.total);
+        setProject(p);
+        setSessions(list);
       } catch (e: any) {
         if (!cancelled) setErr(e?.message ?? "failed to load");
       } finally {
@@ -83,10 +72,7 @@ export default function SessionList() {
     return () => {
       cancelled = true;
     };
-    // `project` is intentionally NOT in the dep list — we only use it
-    // as a placeholder on subsequent pages to avoid an extra request.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, offset]);
+  }, [projectId]);
 
   // Focus the input when edit mode opens.
   useEffect(() => {
@@ -95,13 +81,6 @@ export default function SessionList() {
       editInputRef.current.select();
     }
   }, [editingId]);
-
-  // Pagination helpers. Newest-first means page 1 is offset 0 and
-  // the "Next" button moves to higher offsets (older sessions).
-  const pageCount = Math.max(1, Math.ceil(total / PAGE));
-  const currentPage = Math.floor(offset / PAGE) + 1;
-  const hasPrev = offset > 0;
-  const hasNext = offset + PAGE < total;
 
   const startNew = async () => {
     if (!projectId) return;
@@ -177,21 +156,10 @@ export default function SessionList() {
     sessionApi.cancel(s.id).catch(() => {});
     // 2. Optimistic local removal.
     setSessions((prev) => prev.filter((x) => x.id !== s.id));
-    setTotal((t) => Math.max(0, t - 1));
-    // 3. Kick off the async server-side teardown + open the progress
-    //    modal. If the current page just became empty AND there are
-    //    older sessions to show, jump back one page so the user
-    //    isn't stranded on an empty page.
+    // 3. Kick off the async server-side teardown + open the progress modal.
     try {
       const job = await sessionApi.startDelete(s.id);
       setDeletingSession({ id: s.id, name: s.name, job });
-      setSessions((prev) => {
-        if (prev.length === 0 && offset > 0) {
-          // Will re-trigger the fetch effect.
-          setOffset((o) => Math.max(0, o - PAGE));
-        }
-        return prev;
-      });
     } catch (e: any) {
       setErr(e?.message ?? "delete failed to start");
     }
@@ -248,7 +216,7 @@ export default function SessionList() {
         </div>
       )}
 
-      {!loading && !err && total === 0 && (
+      {!loading && !err && sessions.length === 0 && (
         <div className="glass-card-soft p-10 text-center">
           <div className="text-base text-text">No sessions yet</div>
           <div className="mt-1 text-sm text-muted">
@@ -351,39 +319,6 @@ export default function SessionList() {
           );
         })}
       </div>
-
-      {/* Pagination controls. The page is sorted newest-first, so
-          "Next" moves to older sessions (higher offset) and "Prev"
-          moves to newer sessions. The label is always "Page X of Y ·
-          N total" so the user knows exactly how many sessions exist
-          and where they are in the list. */}
-      {!loading && !err && total > 0 && (
-        <div className="flex flex-col items-center justify-between gap-2 pt-2 sm:flex-row">
-          <div className="text-tx-xs text-muted">
-            Page {currentPage} of {pageCount} · {total} {total === 1 ? "session" : "sessions"} total
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setOffset((o) => Math.max(0, o - PAGE))}
-              disabled={!hasPrev}
-              className="btn-ghost min-h-touch disabled:opacity-40"
-              aria-label="Previous page (newer sessions)"
-            >
-              ← Prev
-            </button>
-            <button
-              type="button"
-              onClick={() => setOffset((o) => o + PAGE)}
-              disabled={!hasNext}
-              className="btn-ghost min-h-touch disabled:opacity-40"
-              aria-label="Next page (older sessions)"
-            >
-              Next →
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* Name-conflict modal — a real React dialog, not a native alert(). */}
       {conflict && (

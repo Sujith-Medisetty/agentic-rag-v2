@@ -1601,36 +1601,17 @@ def projects_update_settings(
 # Sessions
 # ============================================================================
 
-class SessionsPageResponse(BaseModel):
-    """Paginated wrapper around SessionResponse. Newest first (sorted by
-    last_active_at DESC). Returned by GET /api/projects/{id}/sessions so
-    the UI can render "Page X of Y · N total" without a second round
-    trip."""
-    items: list[SessionResponse]
-    total: int
-    limit: int
-    offset: int
-
 @app.get(
     "/api/projects/{project_id}/sessions",
-    response_model=SessionsPageResponse,
+    response_model=list[SessionResponse],
 )
 def sessions_list(
     project_id: str,
-    limit: int = Query(50, ge=1, le=100,
-                       description="Page size; capped at 100."),
-    offset: int = Query(0, ge=0,
-                        description="Row offset for pagination."),
     user: dict = Depends(require_user),
 ):
     _project_or_404(project_id, user)
-    rows, total = db.list_sessions_paginated(project_id, limit, offset)
-    return SessionsPageResponse(
-        items=[SessionResponse(**s) for s in rows],
-        total=total,
-        limit=limit,
-        offset=offset,
-    )
+    rows = db.list_sessions(project_id)
+    return [SessionResponse(**s) for s in rows]
 
 @app.post(
     "/api/projects/{project_id}/sessions",
