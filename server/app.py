@@ -17,7 +17,11 @@ Routes:
     PATCH  /api/projects/{project_id}/settings    → update per-project settings
 
   Sessions:
-    GET  /api/projects/{project_id}/sessions      → list (newest first)
+    GET  /api/projects/{project_id}/sessions      → paginated list (newest
+                                                    first). Query params:
+                                                    ?limit=50&offset=0.
+                                                    Returns {items, total,
+                                                    limit, offset}.
     POST /api/projects/{project_id}/sessions      → create
 
   Messages + events (per session):
@@ -1490,13 +1494,36 @@ def projects_update_settings(
 # Sessions
 # ============================================================================
 
+class SessionsPageResponse(BaseModel):
+    """Paginated wrapper around SessionResponse. Newest first (sorted by
+    last_active_at DESC). Returned by GET /api/projects/{id}/sessions so
+    the UI can render "Page X of Y · N total" without a second round
+    trip."""
+    items: list[SessionResponse]
+    total: int
+    limit: int
+    offset: int
+
 @app.get(
     "/api/projects/{project_id}/sessions",
-    response_model=list[SessionResponse],
+    response_model=SessionsPageResponse,
 )
-def sessions_list(project_id: str, user: dict = Depends(require_user)):
+def sessions_list(
+    project_id: str,
+    limit: int = Query(50, ge=1, le=100,
+                       description="Page size; capped at 100."),
+    offset: int = Query(0, ge=0,
+                        description="Row offset for pagination."),
+    user: dict = Depends(require_user),
+):
     _project_or_404(project_id, user)
-    return [SessionResponse(**s) for s in db.list_sessions(project_id)]
+    rows, total = db.list_sessions_paginated(project_id, limit, offset)
+    return SessionsPageResponse(
+        items=[SessionResponse(**s) for s in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 @app.post(
     "/api/projects/{project_id}/sessions",
