@@ -1158,8 +1158,16 @@ export default function ChatPage() {
         </div>
       </header>
 
-      {/* Sticky plan panel — turn-independent state */}
-      <PlanPanel items={plan} />
+      {/* Sticky plan panel — turn-independent state. The panel itself
+          handles the three render modes: (a) no plan + no work yet →
+          hidden, (b) no plan + work started → "agent hasn't planned"
+          hint, (c) plan present → live list with Step N of M. The
+          "hasWorkStarted" signal comes from any tool call, any
+          streamed assistant text, or a user prompt of 3+ words. */}
+      <PlanPanel items={plan} hasWorkStarted={_hasWorkStarted(
+        turns, currentTurn,
+        currentTurn?.userPrompt ?? turns[0]?.userPrompt ?? "",
+      )} />
 
       {/* Deploy strip — sits between PlanPanel and chat scroll, shows
           deploys made from this session + a "Deploy" button to add more.
@@ -1438,6 +1446,34 @@ function makeTurn(userPrompt: string, ts: number): Turn {
     liveInputTokens: 0, liveOutputTokens: 0,
     summary: null, error: null,
   };
+}
+
+// True once the agent has visibly started working in this session — drives
+// the "no plan yet" hint in PlanPanel so the user sees that the system
+// knows work is happening, even if the agent hasn't called TodoWrite.
+// "Work" = any tool call anywhere, any streamed assistant text in the
+// current turn, or a user prompt of 3+ words (a real task, not "hi").
+// A fresh session with an empty plan returns false → no hint shown.
+function _hasWorkStarted(
+  turns: Turn[], currentTurn: Turn | null, lastUserPrompt: string,
+): boolean {
+  // A completed turn that produced tools is unambiguous "work started".
+  for (const t of turns) {
+    if (t.tools.length > 0) return true;
+    if (t.fileChanges.length > 0) return true;
+    if (t.assistantText.trim().length > 0) return true;
+  }
+  // Current in-flight turn.
+  if (currentTurn) {
+    if (currentTurn.tools.length > 0) return true;
+    if (currentTurn.fileChanges.length > 0) return true;
+    if (currentTurn.assistantText.trim().length > 0) return true;
+  }
+  // No agent activity yet — fall back to a heuristic on the prompt length.
+  // 3+ words is a reasonable "real task" threshold that won't false-positive
+  // on greetings or single-word inputs but covers the stock-sense case.
+  const words = lastUserPrompt.trim().split(/\s+/).filter(Boolean).length;
+  return words >= 3;
 }
 
 // Helpers for maintaining the chronological block timeline. Consecutive text

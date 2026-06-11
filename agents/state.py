@@ -31,3 +31,10 @@ class RunnerState(TypedDict, total=False):
  # Graceful-pause signalling (set when a run budget is hit; see nodes._RunBudget).
  paused: bool # True when the loop stopped on a budget, not completion
  pause_reason: dict # {"reason":..., "detail":...}
+
+ # Per-thread plan-mode flag. When True, the agent's write tools (edit_file,
+ # write_file, bash, git, github, MCP mutators) are blocked at the
+ # node_tools dispatch chokepoint. The model must call ExitPlanMode to
+ # unblock. Persisted via the checkpointer, keyed by thread_id, so each
+ # session has its own plan-mode state and it survives restarts.
+ plan_mode_active: bool

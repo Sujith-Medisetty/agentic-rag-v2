@@ -746,18 +746,24 @@ def get_using_tools_section() -> str:
         "calls in one assistant turn — do NOT serialize them across turns. "
         "Only sequence calls when a later call genuinely depends on an "
         "earlier result.",
-        " - Use `TodoWrite` to plan multi-step work (3+ distinct steps) and "
-        "update it as you go. Skip TodoWrite for trivial single-step requests.",
-        " - TodoWrite update cadence is STRICT: the user is watching a live "
-        "progress widget, and batched updates make it jump (e.g. 1 in-progress → "
-        "suddenly all 3 done). Emit a separate TodoWrite call AT EACH of these "
-        "transitions: (a) when you start an item, mark it `in_progress`; "
-        "(b) when you start MULTIPLE items in parallel, mark all of them "
-        "`in_progress` in ONE TodoWrite call so the user sees them as a parallel "
-        "batch; (c) when ANY item completes, immediately emit a TodoWrite call "
-        "marking THAT item `completed` — even if other items in the batch are "
-        "still running. Do not wait until all parallel items finish to update. "
-        "One completion = one TodoWrite call.",
+        " - You MUST call `TodoWrite` as the FIRST action of any task with 3+ "
+        "distinct steps — emit the full plan with all items `pending` on turn 1, "
+        "BEFORE any other tool call. The UI is a live plan panel; an empty panel "
+        "on a multi-step task is a UX failure. Skip TodoWrite only for genuinely "
+        "trivial single-step requests (a one-line edit, a quick lookup).",
+        " - TodoWrite update cadence is STRICT and matches the tool's own rules: "
+        "the user is watching a live progress widget, and batched updates make it "
+        "jump (e.g. 1 in-progress → suddenly all 3 done). Emit a separate TodoWrite "
+        "call AT EACH of these transitions: (a) when you start an item, mark it "
+        "`in_progress`; (b) when you start MULTIPLE items in parallel (e.g. writing "
+        "three independent files in one turn), mark all of them `in_progress` in "
+        "ONE TodoWrite call so the user sees them as a parallel batch; (c) when ANY "
+        "item completes, immediately emit a TodoWrite call marking THAT item "
+        "`completed` — even if other items in the batch are still running. Do not "
+        "wait until all parallel items finish to update. One completion = one "
+        "TodoWrite call. Use `content` (imperative) for pending/done and "
+        "`activeForm` (present-continuous) for the in_progress row — the UI shows "
+        "activeForm while the item is in flight.",
         " - Read before you edit. `edit_file` requires the file to have been "
         "read this conversation, and your `old_string` must match the file "
         "exactly (whitespace included). When in doubt, read the surrounding "
@@ -1543,8 +1549,11 @@ def render_plan_section(workspace: str) -> str:
         lines = ["# Plan (TodoWrite state — live)",
                  "",
                  "Current step-by-step plan maintained by the TodoWrite tool. "
-                 "Use it as the live source of truth for which step you're on; "
-                 "mark items in_progress before starting them and completed when done."]
+                 "Use it as the live source of truth for which step you're on — "
+                 "you MUST keep it in sync: flip to in_progress BEFORE the tool "
+                 "calls for that step, and to completed the MOMENT the work for "
+                 "that step finishes. The UI renders every transition live; if "
+                 "you batch updates, the user sees a stale panel."]
         for i, t in enumerate(todos, 1):
             if not isinstance(t, dict):
                 continue

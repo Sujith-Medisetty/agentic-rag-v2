@@ -44,6 +44,133 @@ from memory.checkpointer import (
 from tools.wrappers import get_all_tools
 
 # ---------------------------------------------------------------------------
+# Plan-mode write-tool classification
+# ---------------------------------------------------------------------------
+# When the agent is in plan mode (RunnerState.plan_mode_active == True), the
+# pre-scan in node_tools strips every tool call whose name appears in this
+# set and synthesises a `BLOCKED:` ToolMessage for it. The set is built once
+# at startup (configure_tools below) by combining:
+#   1. The native write tools in tools.wrappers.WRITE_TOOLS
+#      (write_file, edit_file, bash, git, github, etc.).
+#   2. A denylist of known-mutating MCP tool names. False negatives are
+#      acceptable — the model rarely needs a real mutator mid-plan and we
+#      err on the side of letting a tool through rather than blocking
+#      legitimate reads.
+_WRITE_LIKE_NAMES: set[str] = set()
+# MCP mutator name patterns. Each pattern matches a name anywhere in the
+# MCP tool name (server-prefixed or not). Conservative — only flags tools
+# whose names clearly indicate mutation.
+_MCP_WRITE_PATTERNS: tuple[str, ...] = (
+    "NotebookEdit",
+    "PowerShell",
+    "_write_",
+    "_edit_",
+    "_delete_",
+    "_create_",
+    "_push_",
+    "_commit_",
+    "REPL",
+    "Config",
+)
+
+
+def _current_thread_id() -> str:
+    """Resolve the current LangGraph thread_id (= session_id, set by
+    server/session_runner) from the reporter's ContextVar. The reporter
+    is per-thread, so this is the right value to key the tool-body
+    micro-cache on. Returns "" if no reporter is in scope (e.g. unit
+    tests that don't go through the graph)."""
+    try:
+        from agents.reporter import get_reporter
+        return str(get_reporter().session_id or "")
+    except Exception:
+        return ""
+
+
+def _drain_plan_mode_into_state(state: RunnerState) -> None:
+    """Drain pending per-thread tool-body flag flips into state. Called
+    at the top of node_agent so subsequent reads in the same iteration
+    (and the following node_tools pre-scan) see the same view.
+
+    Currently only one flag (`plan_mode_active`) flows through this path;
+    new flags add a key to the dict and materialise into state here.
+    Mutates `state` in place — the checkpointer sees the change on the
+    next checkpoint write."""
+    from tools.wrappers import _drain_turn_flags
+    thread_id = _current_thread_id()
+    if not thread_id:
+        return
+    pending = _drain_turn_flags(thread_id)
+    for key, value in pending.items():
+        # Only known flags are materialised — anything else is a bug
+        # we want to surface, not silently drop.
+        if key == "plan_mode_active" and isinstance(value, bool):
+            state["plan_mode_active"] = value
+
+
+def _gate_for_plan_mode(state: RunnerState) -> list[ToolMessage]:
+    """Pre-scan: if plan mode is active, strip every write-tool call from
+    the last AIMessage and synthesise a `BLOCKED:` ToolMessage for each
+    blocked call. Returns the synthesised messages (already appended to
+    `state["messages"]` in place).
+
+    For each blocked call we ALSO emit a `tool_done` reporter event so the
+    UI sees the BLOCKED message appear in the activity stream just like
+    any other tool result. Without this the user would see writes silently
+    disappear, which is the worst possible UX for a guardrail.
+
+    The function is idempotent — calling it twice is a no-op the second
+    time, because the AIMessage's tool_calls are already stripped and
+    `_WRITE_LIKE_NAMES` doesn't include any non-write tools.
+
+    Pure-ish: mutates `state["messages"]` and the last AIMessage's
+    `tool_calls`. The mutation is intentional and matches the inline
+    pattern other tools in this file use when they need to inject a
+    synthetic message before dispatch."""
+    if not state.get("plan_mode_active"):
+        return []
+    messages = state.get("messages") or []
+    last_ai: AIMessage | None = None
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            last_ai = m
+            break
+    if last_ai is None:
+        return []
+    tool_calls = getattr(last_ai, "tool_calls", None) or []
+    if not tool_calls:
+        return []
+    blocked: list[dict] = [
+        tc for tc in tool_calls if tc.get("name") in _WRITE_LIKE_NAMES
+    ]
+    if not blocked:
+        return []
+    # Strip the blocked calls so ToolNode doesn't see them.
+    last_ai.tool_calls = [
+        tc for tc in tool_calls if tc.get("name") not in _WRITE_LIKE_NAMES
+    ]
+    synthesised: list[ToolMessage] = []
+    for tc in blocked:
+        name = str(tc.get("name", ""))
+        content = (
+            f"BLOCKED: '{name}' is a write tool, but plan mode "
+            f"is active. Call ExitPlanMode to leave plan mode first."
+        )
+        msg = ToolMessage(content=content, tool_call_id=tc.get("id", ""))
+        state["messages"] = list(state.get("messages") or []) + [msg]
+        synthesised.append(msg)
+        # Surface the BLOCKED result in the live activity stream so the
+        # user sees the rejection the same way they see any other tool
+        # result. `tool_done` is the canonical channel for "a tool ran
+        # (or was blocked) and here's the first line of its output."
+        try:
+            from agents.reporter import get_reporter
+            get_reporter().tool_done(name, content, error=True)
+        except Exception:
+            pass
+    return synthesised
+
+# ---------------------------------------------------------------------------
 # Global config — set once at startup by server.app
 # ---------------------------------------------------------------------------
 
@@ -80,9 +207,60 @@ def configure_model(
 def configure_tools(extra_tools: list | None = None) -> None:
     """Register additional LangChain tools (typically loaded from MCP servers
     by server.mcp_loader.load_mcp_tools). Called ONCE at server boot; passing
-    [] or omitting the arg leaves the agent with just the native toolset."""
-    global _mcp_tools
+    [] or omitting the arg leaves the agent with just the native toolset.
+
+    Side effect: rebuilds the plan-mode write-tool denylist
+    (`_WRITE_LIKE_NAMES`) from the native `WRITE_TOOLS` set plus any MCP
+    tools whose names match `_MCP_WRITE_PATTERNS`. The set is consulted by
+    the pre-scan in `node_tools` to block write attempts while the agent
+    is in plan mode (RunnerState.plan_mode_active == True)."""
+    global _mcp_tools, _WRITE_LIKE_NAMES
     _mcp_tools = list(extra_tools or [])
+    _WRITE_LIKE_NAMES = _classify_write_tools(_mcp_tools)
+
+
+def _classify_write_tools(mcp_tools: list) -> set[str]:
+    """Build the plan-mode write-tool denylist.
+
+    `tools.wrappers.WRITE_TOOLS` is a misnomer — it's actually
+    "all non-read tools", which mixes the actual mutators (write_file,
+    edit_file, bash, git, github) with utility tools (TodoWrite, Sleep,
+    AskUserQuestion, the Task* family, EnterPlanMode/ExitPlanMode,
+    WebFetch, WebSearch). For plan-mode purposes we want ONLY the
+    mutators, so we hand-list the denylist here rather than reuse the
+    misnamed set. Adding a new write tool to the registry? Add it to
+    `_NATIVE_WRITE_NAMES` too.
+
+    MCP mutators are added separately by matching `_MCP_WRITE_PATTERNS`."""
+    names: set[str] = set(_NATIVE_WRITE_NAMES)
+    for t in mcp_tools:
+        name = getattr(t, "name", "") or ""
+        if not name:
+            continue
+        if any(pat in name for pat in _MCP_WRITE_PATTERNS):
+            names.add(name)
+    return names
+
+
+# The actual mutating tools. The rest of `WRITE_TOOLS` is utility (allowed
+# in plan mode) and read-only fetches (allowed in plan mode). Hand-maintain
+# this list so a careless edit to WRITE_TOOLS can't silently start
+# blocking TodoWrite or ExitPlanMode in plan mode.
+_NATIVE_WRITE_NAMES: tuple[str, ...] = (
+    "write_file",
+    "edit_file",
+    "bash",
+    "git",
+    "github",
+)
+
+
+# Initialise _WRITE_LIKE_NAMES at import time with the native write tools
+# so the pre-scan works the moment `node_tools` is called, even before
+# configure_tools() has had a chance to add MCP mutators. Tests that
+# import this module directly (no server boot) get the same baseline
+# coverage as production.
+_WRITE_LIKE_NAMES = _classify_write_tools([])
 
 
 def get_mcp_tools() -> list:
@@ -794,6 +972,13 @@ def node_agent(state: RunnerState) -> dict:
     checkpointed boundary (tool results already delivered). Re-running the same
     thread_id resumes from here with a fresh budget — no crash, no lost work.
     """
+    # Drain the per-thread tool-body micro-cache into state. Tool bodies
+    # like EnterPlanMode/ExitPlanMode write to a thread-keyed dict because
+    # they don't get a state handle; we materialise the pending flags here
+    # so subsequent reads in this iteration (and the next node_tools call)
+    # see the same view. No-op when nothing was flipped.
+    _drain_plan_mode_into_state(state)
+
     pause = _run_budget.check()
     if pause is not None:
         from agents.reporter import get_reporter
@@ -917,6 +1102,17 @@ def node_tools(state: RunnerState) -> dict:
     tool wrapper) and append the results."""
     from agents.reporter import get_reporter
     reporter = get_reporter()
+
+    # Plan-mode pre-scan: if plan_mode_active is set on this thread, strip
+    # any write-tool calls from the last AIMessage and synthesise
+    # `BLOCKED:` ToolMessages for them. The model sees the same shape it
+    # would see from any other blocked tool and can adjust (e.g. by
+    # calling ExitPlanMode after presenting a plan to the user). This is
+    # the ONLY enforcement point — EnterPlanMode's flag flip is honoured
+    # here, in the single dispatch chokepoint, so coverage is uniform
+    # across native + MCP tools (the latter via the `_WRITE_LIKE_NAMES`
+    # denylist built in configure_tools).
+    _gate_for_plan_mode(state)
 
     result = ToolNode(_tools()).invoke(state)
 
