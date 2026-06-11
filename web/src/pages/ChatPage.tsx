@@ -56,8 +56,10 @@ const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
 
 const EMPTY_TOTALS: SessionTotals = {
   turns: 0, tools: 0,
-  inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
-  costUsd: 0, durationMs: 0,
+  inputTokens: 0, outputTokens: 0,
+  cacheReadTokens: 0, cacheWriteTokens: 0,
+  costUsd: 0, costCacheReadUsd: 0, costInputUsd: 0, costOutputUsd: 0,
+  durationMs: 0,
 };
 
 // ============================================================================
@@ -817,14 +819,22 @@ export default function ChatPage() {
   const totals = useMemo<SessionTotals>(() => {
     return turns.reduce<SessionTotals>((acc, t) => {
       if (!t.summary) return acc;
+      const s = t.summary;
       return {
         turns:           acc.turns + 1,
-        tools:           acc.tools + t.summary.tools_used,
-        inputTokens:     acc.inputTokens + t.summary.input_tokens,
-        outputTokens:    acc.outputTokens + t.summary.output_tokens,
-        cacheReadTokens: acc.cacheReadTokens + t.summary.cache_read_tokens,
-        costUsd:         acc.costUsd + t.summary.cost_usd,
-        durationMs:      acc.durationMs + t.summary.duration_ms,
+        tools:           acc.tools + s.tools_used,
+        inputTokens:     acc.inputTokens + s.input_tokens,
+        outputTokens:    acc.outputTokens + s.output_tokens,
+        cacheReadTokens: acc.cacheReadTokens + s.cache_read_tokens,
+        cacheWriteTokens: acc.cacheWriteTokens + s.cache_write_tokens,
+        costUsd:         acc.costUsd + s.cost_usd,
+        // Per-component cost sub-totals. These default to 0 in the
+        // accumulator when older turns pre-date the field — `??` handles
+        // the optional `cost_*_usd` shape on TurnSummary.
+        costCacheReadUsd: acc.costCacheReadUsd + (s.cost_cache_read_usd ?? 0),
+        costInputUsd:     acc.costInputUsd     + (s.cost_input_usd     ?? 0),
+        costOutputUsd:    acc.costOutputUsd    + (s.cost_output_usd    ?? 0),
+        durationMs:      acc.durationMs + s.duration_ms,
       };
     }, EMPTY_TOTALS);
   }, [turns]);
@@ -1781,6 +1791,18 @@ function ChatStatusBar({
   const runningTools = currentTurn.tools.filter((t) => t.status === "running").length;
   const runningAgents = Object.values(currentTurn.agents).filter((a) => a.status === "running").length;
 
+  // Live cache hits — sum cacheReadTokens across every orchestrator-level
+  // llm_call block this turn has produced. The blocks carry per-call cache
+  // deltas; the running `liveInputTokens` does not (it includes both
+  // cache_read and uncached alike).
+  const liveCacheRead = currentTurn.blocks.reduce((acc, b) => {
+    return b.kind === "llm_call" ? acc + (b.cacheReadTokens ?? 0) : acc;
+  }, 0);
+  // Live cost is intentionally NOT shown here — the server's authoritative
+  // per-component cost lands in turn_summary, and pricing client-side risks
+  // drift from the server's MODEL_PRICING table. The per-turn footer and
+  // session chip show the real number.
+
   return (
     <div className="bg-bg">
       <div className="mx-auto max-w-4xl px-4 py-2">
@@ -1812,7 +1834,18 @@ function ChatStatusBar({
           {(totalIn > 0 || totalOut > 0) && (
             <>
               <Sep />
-              <StatItem label="In"  value={formatTokensTiny(totalIn)}  valueClass="text-accent" />
+              <StatItem
+                label="In"
+                value={
+                  liveCacheRead > 0
+                    ? `${formatTokensTiny(totalIn)} (${formatTokensTiny(liveCacheRead)} cached)`
+                    : formatTokensTiny(totalIn)
+                }
+                valueClass="text-accent"
+                title={liveCacheRead > 0
+                  ? `${totalIn.toLocaleString()} in · ${liveCacheRead.toLocaleString()} cache hits · ${(totalIn - liveCacheRead).toLocaleString()} new`
+                  : `${totalIn.toLocaleString()} in`}
+              />
               <StatItem label="Out" value={formatTokensTiny(totalOut)} valueClass="text-accent-2" />
             </>
           )}
@@ -1823,10 +1856,10 @@ function ChatStatusBar({
 }
 
 function StatItem({
-  label, value, valueClass = "text-text",
-}: { label: string; value: string; valueClass?: string }) {
+  label, value, valueClass = "text-text", title,
+}: { label: string; value: string; valueClass?: string; title?: string }) {
   return (
-    <span className="inline-flex items-baseline gap-1">
+    <span className="inline-flex items-baseline gap-1" title={title}>
       <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">
         {label}
       </span>

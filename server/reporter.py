@@ -452,18 +452,34 @@ class WebReporter(ProgressReporter):
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         cost_usd: float = 0.0,
+        cost_input_usd: float = 0.0,
+        cost_output_usd: float = 0.0,
+        cost_cache_read_usd: float = 0.0,
+        cost_cache_write_usd: float = 0.0,
     ) -> None:
         """End-of-turn metrics. Token counts are PER-TURN (diff from the
         process-wide counter before vs after this turn). The frontend sums
-        across turns to display session totals."""
+        across turns to display session totals.
+
+        `cost_*_usd` are the per-component cost sub-totals (input / output /
+        cache_read / cache_write) — the same model-priced breakdown that
+        `CostEstimate` already computes server-side. The total `cost_usd` is
+        still the authoritative sum; the sub-totals are emitted so the UI can
+        show "cost-of-in vs cost-of-out" and the cache-savings split without
+        having to know the model pricing client-side. They round to 6
+        decimals like the total."""
         self._pub("turn_summary", {
-            "tools_used":         tools_used,
-            "duration_ms":        duration_ms,
-            "input_tokens":       input_tokens,
-            "output_tokens":      output_tokens,
-            "cache_read_tokens":  cache_read_tokens,
-            "cache_write_tokens": cache_write_tokens,
-            "cost_usd":           round(cost_usd, 6),
+            "tools_used":           tools_used,
+            "duration_ms":          duration_ms,
+            "input_tokens":         input_tokens,
+            "output_tokens":        output_tokens,
+            "cache_read_tokens":    cache_read_tokens,
+            "cache_write_tokens":   cache_write_tokens,
+            "cost_usd":             round(cost_usd, 6),
+            "cost_input_usd":       round(cost_input_usd, 6),
+            "cost_output_usd":      round(cost_output_usd, 6),
+            "cost_cache_read_usd":  round(cost_cache_read_usd, 6),
+            "cost_cache_write_usd": round(cost_cache_write_usd, 6),
         })
 
     def session_renamed(

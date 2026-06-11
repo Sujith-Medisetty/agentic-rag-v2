@@ -113,7 +113,10 @@ async def run_turn(
     from agents.nodes import get_token_counter
     tc = get_token_counter()
     before = tc.cumulative if tc else None
-    cost_before = tc.cost().total if tc else 0.0
+    # Keep the full CostEstimate (not just .total) so we can emit per-component
+    # cost sub-totals — the UI uses them to show "cost of in vs cost of out"
+    # and the cache-savings split without re-pricing on the client.
+    cost_before = tc.cost() if tc else None
 
     # Tool-count snapshot — LangGraph keeps cumulative message history across
     # turns (same thread_id), so we diff before vs. after to get "tools used
@@ -259,12 +262,20 @@ async def run_turn(
     # it crashed before the first model call).
     tc_after = get_token_counter()
     after = tc_after.cumulative if tc_after else None
-    cost_after = tc_after.cost().total if tc_after else 0.0
+    cost_after = tc_after.cost() if tc_after else None
     turn_in   = (after.input_tokens          - before.input_tokens)          if before and after else 0
     turn_out  = (after.output_tokens         - before.output_tokens)         if before and after else 0
     turn_cr   = (after.cache_read_tokens     - before.cache_read_tokens)     if before and after else 0
     turn_cw   = (after.cache_creation_tokens - before.cache_creation_tokens) if before and after else 0
-    turn_cost = max(0.0, cost_after - cost_before)
+    # Per-component cost diffs. Use max(0, …) because CostEstimate can
+    # theoretically dip between snapshots if the same model were re-priced
+    # mid-turn (e.g. a tool swapped the active model). Total is the sum of
+    # the four sub-totals, not a separate read of cost_after.total.
+    turn_cost_in  = max(0.0, cost_after.input_cost      - cost_before.input_cost)      if cost_after and cost_before else 0.0
+    turn_cost_out = max(0.0, cost_after.output_cost     - cost_before.output_cost)     if cost_after and cost_before else 0.0
+    turn_cost_cr  = max(0.0, cost_after.cache_read_cost - cost_before.cache_read_cost) if cost_after and cost_before else 0.0
+    turn_cost_cw  = max(0.0, cost_after.cache_write_cost - cost_before.cache_write_cost) if cost_after and cost_before else 0.0
+    turn_cost = turn_cost_in + turn_cost_out + turn_cost_cr + turn_cost_cw
 
     # `tools_used` should be the count of tool invocations in THIS turn, not
     # cumulative across the session. ToolMessages-in-state diff is the most
@@ -284,13 +295,17 @@ async def run_turn(
     # nothing to stop, nothing to flush.)
 
     reporter.turn_summary(
-        tools_used         = tool_count,
-        duration_ms        = int((time.monotonic() - started) * 1000),
-        input_tokens       = max(0, turn_in),
-        output_tokens      = max(0, turn_out),
-        cache_read_tokens  = max(0, turn_cr),
-        cache_write_tokens = max(0, turn_cw),
-        cost_usd           = turn_cost,
+        tools_used           = tool_count,
+        duration_ms          = int((time.monotonic() - started) * 1000),
+        input_tokens         = max(0, turn_in),
+        output_tokens        = max(0, turn_out),
+        cache_read_tokens    = max(0, turn_cr),
+        cache_write_tokens   = max(0, turn_cw),
+        cost_usd             = turn_cost,
+        cost_input_usd       = turn_cost_in,
+        cost_output_usd      = turn_cost_out,
+        cost_cache_read_usd  = turn_cost_cr,
+        cost_cache_write_usd = turn_cost_cw,
     )
 
     # Background LLM-suggested rename. After a turn finishes, if the

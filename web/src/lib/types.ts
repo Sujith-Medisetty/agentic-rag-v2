@@ -140,6 +140,13 @@ export interface ToolEvent {
 
 // Per-turn end-of-turn metrics. Token counts are PER TURN (the frontend
 // sums across turns to display session totals).
+//
+// `cost_*_usd` are the per-component cost sub-totals emitted by the server
+// from `CostEstimate` — the same model-priced breakdown that produces the
+// total `cost_usd`. The UI uses them to show "cost of in vs cost of out"
+// and the cache-savings split without re-pricing on the client. They're
+// optional in the type so older session replays (saved before the field
+// was added) still typecheck.
 export interface TurnSummary {
   tools_used: number;
   duration_ms: number;
@@ -148,6 +155,10 @@ export interface TurnSummary {
   cache_read_tokens: number;
   cache_write_tokens: number;
   cost_usd: number;
+  cost_input_usd?: number;
+  cost_output_usd?: number;
+  cost_cache_read_usd?: number;
+  cost_cache_write_usd?: number;
 }
 
 // One complete turn — user prompt + everything that happened in response.
@@ -202,12 +213,21 @@ export interface LlmCall {
 }
 
 // Pinned-header session totals computed by summing per-turn metrics.
+// `cacheWriteTokens` and the per-component `costCacheReadUsd` /
+// `costInputUsd` / `costOutputUsd` are aggregated alongside the existing
+// `cacheReadTokens` / `costUsd` so the chip can show "new" tokens and a
+// cost-of-in vs cost-of-out split. The server already populates
+// `TurnSummary.cache_write_tokens`; the frontend just wasn't summing it.
 export interface SessionTotals {
   turns: number;
   tools: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  cacheWriteTokens: number;
   costUsd: number;
+  costCacheReadUsd: number;
+  costInputUsd: number;
+  costOutputUsd: number;
   durationMs: number;
 }
