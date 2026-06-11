@@ -973,6 +973,97 @@ def _kill_session_processes(session_id: str) -> None:
             pass
         db.unregister_process(pid)
 
+def _purge_one_deployed_app(slug: str, app_row: dict) -> bool:
+    """Single-app cleanup. Reused by:
+      • _purge_deployed_apps_for_session (per session delete)
+      • admin_user_delete (per user delete, as a safety net for
+        deployed apps whose source_session_id doesn't match any of
+        the user's live sessions — legacy rows, apps whose session
+        was deleted on a previous run, etc.)
+
+    What "cleanup" means: the app leaves NO trace behind. The
+    systemd unit is stopped + removed (fullstack only), the per-slug
+    Caddy fragment is unlinked, the on-disk app dir is rmtree'd
+    (both the live /opt/ojas-apps/<slug>/ AND the
+    /opt/ojas-apps/.stopped/<slug>/ fallback if it was paused), the
+    deployed_apps row is dropped, and the matching ojas_services
+    row is dropped. After this returns, the public URL
+    (https://<slug>.<host>/) stops resolving and the port is free.
+
+    Returns True iff at least one Caddy fragment was unlinked — the
+    caller is expected to reload Caddy once at the end of a batch
+    so we don't pay N reloads for N apps.
+
+    All steps are best-effort: each is wrapped in its own try/except
+    so one bad row (e.g. rmtree failing because the dir is on a read-
+    only mount) doesn't poison the rest of the batch. Failures are
+    logged at WARNING via the module logger so the admin can see
+    what went sideways after the fact.
+    """
+    caddy_changed = False
+    try:
+        # Tear down the systemd unit (fullstack) so the process
+        # releases its files AND its bound port before we rmtree.
+        # _remove_app_service_files handles the case where the row
+        # predates the service_name column (derives the unit name
+        # from the slug), and also disables + removes the unit
+        # file so it doesn't come back on the next boot. v1 static
+        # apps have no service_name and no unit file, so this is
+        # effectively a no-op for them.
+        _remove_app_service_files(slug, app_row or {})
+    except Exception:
+        logger.exception(
+            "_purge_one_deployed_app: systemd unit cleanup failed for %s", slug,
+        )
+    try:
+        # Unlink the per-slug Caddy fragment so the subdomain stops
+        # resolving. Without this the Caddy block stays live and the
+        # URL keeps serving the now-orphaned /opt/ojas-apps/<slug>/
+        # dir. (The wildcard Caddy block in the main Caddyfile
+        # doesn't include /apps/<slug>/ so without the fragment
+        # there's no route at all — the request 404s.)
+        caddy_frag = OJAS_CADDY_ROUTES_DIR / f"{slug}.caddy"
+        if caddy_frag.exists():
+            caddy_frag.unlink()
+            caddy_changed = True
+    except OSError:
+        logger.exception(
+            "_purge_one_deployed_app: caddy fragment unlink failed for %s", slug,
+        )
+    # The app dir is at /opt/ojas-apps/<slug>/. If the app was
+    # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
+    # instead — wipe both. ignore_errors=True on rmtree so a
+    # partially-mounted dir doesn't poison the rest of the batch.
+    for d in (app_row.get("app_dir"), str(OJAS_APPS_STOPPED_DIR / slug)):
+        if d and Path(d).exists():
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                logger.exception(
+                    "_purge_one_deployed_app: rmtree %s failed", d,
+                )
+    try:
+        db.delete_deployed_app(slug)
+    except Exception:
+        logger.exception(
+            "_purge_one_deployed_app: delete_deployed_app(%s) failed", slug,
+        )
+    # Drop the matching ojas_services row too — the Admin panel's
+    # "services & ports" view reads from this table, so a stale row
+    # here shows a deleted app as still "running". The per-app
+    # DELETE handler does this; the session-delete path used to
+    # skip it, leaving ghost rows in the admin panel until manual
+    # cleanup.
+    try:
+        db.delete_ojas_service(f"deployed:{slug}")
+    except Exception:
+        logger.exception(
+            "_purge_one_deployed_app: delete_ojas_service(deployed:%s) failed",
+            slug,
+        )
+    return caddy_changed
+
+
 def _purge_deployed_apps_for_session(session_id: str) -> None:
     """SIGTERM-nothing, but rmtree every deployed_apps `app_dir` rooted in
     this session AND delete the DB rows so the public subdomain stops
@@ -980,77 +1071,36 @@ def _purge_deployed_apps_for_session(session_id: str) -> None:
 
     This is the SYNC delete path (DELETE /api/sessions/{id}). The async
     delete job (_run_delete_job step 3) does the same work inline; keep
-    the two in sync. The async version also unlinks the per-slug Caddy
-    fragment and reloads Caddy at the end — this version used to skip
-    that, which left Caddy fragments and live subdomains for any session
-    deleted via the legacy sync route. Now mirrors the async behaviour:
-    unlink each fragment, then one Caddy reload at the end.
+    the two in sync. Both versions unlink the per-slug Caddy fragment
+    and reload Caddy at the end — without the reload, a previously-
+    deleted session's URL keeps serving the now-orphaned app dir.
     """
-    import shutil
     caddy_changed = False
     try:
         # Inline SQL because db.list_deployed_apps doesn't filter by session.
         with db._connect() as cx:   # noqa: SLF001 -- internal helper, fine here
             rows = cx.execute(
-                "SELECT slug, app_dir FROM deployed_apps "
-                "WHERE source_session_id = ?",
+                "SELECT * FROM deployed_apps WHERE source_session_id = ?",
                 (session_id,),
             ).fetchall()
         for row in rows:
-            slug = row["slug"]
-            # Tear down the systemd unit (fullstack) so the process
-            # releases its files AND its bound port before we rmtree.
-            # _remove_app_service_files handles the case where the row
-            # predates the service_name column (derives the unit name
-            # from the slug), and also disables + removes the unit
-            # file so it doesn't come back on the next boot. v1 static
-            # apps have no service_name and no unit file, so this is
-            # effectively a no-op for them.
-            row_full = db.get_deployed_app(slug) or {}
-            _remove_app_service_files(slug, row_full)
-            # Unlink the per-slug Caddy fragment so the subdomain stops
-            # resolving. Mirrors the async-delete path; without this
-            # the Caddy block stays live and the URL keeps serving the
-            # now-orphaned /opt/ojas-apps/<slug>/ dir.
-            try:
-                caddy_frag = OJAS_CADDY_ROUTES_DIR / f"{slug}.caddy"
-                if caddy_frag.exists():
-                    caddy_frag.unlink()
-                    caddy_changed = True
-            except OSError:
-                pass
-            # The app dir is at /opt/ojas-apps/<slug>/. If the app was
-            # paused, the dir is at /opt/ojas-apps/.stopped/<slug>/
-            # instead -- wipe both.
-            for d in (row["app_dir"], str(OJAS_APPS_STOPPED_DIR / slug)):
-                if d and Path(d).exists():
-                    try:
-                        shutil.rmtree(d, ignore_errors=True)
-                    except Exception:
-                        pass
-            try:
-                db.delete_deployed_app(slug)
-            except Exception:
-                pass
-            # Drop the matching ojas_services row too — the Admin
-            # panel's "services & ports" view reads from this table,
-            # so a stale row here shows a deleted app as still
-            # "running". The per-app DELETE handler does this; the
-            # session-delete path used to skip it, leaving ghost
-            # rows in the admin panel until manual cleanup.
-            try:
-                db.delete_ojas_service(f"deployed:{slug}")
-            except Exception:
-                pass
+            row_dict = dict(row)
+            if _purge_one_deployed_app(row["slug"], row_dict):
+                caddy_changed = True
         # One Caddy reload for the whole session, regardless of how
         # many apps we tore down. Matches the async-delete behaviour.
         if caddy_changed:
             try:
                 _reload_caddy()
             except Exception:
-                pass
+                logger.exception(
+                    "_purge_deployed_apps_for_session: caddy reload failed for %s",
+                    session_id,
+                )
     except Exception:
-        pass
+        logger.exception(
+            "_purge_deployed_apps_for_session: %s", session_id,
+        )
 
 def _purge_session_everything(session: dict) -> None:
     """One-stop cleanup for everything tied to a session OUTSIDE the main
@@ -1063,23 +1113,6 @@ def _purge_session_everything(session: dict) -> None:
     _purge_session_state_dir(sid)
     _purge_langgraph_checkpoint(sid)
     _purge_session_bus(sid)
-
-def _purge_user_everything(user_id: str) -> None:
-    """One-stop cleanup for everything owned by a user, OUTSIDE what
-    SQLite CASCADE will handle. Walks every project the user owns, then
-    every session in each project, and reuses _purge_session_everything
-    to SIGTERM the agent's spawned processes + rm workspace subdirs +
-    drop langgraph checkpoints + clear the per-session event bus.
-
-    Deployed apps are NOT touched here -- they have ON DELETE SET NULL on
-    owner_user_id, so the DB row survives with owner_user_id=NULL. The
-    on-disk files at /opt/ojas-apps/<slug>/ also stay; the apps remain
-    live at https://<host>/apps/<slug>/ but become 'orphan' (visible
-    to root only). If you want to wipe them too, call
-    deployed_apps_delete for each before deleting the user."""
-    for project in db.list_projects(user_id=user_id):
-        for session in db.list_sessions(project["id"]):
-            _purge_session_everything(session)
 
 @app.delete("/api/projects/{project_id}")
 def projects_delete(project_id: str, user: dict = Depends(require_user)):
@@ -4955,32 +4988,67 @@ def admin_user_delete(
         )
     # Best-effort OS-level cleanup BEFORE the DB cascade. We catch
     # everything so a single bad row can't lock the admin out.
+    #
+    # The strategy mirrors the session delete path exactly: for each
+    # user-owned session, run _purge_session_everything — which kills
+    # the agent's spawned processes, SIGTERMs the systemd unit for
+    # every fullstack app deployed from that session, unlinks the
+    # per-slug Caddy fragment, rmtree's the on-disk app dir + the
+    # .stopped/ fallback, drops the deployed_apps row, drops the
+    # matching ojas_services row, rmtree's the workspace subdir +
+    # agent state dir, deletes the langgraph checkpoint, and clears
+    # the in-memory event bus. Caddy is reloaded once per session.
+    #
+    # This way, a user delete is exactly "delete every session the
+    # user owns" — and every side effect of session delete carries
+    # over, including the URL going down. Previously the safety-net
+    # loop below was rmtree'ing the app dir but never unlinking the
+    # Caddy fragment or stopping the systemd unit, so the URL kept
+    # serving until the next Caddy reload (which the next deploy
+    # would eventually trigger, but until then the orphan was
+    # reachable). The safety-net loop is still here, calling the
+    # same _purge_one_deployed_app helper, to catch deployed apps
+    # whose source_session_id doesn't match any of the user's live
+    # sessions (legacy rows, or apps whose session was already
+    # deleted on a previous run).
     try:
-        _purge_user_everything(user_id)
+        # 1. Cancel any in-flight turn task for the user's sessions.
+        #    Same step the session-delete path does first; without
+        #    this the agent keeps producing events that try to write
+        #    to a soon-to-be-deleted workspace.
+        for s in db.list_sessions_for_user(user_id):
+            task = _active_turns.get(s["id"])
+            if task is not None and not task.done():
+                task.cancel()
+        # 2. Run the per-session cleanup for each user-owned session.
+        #    This handles ~all the user delete side effects (processes,
+        #    deployed apps, workspace subdir, state dir, checkpoint,
+        #    bus, Caddy routes, systemd units, ojas_services rows).
+        for s in db.list_sessions_for_user(user_id):
+            _purge_session_everything(s)
+        # 3. Safety net: any deployed apps still owned by the user
+        #    but not linked to a surviving session (legacy rows whose
+        #    source_session_id was already NULLed by an earlier
+        #    session delete, or rows that predate the session FK).
+        #    Use the same per-app cleanup so they leave no Caddy
+        #    fragment / systemd unit / working URL behind.
+        caddy_changed = False
+        for app_row in db.list_deployed_apps(owner_user_id=user_id):
+            if _purge_one_deployed_app(app_row["slug"], app_row):
+                caddy_changed = True
+        if caddy_changed:
+            try:
+                _reload_caddy()
+            except Exception:
+                logger.exception(
+                    "admin_user_delete: caddy reload failed for user %s", user_id,
+                )
     except Exception:
-        pass
-    # Fully tear down the user's deployed apps (files + URL + DB row +
-    # ojas_services row). Runs BEFORE auth.delete_user() because the FK
-    # on deployed_apps.owner_user_id is SET NULL -- once the user is
-    # gone, the apps become orphan and we'd have to filter by name
-    # instead of owner_user_id.
-    import shutil
-    for app_row in db.list_deployed_apps(owner_user_id=user_id):
-        slug = app_row["slug"]
-        target_dir = Path(app_row["app_dir"])
-        try:
-            if target_dir.exists() and target_dir.is_dir():
-                shutil.rmtree(target_dir)
-        except OSError:
-            pass
-        try:
-            db.delete_deployed_app(slug)
-        except Exception:
-            pass
-        try:
-            db.delete_ojas_service(f"deployed:{slug}")
-        except Exception:
-            pass
+        # Don't fail the delete on cleanup errors — the DB cascade
+        # below is the source of truth, and the admin can re-run
+        # the orphan reaper via the Admin panel if anything was
+        # left behind. Logged for the admin to see in journald.
+        logger.exception("admin_user_delete: cleanup error for %s", user_id)
     try:
         auth.delete_user(user_id)
     except LookupError as e:
