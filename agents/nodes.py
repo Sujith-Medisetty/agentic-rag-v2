@@ -92,8 +92,11 @@ def _drain_plan_mode_into_state(state: RunnerState) -> None:
     at the top of node_agent so subsequent reads in the same iteration
     (and the following node_tools pre-scan) see the same view.
 
-    Currently only one flag (`plan_mode_active`) flows through this path;
-    new flags add a key to the dict and materialise into state here.
+    Two flags flow through this path:
+      - `plan_mode_active` (bool): EnterPlanMode/ExitPlanMode flip.
+      - `reset_todo_counter` (bool, one-shot): TodoWrite body signals
+        that the heartbeat counter in state should be zeroed.
+
     Mutates `state` in place — the checkpointer sees the change on the
     next checkpoint write."""
     from tools.wrappers import _drain_turn_flags
@@ -106,6 +109,9 @@ def _drain_plan_mode_into_state(state: RunnerState) -> None:
         # we want to surface, not silently drop.
         if key == "plan_mode_active" and isinstance(value, bool):
             state["plan_mode_active"] = value
+        elif key == "reset_todo_counter" and value is True:
+            # One-shot: TodoWrite fired, zero the heartbeat counter.
+            state["tools_since_last_todowrite"] = 0
 
 
 def _gate_for_plan_mode(state: RunnerState) -> list[ToolMessage]:
@@ -168,6 +174,111 @@ def _gate_for_plan_mode(state: RunnerState) -> list[ToolMessage]:
             get_reporter().tool_done(name, content, error=True)
         except Exception:
             pass
+    return synthesised
+
+
+# ---------------------------------------------------------------------------
+# TodoWrite heartbeat — force the agent to keep the plan in sync with
+# what it's actually doing. The model is told via prompt + tool docstring
+# to call TodoWrite at every state transition, but in practice it goes
+# long stretches (10+ tool calls, many minutes) without updating — the
+# user reported the panel being "stuck" on the first todo item while
+# the agent did substantial work in the background. This pre-scan is a
+# hard graph-level guard: after N non-TodoWrite tool calls, the next
+# non-TodoWrite call is stripped and a `BLOCKED:` ToolMessage is
+# synthesised, forcing the model to call TodoWrite to continue.
+# ---------------------------------------------------------------------------
+
+# Threshold: read once at module import. Override with OJAS_TODO_HEARTBEAT=N
+# (set to 0 to disable). Default 5 strikes a balance: catches the "model
+# forgot to update" case without firing on every normal read.
+_HEARTBEAT_THRESHOLD = int(os.getenv("OJAS_TODO_HEARTBEAT", "5"))
+
+
+def _gate_for_todo_heartbeat(state: RunnerState) -> list[ToolMessage]:
+    """Block non-TodoWrite tool calls when the model has gone too long
+    without updating the plan. Mirrors the shape of `_gate_for_plan_mode`
+    so the two pre-scans compose cleanly (plan-mode first, then heartbeat).
+
+    Logic:
+      - Read state['tools_since_last_todowrite'] (default 0).
+      - For each non-TodoWrite tool call in the last AIMessage, in order:
+        - If counter >= THRESHOLD and we haven't already blocked a call
+          in this pre-scan pass: strip + synthesise BLOCKED message.
+          (Once we've blocked once, the rest of the AIMessage's calls
+          are allowed through — the model needs to do *something* to
+          react to the BLOCKED, and a TodoWrite is the canonical fix.)
+          Wait, scratch that — the model emits ONE AIMessage per turn.
+          The pre-scan runs once per AIMessage. If the threshold is hit,
+          we block the FIRST non-TodoWrite call only; the rest are
+          allowed. Reason: blocking the entire AIMessage would mean the
+          model has no way to actually respond in that turn.
+        - Else: allow + increment counter.
+      - Blocked calls do NOT increment the counter (they didn't run).
+
+    Mutates state['tools_since_last_todowrite'] and the AIMessage's
+    tool_calls. Idempotent in the sense that a second call with the
+    same state and AIMessage has the same effect.
+    """
+    threshold = _HEARTBEAT_THRESHOLD
+    if threshold <= 0:
+        return []  # disabled
+    counter = int(state.get("tools_since_last_todowrite") or 0)
+    messages = state.get("messages") or []
+    last_ai: AIMessage | None = None
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            last_ai = m
+            break
+    if last_ai is None:
+        return []
+    tool_calls = getattr(last_ai, "tool_calls", None) or []
+    if not tool_calls:
+        return []
+
+    # We allow at most ONE block per pre-scan pass. Once a TodoWrite
+    # (or any other allowed call) comes through in the *next* AIMessage,
+    # the counter either resets (TodoWrite) or the model has had a chance
+    # to react. Blocking the entire AIMessage would deadlock the turn.
+    blocked_once = False
+    surviving: list[dict] = []
+    synthesised: list[ToolMessage] = []
+    for tc in tool_calls:
+        name = str(tc.get("name", ""))
+        # TodoWrite is always allowed and resets the counter (handled
+        # by TodoWrite body + drain, not by us — but incrementing the
+        # counter for it would be wrong, so we skip).
+        if name == "TodoWrite":
+            surviving.append(tc)
+            continue
+        if not blocked_once and counter >= threshold:
+            blocked_once = True
+            content = (
+                f"BLOCKED: you have run {counter} non-TodoWrite tool calls "
+                f"since the last TodoWrite update. The user is watching "
+                f"the plan panel and the sync is now stale. Call TodoWrite "
+                f"now to mark progress — items you have finished as "
+                f"`completed`, the item you are working on as `in_progress`, "
+                f"and any new work you have discovered as `pending`. One "
+                f"TodoWrite call unblocks this and the next {threshold} "
+                f"tool calls."
+            )
+            msg = ToolMessage(content=content, tool_call_id=tc.get("id", ""))
+            state["messages"] = list(state.get("messages") or []) + [msg]
+            synthesised.append(msg)
+            try:
+                from agents.reporter import get_reporter
+                get_reporter().tool_done(name or "TodoWrite", content, error=True)
+            except Exception:
+                pass
+            # Do NOT increment counter for the blocked call.
+            continue
+        surviving.append(tc)
+        counter += 1
+
+    if blocked_once:
+        last_ai.tool_calls = surviving
+    state["tools_since_last_todowrite"] = counter
     return synthesised
 
 # ---------------------------------------------------------------------------
@@ -1113,6 +1224,14 @@ def node_tools(state: RunnerState) -> dict:
     # across native + MCP tools (the latter via the `_WRITE_LIKE_NAMES`
     # denylist built in configure_tools).
     _gate_for_plan_mode(state)
+
+    # TodoWrite heartbeat: force the model to call TodoWrite every N
+    # tool calls. Runs after the plan-mode scan so that when both
+    # rules fire (plan mode on AND counter at threshold), the model
+    # sees both BLOCKED messages and the tool_done stream surfaces
+    # both to the UI. The counter is reset to 0 by TodoWrite's body
+    # via the tool-body micro-cache (drained at the top of node_agent).
+    _gate_for_todo_heartbeat(state)
 
     result = ToolNode(_tools()).invoke(state)
 

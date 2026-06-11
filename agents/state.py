@@ -38,3 +38,12 @@ class RunnerState(TypedDict, total=False):
  # unblock. Persisted via the checkpointer, keyed by thread_id, so each
  # session has its own plan-mode state and it survives restarts.
  plan_mode_active: bool
+
+ # TodoWrite heartbeat counter. Counts non-TodoWrite tool calls since the
+ # last TodoWrite. When the count reaches `_HEARTBEAT_THRESHOLD` (default
+ # 5, env override `OJAS_TODO_HEARTBEAT`), the next non-TodoWrite call
+ # is blocked with a `BLOCKED:` message and the model is forced to call
+ # TodoWrite to keep the plan panel in sync with the live activity.
+ # Reset to 0 by TodoWrite (via the tool-body micro-cache, drained at
+ # the top of node_agent). Persisted per-thread via the checkpointer.
+ tools_since_last_todowrite: int

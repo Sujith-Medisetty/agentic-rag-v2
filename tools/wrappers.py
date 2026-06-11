@@ -813,6 +813,16 @@ def TodoWrite(todos: list) -> str:
             for t in todos
         ]
         result = todo_write(items)
+        # Heartbeat reset: signal node_agent to zero the
+        # `tools_since_last_todowrite` counter. Without this, the
+        # pre-scan in node_tools would block every non-TodoWrite call
+        # after a few more iterations. The drain in node_agent turns
+        # this sentinel into a state assignment.
+        _set_turn_flag(
+            _thread_id_from_reporter(),
+            "reset_todo_counter",
+            True,
+        )
         # Notify the UI — full current list so reload / late-joining clients
         # see the same state without replaying every prior TodoWrite call.
         from agents.reporter import get_reporter
