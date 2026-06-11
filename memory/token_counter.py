@@ -163,6 +163,14 @@ class CostEstimate:
     def format(self) -> str:
         if self.total == 0:
             return "free (local model)"
+        # When cache_read contributed a non-trivial fraction, break it out
+        # so the user can see how much prompt caching saved them. The total
+        # is still the authoritative number — this is just a label.
+        if self.cache_read_cost > 0 and self.cache_read_cost / max(self.total, 1e-9) > 0.05:
+            return (
+                f"${self.total:.4f}"
+                f" (cache_read ${self.cache_read_cost:.4f})"
+            )
         return f"${self.total:.4f}"
 
 

@@ -48,10 +48,19 @@ class ProgressReporter:
         Anthropic's `thinking` content blocks AND OpenAI-compatible models
         that emit `<think>...</think>` inline (MiniMax M2, DeepSeek-R1, Qwen)."""
 
-    def token_update(self, input_delta: int = 0, output_delta: int = 0) -> None:
+    def token_update(
+        self,
+        input_delta: int = 0,
+        output_delta: int = 0,
+        cache_read_delta: int = 0,
+        cache_creation_delta: int = 0,
+    ) -> None:
         """Published after each LLM call within a turn so the UI can show live,
         ticking input/output token counts (rather than waiting for the
-        end-of-turn summary). Deltas — frontend accumulates them per turn."""
+        end-of-turn summary). Deltas — frontend accumulates them per turn.
+        `cache_read_delta` / `cache_creation_delta` are the per-call
+        cache-hit / cache-write token counts from the provider's usage
+        metadata; 0 when the provider doesn't surface them."""
 
     def context_update(
         self,

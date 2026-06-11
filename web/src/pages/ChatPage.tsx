@@ -401,8 +401,10 @@ export default function ChatPage() {
         // `LlmCall` entry inside the sub-agent that issued it.
         const inDelta  = Number(p.input_delta  ?? 0);
         const outDelta = Number(p.output_delta ?? 0);
+        const cacheR  = Number(p.cache_read_delta  ?? 0);
+        const cacheW  = Number(p.cache_creation_delta ?? 0);
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
-        if (inDelta === 0 && outDelta === 0) return;  // skip zero-deltas
+        if (inDelta === 0 && outDelta === 0 && cacheR === 0 && cacheW === 0) return;  // skip zero-deltas
         setCurrentTurn((curr) => {
           if (!curr) return curr;
           if (aid && curr.agents[aid]) {
@@ -417,6 +419,7 @@ export default function ChatPage() {
                   liveOutputTokens: a.liveOutputTokens + outDelta,
                   llmCalls: [...a.llmCalls, {
                     ts: ev.ts, inputTokens: inDelta, outputTokens: outDelta,
+                    cacheReadTokens: cacheR, cacheCreationTokens: cacheW,
                   }],
                 },
               },
@@ -430,6 +433,7 @@ export default function ChatPage() {
               id: _newBlockId("llm_call", ev.ts, curr.blocks.length),
               kind: "llm_call", ts: ev.ts,
               inputTokens: inDelta, outputTokens: outDelta,
+              cacheReadTokens: cacheR, cacheCreationTokens: cacheW,
             }],
           };
         });
@@ -1600,12 +1604,15 @@ function rebuildTranscript(events: LiveEvent[]): {
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
         const inD  = Number(p.input_delta  ?? 0);
         const outD = Number(p.output_delta ?? 0);
-        if (inD === 0 && outD === 0) break;
+        const cR  = Number(p.cache_read_delta  ?? 0);
+        const cW  = Number(p.cache_creation_delta ?? 0);
+        if (inD === 0 && outD === 0 && cR === 0 && cW === 0) break;
         if (aid && curr.agents[aid]) {
           curr.agents[aid].liveInputTokens  += inD;
           curr.agents[aid].liveOutputTokens += outD;
           curr.agents[aid].llmCalls.push({
             ts: ev.ts, inputTokens: inD, outputTokens: outD,
+            cacheReadTokens: cR, cacheCreationTokens: cW,
           });
         } else {
           curr.liveInputTokens  += inD;
@@ -1614,6 +1621,7 @@ function rebuildTranscript(events: LiveEvent[]): {
             id: _newBlockId("llm_call", ev.ts, curr.blocks.length),
             kind: "llm_call", ts: ev.ts,
             inputTokens: inD, outputTokens: outD,
+            cacheReadTokens: cR, cacheCreationTokens: cW,
           });
         }
         break;

@@ -188,7 +188,7 @@ export type TimelineBlock =
   | { id: string; kind: "agent";    agentId: string; ts: number }
   | { id: string; kind: "file";     file: FileChange }
   | { id: string; kind: "commit";   commit: CommitRecord }
-  | { id: string; kind: "llm_call"; ts: number; inputTokens: number; outputTokens: number };
+  | { id: string; kind: "llm_call"; ts: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
 
 // Per-LLM-call record kept INSIDE an AgentRecord so a sub-agent's individual
 // iterations show up nested under it (orchestrator's calls live in
@@ -197,6 +197,8 @@ export interface LlmCall {
   ts: number;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
 }
 
 // Pinned-header session totals computed by summing per-turn metrics.

@@ -561,15 +561,85 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
             from memory.token_counter import TokenUsage
             in_delta  = int(usage.get("input_tokens", 0) or 0)
             out_delta = int(usage.get("output_tokens", 0) or 0)
-            tc.record(TokenUsage(input_tokens=in_delta, output_tokens=out_delta))
+            cache_creation, cache_read = _extract_cache_fields(usage)
+            tc.record(TokenUsage(
+                input_tokens=in_delta,
+                output_tokens=out_delta,
+                cache_creation_tokens=cache_creation,
+                cache_read_tokens=cache_read,
+            ))
             try:
-                reporter.token_update(input_delta=in_delta, output_delta=out_delta)
+                reporter.token_update(
+                    input_delta=in_delta,
+                    output_delta=out_delta,
+                    cache_read_delta=cache_read,
+                    cache_creation_delta=cache_creation,
+                )
             except Exception:
                 pass
     except Exception:
         pass
 
     return ai
+
+
+# ---------------------------------------------------------------------------
+# Cache-field extraction
+# ---------------------------------------------------------------------------
+# Provider `usage` dicts come in three known shapes depending on the model /
+# endpoint:
+#   1. Anthropic: top-level `cache_creation_input_tokens` /
+#      `cache_read_input_tokens` (separate write/read breakdown).
+#   2. OpenAI / OpenAI-compatible (including MiniMax-M3): nested
+#      `prompt_tokens_details.cached_tokens` (read-only — no write side).
+#   3. Flat / unknown: nothing — return 0/0 and let the UI display "no cache
+#      info" rather than crashing.
+# We log the raw usage once per process so we can pin down M3's actual shape
+# and drop the diagnostic once it's confirmed.
+_cache_shape_logged = False
+
+
+def _extract_cache_fields(usage: dict) -> tuple[int, int]:
+    """Return (cache_creation_tokens, cache_read_tokens) from a provider
+    usage dict. Probes the three known shapes and returns (0, 0) if the
+    provider doesn't surface cache info. Logs the raw usage once per
+    process so we can confirm M3's actual shape."""
+    global _cache_shape_logged
+    if not usage:
+        return 0, 0
+    # 1. Anthropic native shape.
+    try:
+        cr = int(usage.get("cache_read_input_tokens", 0) or 0)
+        cw = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        cr = cw = 0
+    if cr or cw:
+        if not _cache_shape_logged:
+            import logging
+            logging.getLogger(__name__).info(
+                "[cache-debug] provider returned Anthropic-shape usage: %r", usage
+            )
+            _cache_shape_logged = True
+        return cw, cr
+    # 2. OpenAI / OpenAI-compatible shape (nested prompt_tokens_details).
+    details = usage.get("prompt_tokens_details") or usage.get("input_token_details") or {}
+    if isinstance(details, dict) and details.get("cached_tokens"):
+        cr = int(details["cached_tokens"] or 0)
+        if not _cache_shape_logged:
+            import logging
+            logging.getLogger(__name__).info(
+                "[cache-debug] provider returned OpenAI-shape usage: %r", usage
+            )
+            _cache_shape_logged = True
+        return 0, cr
+    # 3. Unknown — log once so we know the shape, then return 0/0.
+    if not _cache_shape_logged:
+        import logging
+        logging.getLogger(__name__).info(
+            "[cache-debug] provider usage has no cache fields: %r", usage
+        )
+        _cache_shape_logged = True
+    return 0, 0
 
 # ---------------------------------------------------------------------------
 # Loop nodes

@@ -128,7 +128,7 @@ function TimelineBlockRow({
     case "commit":
       return <div className="font-mono text-tx-sm"><CommitNode commit={block.commit} /></div>;
     case "llm_call":
-      return <LlmCallBlock inputTokens={block.inputTokens} outputTokens={block.outputTokens} />;
+      return <LlmCallBlock inputTokens={block.inputTokens} outputTokens={block.outputTokens} cacheReadTokens={block.cacheReadTokens ?? 0} cacheCreationTokens={block.cacheCreationTokens ?? 0} />;
   }
 }
 
@@ -136,25 +136,37 @@ function TimelineBlockRow({
 // LlmCallBlock — chronological marker for one model call inside the turn.
 // Shows in / out tokens for THAT iteration so the user can see how each step
 // in the agent's reasoning loop spent the token budget, not just the total.
+// The cached fraction is shown inline ("(X cached)") so the user can see
+// the prompt-cache hit rate per call — a 90% cache rate means we're only
+// paying full price on ~10% of the input.
 // ============================================================================
 
 function LlmCallBlock({
-  inputTokens, outputTokens,
-}: { inputTokens: number; outputTokens: number }) {
+  inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+}: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }) {
   // Right-aligned, borderless, subtle. Used to mark every model call inside a
   // turn (so the user can see token cost per iteration), but it's secondary
   // information — visual weight is reduced so it doesn't compete with tool
   // / file / agent blocks. No box, no background, just a line of small
   // labelled text aligned to the right rail.
+  const cacheParts: string[] = [];
+  if (cacheReadTokens > 0) cacheParts.push(`${cacheReadTokens.toLocaleString()} cached`);
+  if (cacheCreationTokens > 0) cacheParts.push(`${cacheCreationTokens.toLocaleString()} written`);
+  const titleSuffix = cacheParts.length ? ` · ${cacheParts.join(" / ")}` : "";
   return (
     <div className="flex justify-end pr-1 font-sans text-[10px] leading-tight text-subtle">
       <span
         className="inline-flex items-baseline gap-1.5"
-        title={`Model call · ${inputTokens.toLocaleString()} input / ${outputTokens.toLocaleString()} output tokens`}
+        title={`Model call · ${inputTokens.toLocaleString()} input / ${outputTokens.toLocaleString()} output tokens${titleSuffix}`}
       >
         <span className="font-semibold uppercase tracking-[0.16em]">llm</span>
         <span className="font-mono text-tx-xs">
           <span className="text-accent">{formatTokensCompact(inputTokens)}</span>
+          {cacheReadTokens > 0 && (
+            <span className="text-success/80" title={cacheParts.join(" / ")}>
+              {" "}({formatTokensCompact(cacheReadTokens)} cached)
+            </span>
+          )}
           <span className="text-subtle"> in · </span>
           <span className="text-accent-2">{formatTokensCompact(outputTokens)}</span>
           <span className="text-subtle"> out</span>
@@ -174,6 +186,7 @@ function SubAgentCallsBreakdown({ calls }: { calls: LlmCall[] }) {
   const [open, setOpen] = useState(false);
   const totalIn  = calls.reduce((a, c) => a + c.inputTokens, 0);
   const totalOut = calls.reduce((a, c) => a + c.outputTokens, 0);
+  const totalCacheRead = calls.reduce((a, c) => a + (c.cacheReadTokens ?? 0), 0);
   return (
     <div className="border-t border-accent-2/15 px-3 py-1.5">
       <button
@@ -186,6 +199,11 @@ function SubAgentCallsBreakdown({ calls }: { calls: LlmCall[] }) {
         </span>
         <span className="font-mono text-muted">
           {calls.length} · {formatTokensCompact(totalIn)} in / {formatTokensCompact(totalOut)} out
+          {totalCacheRead > 0 && (
+            <span className="text-success/80" title={`${totalCacheRead.toLocaleString()} cache hits across this sub-agent's calls`}>
+              {" "}({formatTokensCompact(totalCacheRead)} cached)
+            </span>
+          )}
         </span>
         <span>{open ? "▾" : "▸"}</span>
       </button>
@@ -195,6 +213,11 @@ function SubAgentCallsBreakdown({ calls }: { calls: LlmCall[] }) {
             <li key={`${c.ts}-${i}`} className="flex items-baseline gap-3 font-mono text-tx-xs">
               <span className="w-10 text-right text-subtle">#{i + 1}</span>
               <span className="text-accent">{formatTokensCompact(c.inputTokens)}</span>
+              {c.cacheReadTokens > 0 && (
+                <span className="text-success/80" title={`${c.cacheReadTokens.toLocaleString()} cache hits`}>
+                  ({formatTokensCompact(c.cacheReadTokens)} cached)
+                </span>
+              )}
               <span className="text-subtle">in</span>
               <span className="text-accent-2">{formatTokensCompact(c.outputTokens)}</span>
               <span className="text-subtle">out</span>

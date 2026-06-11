@@ -304,10 +304,18 @@ class WebReporter(ProgressReporter):
     def message(self, text: str) -> None:
         self._pub("message", {"text": text})
 
-    def token_update(self, input_delta: int = 0, output_delta: int = 0) -> None:
+    def token_update(
+        self,
+        input_delta: int = 0,
+        output_delta: int = 0,
+        cache_read_delta: int = 0,
+        cache_creation_delta: int = 0,
+    ) -> None:
         self._pub("token_update", {
-            "input_delta": int(input_delta or 0),
-            "output_delta": int(output_delta or 0),
+            "input_delta":          int(input_delta or 0),
+            "output_delta":         int(output_delta or 0),
+            "cache_read_delta":     int(cache_read_delta or 0),
+            "cache_creation_delta": int(cache_creation_delta or 0),
         })
 
     def context_update(
