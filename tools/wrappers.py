@@ -22,7 +22,6 @@ import functools
 import inspect
 import json
 import re
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from langchain_core.tools import tool
@@ -57,55 +56,10 @@ _workspace: str = "."
 _permission_mode: PermissionMode = PermissionMode.FULL_ACCESS
 _task_manager = None # lazily created via _get_task_manager()
 
-# Per-thread micro-cache for tool-body → node-agent handoff.
-#
-# Some tool bodies (EnterPlanMode, ExitPlanMode) need to flip a per-thread
-# flag that's actually stored in RunnerState — but the tool function only
-# receives its declared args from LangGraph, not the graph state. The
-# handoff pattern:
-#   1. Tool body calls _set_turn_flag(thread_id, key, value) on this dict.
-#   2. node_agent entry (agents/nodes.py) calls _drain_turn_flags(thread_id)
-#      and materialises the result into RunnerState at the start of each
-#      iteration.
-#   3. The single reader of the resulting state (the pre-scan in node_tools)
-#      sees the same view every iteration of the same thread.
-#
-# This replaces a process-global `_plan_mode_active` that previously lived
-# here — which was a latent multi-tenant bug (a flag flipped in session A
-# would leak into session B) and would not survive a process restart
-# (the checkpointer can't restore a module global).
-_turn_state_lock = threading.Lock()
-_turn_state: dict[str, dict[str, bool]] = {}  # thread_id -> {"plan_mode_active": bool, ...}
+# Per-thread micro-cache removed: the plan-mode/heartbeat pre-scans that
+# required it have been removed. EnterPlanMode/ExitPlanMode are now
+# advisory-only — they no longer flip any state.
 
-
-def _set_turn_flag(thread_id: str, key: str, value: bool) -> None:
-    """Record a tool-body intent to flip a per-thread flag. The flag is
-    materialised into RunnerState on the next node_agent entry."""
-    if not thread_id:
-        return
-    with _turn_state_lock:
-        _turn_state.setdefault(thread_id, {})[key] = value
-
-
-def _drain_turn_flags(thread_id: str) -> dict[str, bool]:
-    """Read all pending flags for this thread and clear them in one shot.
-    Called by node_agent at the start of each iteration. Returns an empty
-    dict if no flags were pending."""
-    if not thread_id:
-        return {}
-    with _turn_state_lock:
-        return _turn_state.pop(thread_id, {})
-
-
-def _thread_id_from_reporter() -> str:
-    """Best-effort thread_id lookup for tool bodies. The reporter is
-    already per-thread via ContextVar, so its session_id is the same
-    value the graph uses for its thread_id config."""
-    try:
-        from agents.reporter import get_reporter
-        return str(get_reporter().session_id or "")
-    except Exception:
-        return ""
 def configure_safety(
     permission_policy: PermissionPolicy,
     hook_runner: HookRunner,
@@ -813,17 +767,6 @@ def TodoWrite(todos: list) -> str:
             for t in todos
         ]
         result = todo_write(items)
-        # Heartbeat reset: signal node_agent to zero the
-        # `tools_since_last_todowrite` counter. Without this, the
-        # pre-scan in node_tools would block every non-TodoWrite call
-        # after a few more iterations. The drain in node_agent turns
-        # this sentinel into a state assignment (and includes it in
-        # node_agent's return so LangGraph's reducer persists it).
-        _set_turn_flag(
-            _thread_id_from_reporter(),
-            "reset_todo_counter",
-            True,
-        )
         # Notify the UI — full current list so reload / late-joining clients
         # see the same state without replaying every prior TodoWrite call.
         from agents.reporter import get_reporter
@@ -923,7 +866,6 @@ def EnterPlanMode() -> str:
     response and synthesises a `BLOCKED:` ToolMessage for each, so the model
     can react to the rejection just like any other tool error.
     """
-    _set_turn_flag(_thread_id_from_reporter(), "plan_mode_active", True)
     return "Plan mode ON. Explore and search freely. Do NOT write/edit/bash. Call ExitPlanMode when ready."
 @tool("ExitPlanMode", args_schema=PlanModeInput)
 @_safe_tool("ExitPlanMode")
@@ -931,7 +873,7 @@ def ExitPlanMode() -> str:
     """Leave plan mode and re-enable write / edit / bash tools. Call ONLY after presenting your plan to the user AND receiving explicit approval to proceed.
     Do not call it implicitly to bypass plan mode.
     """
-    _set_turn_flag(_thread_id_from_reporter(), "plan_mode_active", False)
+    return "Plan mode OFF. Write/edit/bash tools are now available."
     return "Plan mode OFF. Write and execute tools available."
 @tool("TaskCreate", args_schema=TaskCreateInput)
 @_safe_tool("TaskCreate")

@@ -44,261 +44,6 @@ from memory.checkpointer import (
 from tools.wrappers import get_all_tools
 
 # ---------------------------------------------------------------------------
-# Plan-mode write-tool classification
-# ---------------------------------------------------------------------------
-# When the agent is in plan mode (RunnerState.plan_mode_active == True), the
-# pre-scan in node_tools strips every tool call whose name appears in this
-# set and synthesises a `BLOCKED:` ToolMessage for it. The set is built once
-# at startup (configure_tools below) by combining:
-#   1. The native write tools in tools.wrappers.WRITE_TOOLS
-#      (write_file, edit_file, bash, git, github, etc.).
-#   2. A denylist of known-mutating MCP tool names. False negatives are
-#      acceptable — the model rarely needs a real mutator mid-plan and we
-#      err on the side of letting a tool through rather than blocking
-#      legitimate reads.
-_WRITE_LIKE_NAMES: set[str] = set()
-# MCP mutator name patterns. Each pattern matches a name anywhere in the
-# MCP tool name (server-prefixed or not). Conservative — only flags tools
-# whose names clearly indicate mutation.
-_MCP_WRITE_PATTERNS: tuple[str, ...] = (
-    "NotebookEdit",
-    "PowerShell",
-    "_write_",
-    "_edit_",
-    "_delete_",
-    "_create_",
-    "_push_",
-    "_commit_",
-    "REPL",
-    "Config",
-)
-
-
-def _current_thread_id() -> str:
-    """Resolve the current LangGraph thread_id (= session_id, set by
-    server/session_runner) from the reporter's ContextVar. The reporter
-    is per-thread, so this is the right value to key the tool-body
-    micro-cache on. Returns "" if no reporter is in scope (e.g. unit
-    tests that don't go through the graph)."""
-    try:
-        from agents.reporter import get_reporter
-        return str(get_reporter().session_id or "")
-    except Exception:
-        return ""
-
-
-def _drain_plan_mode_into_state(state: RunnerState) -> dict:
-    """Drain pending per-thread tool-body flag flips into state. Called
-    at the top of node_agent so subsequent reads in the same iteration
-    (and the following node_tools pre-scan) see the same view.
-
-    Two flags flow through this path:
-      - `plan_mode_active` (bool): EnterPlanMode/ExitPlanMode flip.
-      - `reset_todo_counter` (bool, one-shot): TodoWrite body signals
-        that the heartbeat counter in state should be zeroed.
-
-    Returns a dict of drained values for the caller to merge into its
-    return. Mutates `state` in place as a best-effort hint for any
-    in-iteration reads, but the return value is the source of truth —
-    plain field mutations on `state` are NOT reliably persisted by
-    LangGraph's reducer system; only fields returned from the node
-    function are merged."""
-    from tools.wrappers import _drain_turn_flags
-    thread_id = _current_thread_id()
-    drained: dict = {}
-    if not thread_id:
-        return drained
-    pending = _drain_turn_flags(thread_id)
-    for key, value in pending.items():
-        # Only known flags are materialised — anything else is a bug
-        # we want to surface, not silently drop.
-        if key == "plan_mode_active" and isinstance(value, bool):
-            state["plan_mode_active"] = value
-            drained["plan_mode_active"] = value
-        elif key == "reset_todo_counter" and value is True:
-            # One-shot: TodoWrite fired, zero the heartbeat counter.
-            state["tools_since_last_todowrite"] = 0
-            drained["tools_since_last_todowrite"] = 0
-    return drained
-
-
-def _gate_for_plan_mode(state: RunnerState) -> list[ToolMessage]:
-    """Pre-scan: if plan mode is active, strip every write-tool call from
-    the last AIMessage and synthesise a `BLOCKED:` ToolMessage for each
-    blocked call. Returns the synthesised messages (already appended to
-    `state["messages"]` in place).
-
-    For each blocked call we ALSO emit a `tool_done` reporter event so the
-    UI sees the BLOCKED message appear in the activity stream just like
-    any other tool result. Without this the user would see writes silently
-    disappear, which is the worst possible UX for a guardrail.
-
-    The function is idempotent — calling it twice is a no-op the second
-    time, because the AIMessage's tool_calls are already stripped and
-    `_WRITE_LIKE_NAMES` doesn't include any non-write tools.
-
-    Pure-ish: mutates `state["messages"]` and the last AIMessage's
-    `tool_calls`. The mutation is intentional and matches the inline
-    pattern other tools in this file use when they need to inject a
-    synthetic message before dispatch."""
-    if not state.get("plan_mode_active"):
-        return []
-    messages = state.get("messages") or []
-    last_ai: AIMessage | None = None
-    for m in reversed(messages):
-        if isinstance(m, AIMessage):
-            last_ai = m
-            break
-    if last_ai is None:
-        return []
-    tool_calls = getattr(last_ai, "tool_calls", None) or []
-    if not tool_calls:
-        return []
-    blocked: list[dict] = [
-        tc for tc in tool_calls if tc.get("name") in _WRITE_LIKE_NAMES
-    ]
-    if not blocked:
-        return []
-    # Strip the blocked calls so ToolNode doesn't see them.
-    last_ai.tool_calls = [
-        tc for tc in tool_calls if tc.get("name") not in _WRITE_LIKE_NAMES
-    ]
-    synthesised: list[ToolMessage] = []
-    for tc in blocked:
-        name = str(tc.get("name", ""))
-        content = (
-            f"BLOCKED: '{name}' is a write tool, but plan mode "
-            f"is active. Call ExitPlanMode to leave plan mode first."
-        )
-        msg = ToolMessage(content=content, tool_call_id=tc.get("id", ""))
-        state["messages"] = list(state.get("messages") or []) + [msg]
-        synthesised.append(msg)
-        # Surface the BLOCKED result in the live activity stream so the
-        # user sees the rejection the same way they see any other tool
-        # result. `tool_done` is the canonical channel for "a tool ran
-        # (or was blocked) and here's the first line of its output."
-        try:
-            from agents.reporter import get_reporter
-            get_reporter().tool_done(name, content, error=True)
-        except Exception:
-            pass
-    return synthesised
-
-
-# ---------------------------------------------------------------------------
-# TodoWrite heartbeat — force the agent to keep the plan in sync with
-# what it's actually doing. The model is told via prompt + tool docstring
-# to call TodoWrite at every state transition, but in practice it goes
-# long stretches (10+ tool calls, many minutes) without updating — the
-# user reported the panel being "stuck" on the first todo item while
-# the agent did substantial work in the background. This pre-scan is a
-# hard graph-level guard: after N non-TodoWrite tool calls, the next
-# non-TodoWrite call is stripped and a `BLOCKED:` ToolMessage is
-# synthesised, forcing the model to call TodoWrite to continue.
-# ---------------------------------------------------------------------------
-
-# Threshold: read once at module import. Override with OJAS_TODO_HEARTBEAT=N
-# (set to 0 to disable). Default 5 strikes a balance: catches the "model
-# forgot to update" case without firing on every normal read.
-_HEARTBEAT_THRESHOLD = int(os.getenv("OJAS_TODO_HEARTBEAT", "5"))
-
-
-def _gate_for_todo_heartbeat(state: RunnerState) -> tuple[list[ToolMessage], int]:
-    """Block non-TodoWrite tool calls when the model has gone too long
-    without updating the plan. Mirrors the shape of `_gate_for_plan_mode`
-    so the two pre-scans compose cleanly (plan-mode first, then heartbeat).
-
-    Returns a tuple of (synthesised_blocked_messages, new_counter). The
-    caller MUST include `new_counter` in its return dict — plain field
-    mutations on `state` are NOT persisted by LangGraph's reducer
-    system; only fields returned from the node function are merged.
-    (The pre-scan in node_tools would be a no-op otherwise — the counter
-    would be 0 on every call and the threshold would never be reached.)
-
-    Logic:
-      - Read state['tools_since_last_todowrite'] (default 0).
-      - For each non-TodoWrite tool call in the last AIMessage, in order:
-        - If counter >= THRESHOLD and we haven't already blocked a call
-          in this pre-scan pass: strip + synthesise BLOCKED message.
-          Reason: blocking the entire AIMessage would mean the model has
-          no way to actually respond in that turn.
-        - Else: allow + increment counter.
-      - Blocked calls do NOT increment the counter (they didn't run).
-
-    Mutates the AIMessage's tool_calls (same as plan-mode). The
-    synthesised ToolMessages are also appended to state['messages']
-    so the UI sees them in the activity stream immediately; LangGraph's
-    add_messages reducer will persist them across the node boundary.
-    """
-    threshold = _HEARTBEAT_THRESHOLD
-    if threshold <= 0:
-        # Disabled: pass the counter through unchanged so the caller's
-        # return is consistent. (The drain + TodoWrite reset still work;
-        # the heartbeat is just not enforced.)
-        counter = int(state.get("tools_since_last_todowrite") or 0)
-        return [], counter
-    counter = int(state.get("tools_since_last_todowrite") or 0)
-    messages = state.get("messages") or []
-    last_ai: AIMessage | None = None
-    for m in reversed(messages):
-        if isinstance(m, AIMessage):
-            last_ai = m
-            break
-    if last_ai is None:
-        return [], counter
-    tool_calls = getattr(last_ai, "tool_calls", None) or []
-    if not tool_calls:
-        return [], counter
-
-    # We allow at most ONE block per pre-scan pass. Once a TodoWrite
-    # (or any other allowed call) comes through in the *next* AIMessage,
-    # the counter either resets (TodoWrite) or the model has had a chance
-    # to react. Blocking the entire AIMessage would deadlock the turn.
-    blocked_once = False
-    surviving: list[dict] = []
-    synthesised: list[ToolMessage] = []
-    for tc in tool_calls:
-        name = str(tc.get("name", ""))
-        # TodoWrite is always allowed and resets the counter (handled
-        # by TodoWrite body + drain, not by us — but incrementing the
-        # counter for it would be wrong, so we skip).
-        if name == "TodoWrite":
-            surviving.append(tc)
-            continue
-        if not blocked_once and counter >= threshold:
-            blocked_once = True
-            content = (
-                f"BLOCKED: you have run {counter} non-TodoWrite tool calls "
-                f"since the last TodoWrite update. The user is watching "
-                f"the plan panel and the sync is now stale. Call TodoWrite "
-                f"now to mark progress — items you have finished as "
-                f"`completed`, the item you are working on as `in_progress`, "
-                f"and any new work you have discovered as `pending`. One "
-                f"TodoWrite call unblocks this and the next {threshold} "
-                f"tool calls."
-            )
-            msg = ToolMessage(content=content, tool_call_id=tc.get("id", ""))
-            state["messages"] = list(state.get("messages") or []) + [msg]
-            synthesised.append(msg)
-            try:
-                from agents.reporter import get_reporter
-                get_reporter().tool_done(name or "TodoWrite", content, error=True)
-            except Exception:
-                pass
-            # Do NOT increment counter for the blocked call.
-            continue
-        surviving.append(tc)
-        counter += 1
-
-    if blocked_once:
-        last_ai.tool_calls = surviving
-    # DO NOT mutate state['tools_since_last_todowrite'] here — LangGraph
-    # would discard the change. The caller MUST return the new counter
-    # in its return dict so the reducer system picks it up. (See the
-    # docstring above for the long version of this gotcha.)
-    return synthesised, counter
-
-# ---------------------------------------------------------------------------
 # Global config — set once at startup by server.app
 # ---------------------------------------------------------------------------
 
@@ -335,60 +80,9 @@ def configure_model(
 def configure_tools(extra_tools: list | None = None) -> None:
     """Register additional LangChain tools (typically loaded from MCP servers
     by server.mcp_loader.load_mcp_tools). Called ONCE at server boot; passing
-    [] or omitting the arg leaves the agent with just the native toolset.
-
-    Side effect: rebuilds the plan-mode write-tool denylist
-    (`_WRITE_LIKE_NAMES`) from the native `WRITE_TOOLS` set plus any MCP
-    tools whose names match `_MCP_WRITE_PATTERNS`. The set is consulted by
-    the pre-scan in `node_tools` to block write attempts while the agent
-    is in plan mode (RunnerState.plan_mode_active == True)."""
-    global _mcp_tools, _WRITE_LIKE_NAMES
+    [] or omitting the arg leaves the agent with just the native toolset."""
+    global _mcp_tools
     _mcp_tools = list(extra_tools or [])
-    _WRITE_LIKE_NAMES = _classify_write_tools(_mcp_tools)
-
-
-def _classify_write_tools(mcp_tools: list) -> set[str]:
-    """Build the plan-mode write-tool denylist.
-
-    `tools.wrappers.WRITE_TOOLS` is a misnomer — it's actually
-    "all non-read tools", which mixes the actual mutators (write_file,
-    edit_file, bash, git, github) with utility tools (TodoWrite, Sleep,
-    AskUserQuestion, the Task* family, EnterPlanMode/ExitPlanMode,
-    WebFetch, WebSearch). For plan-mode purposes we want ONLY the
-    mutators, so we hand-list the denylist here rather than reuse the
-    misnamed set. Adding a new write tool to the registry? Add it to
-    `_NATIVE_WRITE_NAMES` too.
-
-    MCP mutators are added separately by matching `_MCP_WRITE_PATTERNS`."""
-    names: set[str] = set(_NATIVE_WRITE_NAMES)
-    for t in mcp_tools:
-        name = getattr(t, "name", "") or ""
-        if not name:
-            continue
-        if any(pat in name for pat in _MCP_WRITE_PATTERNS):
-            names.add(name)
-    return names
-
-
-# The actual mutating tools. The rest of `WRITE_TOOLS` is utility (allowed
-# in plan mode) and read-only fetches (allowed in plan mode). Hand-maintain
-# this list so a careless edit to WRITE_TOOLS can't silently start
-# blocking TodoWrite or ExitPlanMode in plan mode.
-_NATIVE_WRITE_NAMES: tuple[str, ...] = (
-    "write_file",
-    "edit_file",
-    "bash",
-    "git",
-    "github",
-)
-
-
-# Initialise _WRITE_LIKE_NAMES at import time with the native write tools
-# so the pre-scan works the moment `node_tools` is called, even before
-# configure_tools() has had a chance to add MCP mutators. Tests that
-# import this module directly (no server boot) get the same baseline
-# coverage as production.
-_WRITE_LIKE_NAMES = _classify_write_tools([])
 
 
 def get_mcp_tools() -> list:
@@ -1100,16 +794,6 @@ def node_agent(state: RunnerState) -> dict:
     checkpointed boundary (tool results already delivered). Re-running the same
     thread_id resumes from here with a fresh budget — no crash, no lost work.
     """
-    # Drain the per-thread tool-body micro-cache into state. Tool bodies
-    # like EnterPlanMode/ExitPlanMode write to a thread-keyed dict because
-    # they don't get a state handle; we materialise the pending flags here
-    # so subsequent reads in this iteration (and the next node_tools call)
-    # see the same view. No-op when nothing was flipped.
-    # CRITICAL: merge the returned dict into our return value below —
-    # the state mutation alone is silently dropped by LangGraph's reducer
-    # system (same gotcha as the heartbeat counter).
-    drained = _drain_plan_mode_into_state(state)
-
     pause = _run_budget.check()
     if pause is not None:
         from agents.reporter import get_reporter
@@ -1213,7 +897,6 @@ def node_agent(state: RunnerState) -> dict:
     # orphans remain in checkpoint but the repair runs again next turn (cheap
     # and idempotent).
     return {
-        **drained,  # plan_mode_active / tools_since_last_todowrite reset
         "messages": [ai],
         "iterations": iterations,
         "system_prompt_pair": [static_base, dynamic_suffix],
@@ -1235,27 +918,6 @@ def node_tools(state: RunnerState) -> dict:
     from agents.reporter import get_reporter
     reporter = get_reporter()
 
-    # Plan-mode pre-scan: if plan_mode_active is set on this thread, strip
-    # any write-tool calls from the last AIMessage and synthesise
-    # `BLOCKED:` ToolMessages for them. The model sees the same shape it
-    # would see from any other blocked tool and can adjust (e.g. by
-    # calling ExitPlanMode after presenting a plan to the user). This is
-    # the ONLY enforcement point — EnterPlanMode's flag flip is honoured
-    # here, in the single dispatch chokepoint, so coverage is uniform
-    # across native + MCP tools (the latter via the `_WRITE_LIKE_NAMES`
-    # denylist built in configure_tools).
-    _gate_for_plan_mode(state)
-
-    # TodoWrite heartbeat: force the model to call TodoWrite every N
-    # tool calls. Runs after the plan-mode scan so that when both
-    # rules fire (plan mode on AND counter at threshold), the model
-    # sees both BLOCKED messages and the tool_done stream surfaces
-    # both to the UI. The counter is reset to 0 by TodoWrite's body
-    # via the tool-body micro-cache (drained at the top of node_agent).
-    # CRITICAL: the returned counter MUST be merged into the return
-    # dict below — mutating state[...] is silently dropped by LangGraph.
-    _synth_heartbeat, new_counter = _gate_for_todo_heartbeat(state)
-
     result = ToolNode(_tools()).invoke(state)
 
     for msg in result.get("messages", []):
@@ -1276,9 +938,4 @@ def node_tools(state: RunnerState) -> dict:
         )
         reporter.tool_done(name, content or "(no output)", error=is_error)
 
-    # Merge the heartbeat counter into the result so LangGraph's reducer
-    # system persists it. The state mutation in _gate_for_todo_heartbeat
-    # is a no-op from LangGraph's perspective — the only way to update
-    # a non-reduced field is to include it in the return value here.
-    result["tools_since_last_todowrite"] = new_counter
     return result
