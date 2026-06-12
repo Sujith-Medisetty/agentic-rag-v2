@@ -7,7 +7,6 @@ Authentication: GITHUB_TOKEN from.env (personal access token).
 Needs scopes: repo, pull_requests.
 """
 
-import json
 import os
 import re
 from dataclasses import dataclass, field

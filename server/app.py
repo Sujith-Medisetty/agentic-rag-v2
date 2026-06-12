@@ -95,15 +95,15 @@ from server.git_autocommit import get_git_info, push_to_remote
 from server.reporter import WebReporter, get_bus
 from pydantic import BaseModel
 from server.schemas import (
-    AuthStatusResponse, DeployRequest, DeployResponse, DeployedAppResponse,
-    DeployJobStartResponse, DeployJobStatusResponse, DeployStep,
+    AuthStatusResponse, DeployRequest, DeployedAppResponse,
+    DeployJobStartResponse, DeployJobStatusResponse,
     DeployStateResponse, DeployedAppsBySession,
-    DeleteJobStartResponse, DeleteJobStatusResponse, DeleteStep,
+    DeleteJobStartResponse, DeleteJobStatusResponse,
     EventResponse, GitInfoResponse, LoginRequest,
     LoginResponse, MessagePostRequest, MessageResponse, OjasServiceResponse,
     ProcessResponse, ProjectCreateRequest, ProjectResponse, ProjectSettingsRequest,
     PushResponse, SessionCreateRequest, SessionRenameRequest, SessionResponse,
-    SetupRequest, SignupRequest, UserResponse, AdminResetPasswordRequest,
+    SignupRequest, UserResponse, AdminResetPasswordRequest,
 )
 from server.session_runner import run_turn
 
