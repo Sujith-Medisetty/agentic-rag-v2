@@ -746,24 +746,18 @@ def get_using_tools_section() -> str:
         "calls in one assistant turn — do NOT serialize them across turns. "
         "Only sequence calls when a later call genuinely depends on an "
         "earlier result.",
-        " - You MUST call `TodoWrite` as the FIRST action of any task with 3+ "
-        "distinct steps — emit the full plan with all items `pending` on turn 1, "
-        "BEFORE any other tool call. The UI is a live plan panel; an empty panel "
-        "on a multi-step task is a UX failure. Skip TodoWrite only for genuinely "
-        "trivial single-step requests (a one-line edit, a quick lookup).",
-        " - TodoWrite update cadence is STRICT and matches the tool's own rules: "
-        "the user is watching a live progress widget, and batched updates make it "
-        "jump (e.g. 1 in-progress → suddenly all 3 done). Emit a separate TodoWrite "
-        "call AT EACH of these transitions: (a) when you start an item, mark it "
-        "`in_progress`; (b) when you start MULTIPLE items in parallel (e.g. writing "
-        "three independent files in one turn), mark all of them `in_progress` in "
-        "ONE TodoWrite call so the user sees them as a parallel batch; (c) when ANY "
-        "item completes, immediately emit a TodoWrite call marking THAT item "
-        "`completed` — even if other items in the batch are still running. Do not "
-        "wait until all parallel items finish to update. One completion = one "
-        "TodoWrite call. Use `content` (imperative) for pending/done and "
-        "`activeForm` (present-continuous) for the in_progress row — the UI shows "
-        "activeForm while the item is in flight.",
+        " - Use `TodoWrite` to plan multi-step work (3+ distinct steps) and "
+        "update it as you go. Skip TodoWrite for trivial single-step requests.",
+        " - TodoWrite update cadence is STRICT: the user is watching a live "
+        "progress widget, and batched updates make it jump (e.g. 1 in-progress → "
+        "suddenly all 3 done). Emit a separate TodoWrite call AT EACH of these "
+        "transitions: (a) when you start an item, mark it `in_progress`; "
+        "(b) when you start MULTIPLE items in parallel, mark all of them "
+        "`in_progress` in ONE TodoWrite call so the user sees them as a parallel "
+        "batch; (c) when ANY item completes, immediately emit a TodoWrite call "
+        "marking THAT item `completed` — even if other items in the batch are "
+        "still running. Do not wait until all parallel items finish to update. "
+        "One completion = one TodoWrite call.",
         " - Read before you edit. `edit_file` requires the file to have been "
         "read this conversation, and your `old_string` must match the file "
         "exactly (whitespace included). When in doubt, read the surrounding "
@@ -1518,66 +1512,6 @@ def render_mcp_tools_section(mcp_tools: list) -> str:
     return "\n".join(lines)
 
 
-def render_plan_section(workspace: str) -> str:
-    """Render the current TodoWrite plan as a compact markdown section.
-
-    Reads `<workspace>/.clawd-todos.json` (the file the TodoWrite tool
-    maintains). Returns "" if no plan / file missing / file malformed —
-    the empty path stays a no-op for non-plan sessions and never breaks
-    the prompt build on a malformed todo file.
-
-    The plan is small (~200-500 tokens for a typical 5-10 step plan) and
-    goes in the dynamic suffix (after the boundary marker), so it rides
-    the dynamic cache for consecutive turns where the plan didn't
-    change. A TodoWrite call busts the dynamic cache once; the static
-    prefix stays cached.
-    """
-    import json
-    from pathlib import Path
-    try:
-        if not workspace:
-            return ""
-        p = Path(workspace) / ".clawd-todos.json"
-        if not p.exists():
-            return ""
-        try:
-            todos = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return ""
-        if not isinstance(todos, list) or not todos:
-            return ""
-        lines = ["# Plan (TodoWrite state — live)",
-                 "",
-                 "Current step-by-step plan maintained by the TodoWrite tool. "
-                 "Use it as the live source of truth for which step you're on — "
-                 "you MUST keep it in sync: flip to in_progress BEFORE the tool "
-                 "calls for that step, and to completed the MOMENT the work for "
-                 "that step finishes. The UI renders every transition live; if "
-                 "you batch updates, the user sees a stale panel."]
-        for i, t in enumerate(todos, 1):
-            if not isinstance(t, dict):
-                continue
-            content = str(t.get("content") or "").strip()
-            if not content:
-                continue
-            status = str(t.get("status") or "pending").lower()
-            if status == "completed":
-                mark = "✓"
-            elif status == "in_progress":
-                mark = "▶"
-            else:
-                mark = "○"
-            lines.append(f" {i}. [{mark}] {content}")
-        # Defensive: if every item had empty content, we rendered only the
-        # header. Return "" so we don't add a half-empty section to the prompt.
-        if len(lines) <= 2:
-            return ""
-        return "\n".join(lines)
-    except Exception:
-        # Never break the prompt build on a malformed todo file.
-        return ""
-
-
 def render_fix_log_section(workspace: str) -> str:
     """Render the tail of `<workspace>/.ojas-fixlog.md` as a compact
     markdown section.
@@ -1720,21 +1654,14 @@ class SystemPromptBuilder:
             sections.append(get_orchestration_section())
         sections.append(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
         sections.append(self._environment_section())
-        # Plan (TodoWrite state) — dynamic, but stable across consecutive
-        # turns when the agent is in deep work on one step. Goes in the
-        # dynamic suffix so it rides the dynamic cache; a TodoWrite call
-        # busts the dynamic cache once but the static prefix stays cached.
-        workspace_for_plan = (
-            str(self.project_context.cwd) if self.project_context else ""
-        )
-        plan_section = render_plan_section(workspace_for_plan)
-        if plan_section:
-            sections.append(plan_section)
         # Fix log — same dynamic-suffix placement as the plan. Tail-only
         # (newest N lines) so it doesn't bloat the live window, but the
         # full file is on disk and immune to compaction. The next LLM
         # call that needs to enumerate past fixes can `Read
         # .ojas-fixlog.md` to see the full history.
+        workspace_for_plan = (
+            str(self.project_context.cwd) if self.project_context else ""
+        )
         fix_log_section = render_fix_log_section(workspace_for_plan)
         if fix_log_section:
             sections.append(fix_log_section)
