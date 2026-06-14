@@ -1,4 +1,5 @@
 {
+  "$comment": "AGENT: replace the 3 brand strings below (name / short_name / description) with your app's. There are 5 more brand strings in index.html (apple-mobile-web-app-title, <title>, favicon alt) — see the [BRAND] markers there. Total: 8 strings to update, otherwise the PWA install prompt / browser tab / home-screen icon will say 'Ojas app'.",
   "name": "Ojas app",
   "short_name": "Ojas",
   "description": "An app deployed by Ojas",

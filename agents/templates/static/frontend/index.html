@@ -1,4 +1,12 @@
 <!doctype html>
+<!--
+  AGENT: before scaffolding your app, replace ALL of the brand strings
+  marked with [BRAND] below with your app's actual name and short label.
+  There are 5 strings in this file (apple-mobile-web-app-title, favicon
+  alt text, <title>, and 2 OG meta) plus 3 in public/manifest.webmanifest
+  (name, short_name, description). Miss any one and the PWA install
+  prompt / browser tab / home-screen icon will say "Ojas app".
+-->
 <html lang="en" suppressHydrationWarning>
   <head>
     <meta charset="UTF-8" />
@@ -8,11 +16,15 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="apple-mobile-web-app-title" content="Ojas" />
-    <link rel="apple-touch-icon" href="./icon-192.png" />
+    <!-- [BRAND] PWA / home-screen label (iOS uses this) -->
+    <meta name="apple-mobile-web-app-title" content="Ojas app" />
     <title>Ojas app</title>
+    <!-- iOS home-screen icon — uses the canonical filename. Don't rename to icon-192.png. -->
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <!-- Generic favicon (browser tab, Android home screen) -->
+    <link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png" />
   </head>
-  <body>
+  <body class="min-h-svh bg-background text-foreground antialiased">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
