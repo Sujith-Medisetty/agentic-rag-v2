@@ -2434,13 +2434,23 @@ function ContextChip({
             </p>
           ) : (
             <>
+              {/* Lead with the TOTAL prompt (what the chip measures
+                  + matches the per-turn "In 37k" stat the user sees
+                  in the chat footer), not the new-only portion. The
+                  chip's % is `used / threshold` where `used` IS the
+                  total prompt — and auto-compact triggers on the
+                  same number, so they're in lockstep. When the
+                  percentage hits 100%, the next LLM call sees the
+                  pre-compact prompt get summarised down BEFORE the
+                  model is invoked, then the chip drops to whatever
+                  the post-compact total is. */}
               <p className="mb-1.5 text-text/90">
-                <span className="font-medium">{fmt(used)}</span> new (uncached + writes).
-                {" "}Auto-compact fires at <span className="font-medium">{fmt(threshold)}</span>.
+                <span className="font-medium">{fmt(used)}</span> total prompt this turn.
+                {" "}Auto-compact fires at <span className="font-medium">{fmt(threshold)}</span> (resets to 0% on the next call).
               </p>
-              {(totalPrompt > used || cacheRead > 0) && (
+              {(cacheRead > 0 || cacheCreation > 0) && (
                 <p className="mb-1.5 text-text/70">
-                  Total prompt this turn: <span className="font-medium">{fmt(totalPrompt)}</span>
+                  Breakdown: <span className="font-medium">{fmt(Math.max(0, used - cacheRead - cacheCreation))}</span> new
                   {cacheRead > 0 && <> · <span className="font-medium">{fmt(cacheRead)}</span> cache hits</>}
                   {cacheCreation > 0 && <> · <span className="font-medium">{fmt(cacheCreation)}</span> cache writes</>}
                   {hitRate > 0 && <> · <span className="font-medium">{hitRate}%</span> hit rate</>}
