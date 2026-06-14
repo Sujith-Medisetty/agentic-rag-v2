@@ -24,6 +24,7 @@
 // fold into turns[]. This gives full restore-on-reload behaviour.
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useParams, useOutletContext, useLocation } from "react-router-dom";
 import type { Project as ProjectType } from "@/lib/types";
 import { sessionApi, sessionsApi, deployedAppsApi } from "@/lib/api";
@@ -2388,18 +2389,31 @@ function ContextChip({
         )}
       </button>
 
-      {open && (
+      {open && createPortal(
         <div
           role="dialog"
           aria-label="Context usage details"
-          // position: fixed escapes ALL ancestor stacking contexts
-          // (the chat header's backdrop-blur-xl creates one, the
-          // PlanPanel's backdrop-blur-md creates one, etc.). z-60
-          // is the highest in the file — above the help overlay
-          // (z-30), deploy progress modal (z-30), name-conflict
-          // modal (z-40), and any other UI chrome. The popover is
-          // a transient detail panel, so it being top-of-stack
-          // is the right priority order.
+          // RENDERED INTO document.body VIA PORTAL. This is the
+          // critical part: even with `position: fixed` and `z-[60]`,
+          // the popover is still DOM-descended from the chat
+          // header, which has `backdrop-blur-xl` (chrome-bar) and
+          // therefore creates its own CSS stacking context. Inside
+          // that context, z-60 is the top — but the PlanPanel
+          // (rendered as the header's next sibling, with its own
+          // `backdrop-blur-md` stacking context) paints ON TOP of
+          // the header's stacking context in document order. The
+          // browser paints the header's contents as one unit, then
+          // the PlanPanel's contents as the next unit — regardless
+          // of any z-index inside the header.
+          //
+          // createPortal escapes this: the popover DOM node lives
+          // directly under <body>, so it participates in the
+          // root stacking context. z-[60] is now globally top-of-
+          // stack, above the PlanPanel AND any other chrome
+          // (help overlay z-30, deploy modal z-30, name-conflict
+          // modal z-40). The popover is anchored via viewport
+          // coordinates from getBoundingClientRect() — independent
+          // of where in the DOM it actually renders.
           style={
             popPos
               ? { position: "fixed", top: popPos.top, right: popPos.right }
@@ -2446,7 +2460,8 @@ function ContextChip({
           <p className="mt-2 border-t border-border/40 pt-1.5 text-tx-[10px] text-text/40">
             Click the chip again or press Esc to close.
           </p>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
