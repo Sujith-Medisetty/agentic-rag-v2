@@ -13,17 +13,12 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      // Auto-update strategy: when a new SW is found, activate it on next
-      // navigation. No user-visible "update available" prompt for v1 — quiet
-      // and reliable is better for a non-technical user.
-      registerType: "autoUpdate",
-      injectRegister: false,         // we register manually in src/pwa/registerSW.ts
-                                     // so we control timing + error handling
-      includeAssets: [
-        "icon.svg", "favicon.ico",
-        "icons/icon-192.png", "icons/icon-512.png",
-        "icons/icon-maskable-512.png", "icons/apple-touch-icon.png",
-      ],
+      // We use a hand-rolled no-op SW from web/public/sw.js (copied to
+      // dist/ on build) — not the workbox-generated one. So:
+      //   - disable the auto-generated SW (workbox precache, runtimeCaching)
+      //   - just keep the manifest so the PWA is installable
+      //   - src/pwa/registerSW.ts registers /sw.js (the no-op one) on load
+      disable: true,
       manifest: {
         name: "Ojas",
         short_name: "Ojas",
@@ -47,59 +42,14 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // Don't pre-cache the API; always go to the network for it. Cache
-        // static assets and the SPA shell so first paint is instant offline.
-        navigateFallback: "/index.html",
-        navigateFallbackDenylist: [/^\/api\//, /^\/apps\//],
-        runtimeCaching: [
-          {
-            // HTML documents — NetworkFirst with a short fallback. This is
-            // the key change for "I deployed but it looks the same": the
-            // SPA shell now goes to the network FIRST on every navigation,
-            // so a re-deploy of the Ojas UI shows up on the very next
-            // navigation. Fallback to cache only if the network fails
-            // (true offline). A 3s network timeout keeps the UI snappy.
-            urlPattern: ({ request }) => request.destination === "document",
-            handler: "NetworkFirst",
-            options: {
-              cacheName: "app-shell-html",
-              networkTimeoutSeconds: 3,
-            },
-          },
-          {
-            // JS/CSS chunks — StaleWhileRevalidate is fine here because
-            // the build hashes them in the filename (`index-DdRZH3ez.js`),
-            // so a content change always means a new URL = a fresh fetch.
-            urlPattern: ({ request }) =>
-              ["script", "style", "worker"].includes(request.destination),
-            handler: "StaleWhileRevalidate",
-            options: { cacheName: "app-shell-assets" },
-          },
-          {
-            urlPattern: ({ request }) =>
-              ["image", "font"].includes(request.destination),
-            handler: "CacheFirst",
-            options: {
-              cacheName: "static-assets",
-              expiration: { maxEntries: 100, maxAgeSeconds: 60 * 60 * 24 * 30 },
-            },
-          },
-          {
-            // API requests — always try the network.
-            urlPattern: ({ url }) => url.pathname.startsWith("/api/"),
-            handler: "NetworkOnly",
-          },
-          {
-            // Deployed sub-apps at /apps/<slug>/* — never cache. The
-            // server already sends `Cache-Control: no-cache, must-revalidate`
-            // on these, but tell the SW to skip them entirely so a stale
-            // entry from a previous deploy can't haunt us. The browser's
-            // HTTP cache is still authoritative (with no-cache it always
-            // revalidates), and the SW doesn't second-guess it.
-            urlPattern: ({ url }) => url.pathname.startsWith("/apps/"),
-            handler: "NetworkOnly",
-          },
-        ],
+        // No runtime caching at all. The server already sends
+        // `Cache-Control: no-store, must-revalidate` on every response,
+        // and the SW's job here is only to satisfy the installability
+        // criterion (browsers won't show the install prompt without a
+        // registered SW). The precache is the minimum needed for that;
+        // every fetch goes straight to the network.
+        navigateFallback: null,
+        runtimeCaching: [],
       },
       devOptions: {
         // Make the SW work in `npm run dev` too so we catch PWA bugs early

@@ -17,6 +17,9 @@
 //   - skipWaiting + clients.claim → take over immediately, not on the
 //     next page navigation. Means a redeploy that ships a new SW
 //     doesn't need a manual refresh to be effective.
+//   - On activate, wipe any cache buckets left by older SWs (in case
+//     a previous build had a real cache and we want the new policy to
+//     take effect on the very next load).
 
 self.addEventListener("install", (e) => {
   self.skipWaiting();
@@ -25,9 +28,6 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     Promise.all([
-      // Wipe ANY cache buckets left by an older SW (one that actually
-      // cached things). The new policy is no-cache, so we want to be
-      // SURE no stale entry from a previous build can survive.
       caches.keys().then((keys) =>
         Promise.all(keys.map((k) => caches.delete(k)))
       ),

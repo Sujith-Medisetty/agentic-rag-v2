@@ -696,6 +696,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ============================================================================
+# No-cache everywhere — user-facing policy.
+# The user wants zero caching across the stack: every response must be
+# re-fetched from the server on every request. This middleware:
+#   1. Strips any Cache-Control / ETag / Last-Modified the app layer set
+#      (we want one consistent policy, not "did this route forget?").
+#   2. Strips the ETag + Last-Modified from the request side too, so the
+#      browser can't use 304 If-None-Match to short-circuit a fetch.
+#   3. Sets Cache-Control: no-store, must-revalidate on every response.
+#      `no-store` tells the browser "don't keep a copy at all";
+#      `must-revalidate` is belt-and-braces for any proxy that ignores it.
+# Trade-offs accepted: every navigation re-downloads the JS bundle
+# (~500KB), every API call hits the DB, no offline launch from the
+# home-screen icon. The user explicitly asked for this.
+# ============================================================================
+class NoCacheEverywhere:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        # Strip the conditional-request headers from the incoming request
+        # so the server can't return 304 for a cached representation.
+        if scope["type"] == "http":
+            headers = scope.get("headers") or []
+            stripped = []
+            for name, value in headers:
+                lname = name.decode("latin-1").lower() if isinstance(name, bytes) else name.lower()
+                if lname in ("if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range"):
+                    continue
+                stripped.append((name, value))
+            scope["headers"] = stripped
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                # Drop any Cache-Control the route set, then add ours.
+                new_headers = []
+                for name, value in message.get("headers", []):
+                    lname = name.decode("latin-1").lower() if isinstance(name, bytes) else name.lower()
+                    if lname in ("cache-control", "etag", "last-modified", "expires", "age", "vary"):
+                        continue
+                    new_headers.append((name, value))
+                new_headers.append((b"cache-control", b"no-store, must-revalidate"))
+                new_headers.append((b"pragma", b"no-cache"))
+                message["headers"] = new_headers
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(NoCacheEverywhere)
+
 # ============================================================================
 # Auth dependency
 # ============================================================================
