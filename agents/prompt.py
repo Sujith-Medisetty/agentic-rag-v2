@@ -950,7 +950,7 @@ def get_frontend_ui_quality_section() -> str:
         "(3) wipe any cache buckets left by an older SW in `activate` "
         "(in case a previous build had a real cache and we want the new "
         "policy to take effect immediately). Don't add a `fetch` handler. "
-        "Don't add `runtimeCaching`. Don't add a precache manifest.",",
+        "Don't add `runtimeCaching`. Don't add a precache manifest.",
         "- **Install affordance** — MANDATORY and NOT NEGOTIABLE for every "
         "user-facing PWA. The `InstallButton` ships vendored at "
         "`frontend/src/components/install-button.tsx` in both Ojas "
