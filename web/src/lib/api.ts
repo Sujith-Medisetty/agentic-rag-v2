@@ -514,10 +514,8 @@ export const sessionApi = {
       `/api/sessions/${encodeURIComponent(sessionId)}/compact`,
       { method: "POST" },
     ),
-  // Per-session LLM call trace. The server keeps the last 50 wire-level
-  // request/response pairs in an in-memory ring buffer; this fetches them
-  // for the LLM Trace debug panel. Each entry is large (full prompt +
-  // full response + usage), so don't poll — fetch on panel open.
+  // Wire-level LLM call trace. Server keeps last 50 in an in-memory
+  // ring buffer; fetched on panel open (not polled).
   llmTrace: (sessionId: string) =>
     request<{
       session_id: string;
@@ -550,8 +548,7 @@ export const sessionApi = {
         usage: Record<string, unknown>;
       }>;
     }>(`/api/sessions/${encodeURIComponent(sessionId)}/llm-trace`),
-  // Wipe the in-memory LLM trace buffer for this session. Useful
-  // before a fresh debug run to start with an empty list.
+  // Wipe the in-memory trace buffer for this session.
   clearLlmTrace: (sessionId: string) =>
     request<{ ok: boolean }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/llm-trace`,

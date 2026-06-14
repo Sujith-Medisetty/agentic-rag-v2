@@ -186,20 +186,19 @@ async def run_turn(
                 (max_iterations * 2 + 10) if max_iterations > 0 else 100_000
             ),
         }
-        # Carry the new user message into BOTH the `messages` accumulator
-        # (via the add_messages reducer, which appends) AND `live_messages`
-        # (the per-turn LLM input source — default reducer is REPLACE).
-        # The previous turn's `live_messages` snapshot is the post-compact
-        # working set; we APPEND the new user message to it so the LLM
-        # actually sees the user's new question. Without this,
-        # `live_messages` stays stale across turns and the LLM call
-        # fires with the prior turn's context, responding to nothing.
+        # Append the new user message to BOTH channels: `messages`
+        # (add_messages reducer, appends to the accumulator) and
+        # `live_messages` (REPLACE reducer — we read the prior turn's
+        # working set, append, write the full list). Without this,
+        # `live_messages` stays stale and the LLM fires with the prior
+        # turn's context, never seeing the user's new question.
         prior_live: list = []
         try:
-            prior_state = runner_graph.get_state(config)
-            prior_live = list(prior_state.values.get("live_messages") or [])
+            prior_live = list(
+                runner_graph.get_state(config).values.get("live_messages") or []
+            )
         except Exception:
-            prior_live = []
+            pass
         initial_state = {
             "messages":        [HumanMessage(content=user_prompt)],
             "live_messages":   list(prior_live) + [HumanMessage(content=user_prompt)],
@@ -210,13 +209,8 @@ async def run_turn(
             "mode":            "auto",
             "iterations":      0,
             "max_iterations":  max_iterations,
-            # Plumb session_id into LangGraph state so node_agent can
-            # pass it to maybe_compact / record_llm_input_tokens.
-            # The auto-compact trigger uses an LLM-reported
-            # `input_tokens` value keyed by session_id; without this
-            # the value is per-context (resets to 0 every turn) and
-            # the trigger never fires — the chip just sits at 100%
-            # forever.
+            # Plumbed so node_agent can key the cross-turn
+            # maybe_compact / record_llm_input_tokens cache by session.
             "session_id":      session_id,
         }
         for _ in runner_graph.stream(
@@ -273,30 +267,24 @@ async def run_turn(
 
         # Persist the user message that started this turn into the
         # LangGraph state. Without this, a turn that was cancelled
-        # mid-stream leaves the state unchanged (no checkpoint was
-        # written during the LLM stream), so the user message that
-        # triggered the cancelled turn is LOST. The next turn reads
-        # the pre-cancel state and never sees the interrupted
-        # question — the LLM responds to the *prior* turn's context
-        # as if the user never typed anything.
-        #
-        # We do a minimal `update_state` with just the user message
-        # for two channels: `messages` (the add_messages reducer
-        # appends it to the existing accumulator) and `live_messages`
-        # (REPLACE reducer, so we read the current live_messages
-        # first, append, write back). This is best-effort: if the
-        # graph or checkpointer is in a wedged state we don't want
-        # the cancel-cleanup itself to fail.
+        # Persist the user message that started this turn. Without
+        # this, a turn cancelled mid-stream leaves no checkpoint
+        # (the LLM was still streaming when the cancel landed) and
+        # the user message is LOST — the next turn reads the
+        # pre-cancel state and never sees the interrupted question.
+        # update_state is best-effort; a wedged checkpointer must
+        # not fail the cancel-cleanup itself.
         try:
-            from agents.graph import runner_graph as _rg
-            _cfg = {"configurable": {"thread_id": session_id}}
-            _prior = _rg.get_state(_cfg)
-            _prior_live = list(_prior.values.get("live_messages") or [])
-            _rg.update_state(
-                _cfg,
+            from agents.graph import runner_graph
+            cfg = {"configurable": {"thread_id": session_id}}
+            prior_live = list(
+                runner_graph.get_state(cfg).values.get("live_messages") or []
+            )
+            runner_graph.update_state(
+                cfg,
                 {
                     "messages": [HumanMessage(content=user_prompt)],
-                    "live_messages": _prior_live + [HumanMessage(content=user_prompt)],
+                    "live_messages": prior_live + [HumanMessage(content=user_prompt)],
                 },
             )
         except Exception:

@@ -506,25 +506,18 @@ class _ThinkingTagSplitter:
 
 
 def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage:
-    """Stream a single model call: forward text chunks + tool announcements
-    through the reporter, return the aggregated assistant message.
-
-    Also records the full request/response pair to the per-session LLM
-    trace store (memory.llm_trace). The trace is the WIRE-level view —
-    the exact prompt sent over the API, the exact response that came
-    back, and the provider's usage_metadata. Exposed via
-    /api/sessions/:id/llm-trace so the user can debug prompt-size,
-    cache-hit, and tool-call questions without having to tail
-    journalctl.
+    """Stream one model call: forward text chunks + tool announcements
+    through the reporter, return the aggregated assistant message. Also
+    records the full request/response to the per-session trace store
+    (memory.llm_trace) for the wire-level debug panel.
     """
     from agents.reporter import get_reporter
     reporter = get_reporter()
-    # Capture wall-clock start so the trace can report per-call duration.
-    # Module-level so the trace-recording block at the end of the
-    # function can read it without us threading it through every helper.
+    # Wall-clock start so the trace can report per-call duration. Module-
+    # level because the default executor is single-threaded and we don't
+    # want to thread it through every helper.
     global _t_call_start
-    import time as _time
-    _t_call_start = _time.monotonic()
+    _t_call_start = time.monotonic()
 
     aggregate: AIMessageChunk | None = None
     announced: set[str] = set()
@@ -628,25 +621,20 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
         pass
 
     # Record the wire-level LLM call to the per-session trace store.
-    # Best-effort: a failure here must not break the agent loop.
+    # Best-effort — a failure here must not break the agent loop.
     try:
         from memory.llm_trace import get_store, LLMCallRecord, serialize_messages
-        from agents.reporter import get_reporter as _get_rep
-        rep = _get_rep()
-        # The reporter scope carries the session_id; if not present
-        # (e.g. tests), fall back to the empty string and skip.
+        rep = get_reporter()
         sid = getattr(rep, "session_id", "") or ""
         if sid:
-            import time as _time
-            from agents.nodes import _model_name_for_trace, _iterations_for_trace
             rec = LLMCallRecord(
-                ts=_time.time(),
+                ts=time.time(),
                 iteration=_iterations_for_trace(),
                 model=_model_name_for_trace(),
                 request_messages=serialize_messages(messages),
                 response=serialize_messages([ai])[0] if ai else {},
                 usage=dict(usage) if usage else {},
-                duration_ms=int((_time.monotonic() - _t_call_start) * 1000),
+                duration_ms=int((time.monotonic() - _t_call_start) * 1000),
                 finish_reason=str(
                     (getattr(ai, "response_metadata", {}) or {}).get("finish_reason", "")
                 ),
@@ -853,31 +841,12 @@ def _auto_compact_threshold_value() -> int:
 
 
 def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Return a new list with oversized ToolMessage bodies AND oversized
-    AIMessage tool_call arguments replaced by short stubs.
-
-    Both directions matter:
-      - ToolMessage bodies: a single `Read` of a 30k-token log file
-        would otherwise fill most of the live window with stale content.
-        The agent can re-`Read` if it needs the fresh content. We keep
-        the tool CALL (path + args) verbatim, since that's the agent's
-        intent, but replace the oversized result body with a one-line
-        pointer.
-      - AIMessage tool_call args: `edit_file(path=..., new_string=...)`
-        and `write_file(path=..., content=...)` embed the new file body
-        IN the tool call's argument. For a typical build session with
-        30+ edits, each one carries a 1-3KB `new_string` — the recent
-        window alone is 30-90K tokens. Truncating these args keeps the
-        recent window small while preserving the agent's intent
-        (file path, edit description) for the next turn to reference.
-
-    Cheap to run on every turn (O(n) over a list of ~30 messages); no
-    reason to cache it. Uses `model_copy(update=...)` (LangChain
-    `BaseMessage` has `model_copy` since langchain-core>=0.1) so the
-    checkpoint history isn't mutated in place — the on-disk record
-    keeps the full body, only the per-turn request gets the trimmed
-    view.
-    """
+    """Replace oversized ToolMessage bodies AND oversized AIMessage
+    tool_call args with short stubs. Tool CALLS (path + args) on the
+    preceding AIMessage stay verbatim — the agent's intent is what
+    matters. Uses `model_copy(update=...)` so the on-disk checkpoint
+    keeps the full body; only the per-turn request gets the trimmed
+    view."""
     out: list[BaseMessage] = []
     n_truncated_tool = 0
     n_truncated_call = 0
@@ -908,33 +877,22 @@ def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
     return out
 
 
-# Args that, when present in a tool call, frequently carry multi-KB strings
-# (the new file body for an edit, a long shell command, etc.). Truncating
-# just these — rather than the entire args dict — preserves the agent's
-# intent (which file, which function) while shaving the heavy strings.
+# Heavy tool-call arg keys — these often carry multi-KB strings
+# (file bodies for edits, heredocs for bash). Truncating just these
+# preserves the agent's intent (file path, function name) while
+# shedding the heavy strings.
 _TOOL_CALL_LARGE_ARG_KEYS = (
-    "new_string",   # edit_file: the new file body
-    "old_string",   # edit_file: also large sometimes
-    "content",      # write_file: the entire file body
-    "command",      # bash: long shell commands / heredocs
+    "new_string",
+    "old_string",
+    "content",
+    "command",
 )
 
 
 def _truncate_tool_call_args(tool_calls: list) -> tuple[list, int]:
-    """Walk a list of tool call dicts and replace large string arg values
-    with a one-line stub. Returns `(new_calls, n_truncated)`.
-
-    Each tool call is a dict like `{"id": "...", "name": "edit_file",
-    "args": {"path": "...", "new_string": "..."}}`. Only the well-known
-    heavy keys are touched; everything else (path, query, etc.) passes
-    through verbatim so the LLM can still see what the agent was doing.
-
-    The threshold is the same `TOOL_RESULT_TRUNCATE_AT_CHARS` from
-    checkpointer — a 800-char stub plus a one-line notice. The original
-    full text is NOT recoverable (we don't keep it elsewhere); if the
-    next turn needs the verbatim file body, the agent re-invokes the
-    tool (read_file / cat) to get the fresh content.
-    """
+    """Replace large string arg values in tool call dicts with a
+    one-line stub. Other args (path, query, etc.) pass through
+    verbatim. Returns (new_calls, n_truncated)."""
     limit = 800
     if limit <= 0:
         return tool_calls, 0
@@ -1086,38 +1044,22 @@ def node_agent(state: RunnerState) -> dict:
         else:
             static_base, dynamic_suffix = _build_system_prompt(state)
 
-    # Repair any orphaned tool_calls left by a previously cancelled/killed turn
-    # BEFORE we send the message history to the LLM. Without this, MiniMax /
-    # OpenAI-compatible providers reject the conversation with a 400.
-    #
-    # Source of the LLM input: prefer `live_messages` (the per-turn working
-    # set that the previous turn wrote — post-compact, post-mask, post-trim)
-    # over `messages` (the append-only accumulator). On the very first turn
-    # of a session, `live_messages` is unset, so we fall back to the full
-    # accumulator. The pre-compact state of `messages` is also kept around
-    # for replays / debugging — it's not a duplicate cost because the LLM
-    # only ever reads from `live_messages`.
+    # LLM input source: `live_messages` (per-turn post-compact working
+    # set) if set, else `messages` (append-only accumulator). On the
+    # first turn of a session `live_messages` is unset.
     raw_history = list(state.get("live_messages") or state.get("messages", []))
     history = _repair_orphan_tool_calls(raw_history)
 
-    # Auto-compact BEFORE the LLM call, not after. The old `put()`-time check
-    # fired after the turn that crossed the threshold had already been billed
-    # at full price — late fire, paid twice. See memory.checkpointer.maybe_compact
-    # for the threshold + summary logic.
+    # Auto-compact BEFORE the LLM call (turn that crosses threshold pays
+    # for the smaller compacted context, not the giant one). The `put()`
+    # safety net only fires on restart or paths that bypass the loop.
     from memory.checkpointer import maybe_compact, mask_old_observations
     history, did_compact, compact_info = maybe_compact(history, session_id=session_id)
     if did_compact:
-        # Chat-visible notification: tell the user what just happened.
-        # Without this, auto-compact is invisible — the user has no way
-        # to know older turns got summarised, or what's preserved in
-        # the summary block. The payload includes the summary preview
-        # so the user can see at a glance what the agent now remembers.
-        # We DON'T publish a redundant `context_update` here — the
+        # Chat-visible notification. No `context_update` here — the
         # post-LLM publish below is the single source of truth for the
-        # chip's used-tokens number. Pre-LLM local estimates have
-        # drifted from the provider's real number in the past (no
-        # system prompt in the local count, mask/strip just ran) and
-        # caused the chip to bounce.
+        # chip (pre-LLM local estimates have drifted from the provider's
+        # real number in the past and made the chip bounce).
         try:
             from agents.reporter import get_reporter
             get_reporter().context_compacted(
@@ -1131,27 +1073,19 @@ def node_agent(state: RunnerState) -> dict:
         except Exception:
             pass
 
-    # Observation masking — collapse old tool results to a one-line stub
-    # so Anthropic's automatic prefix cache doesn't re-send the entire
-    # previous history on every turn. See memory.checkpointer.mask_old_observations
-    # for the rationale + JetBrains research citation. The agent can
-    # always re-invoke the tool to get the fresh body, so masking is
-    # lossless for the agent's capability.
+    # Collapse old tool results to a stub so the prefix cache doesn't
+    # re-send the entire previous history on every turn. The agent can
+    # always re-invoke the tool for the fresh body.
     history = mask_old_observations(history)
 
-    # Strip thinking / reasoning_content from old AIMessages. The agent
-    # doesn't need its own past reasoning to keep working, and those
-    # blocks are re-shipped on every turn via Anthropic's automatic
-    # prefix cache — the largest single contributor to per-turn cost on
-    # long sessions. See _strip_old_thinking for the JetBrains-style
-    # "stop feeding the model its own past thoughts" rationale.
+    # Strip old thinking/reasoning blocks — they re-ship every turn via
+    # the prefix cache and are the largest single contributor to
+    # per-turn cost on long sessions.
     history = _strip_old_thinking(history)
 
-    # Truncate oversized ToolMessage bodies so a single `Read` of a 30k-token
-    # log file doesn't bloat the live window for the rest of the session.
-    # The agent can re-invoke the tool if it needs the fresh content; we keep
-    # the tool CALL (path + args) on the preceding AIMessage verbatim so the
-    # agent's intent stays intact. Cheap O(n) pass; no need to cache it.
+    # Truncate oversized ToolMessage bodies + heavy AIMessage tool_call
+    # args. Tool calls (path + args) on the preceding AIMessage stay
+    # verbatim — the agent's intent is what matters.
     history = _truncate_live_history(history)
 
     # NOTE: we no longer publish a pre-LLM `context_update` here. The
@@ -1271,29 +1205,18 @@ def node_agent(state: RunnerState) -> dict:
                 input_total=_input_total,
             )
             # Auto-compact trigger uses the same total number.
-            # When the chip goes red (>=100% of threshold),
-            # auto-compact fires on the next turn. Pass
-            # `session_id` so the value is keyed in the cross-turn
-            # module dict — without it the per-context ContextVar
-            # would reset to 0 at the start of the next turn and
-            # the primary trigger would never fire.
+            # Auto-compact trigger uses the same total. `session_id` keys
+            # the cross-turn module dict — without it the per-context
+            # ContextVar would reset to 0 next turn and the trigger
+            # would never fire.
             record_llm_input_tokens(_input_total, session_id=session_id)
     except Exception:
         pass
 
-    # Persist the post-compact + post-mask + post-strip + post-trim history
-    # as the LLM input for the NEXT turn. Two channels:
-    #   - `messages` (Annotated[add_messages]) — append the new AI message
-    #     to the audit log. Older turns stay here for replays / debugging.
-    #     The accumulator grows unboundedly; we don't read from it for
-    #     LLM input.
-    #   - `live_messages` (default reducer, no Annotated) — REPLACE with
-    #     the compacted working set + new AI message. The next turn reads
-    #     from here, so the LLM only ever sees the bounded (summary +
-    #     recent tail) list, not the full uncompacted history.
-    # Together: the full history is preserved in `messages`, the LLM sees
-    # a compact view in `live_messages`, and the per-turn cost stays
-    # bounded by the auto-compact threshold.
+    # Persist the post-process history as the LLM input for the NEXT turn.
+    # Two channels: `messages` (add_messages reducer — append-only audit
+    # log) and `live_messages` (REPLACE reducer — the LLM only ever
+    # reads this, so it stays bounded by the auto-compact threshold).
     return {
         "messages": [ai],
         "live_messages": list(history) + [ai],

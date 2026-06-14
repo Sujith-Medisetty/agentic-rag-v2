@@ -22,91 +22,47 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
 
-# The LLM-reported input_tokens from the most recent call. Set by
-# nodes.py after each streamed model call. Used by maybe_compact() as
-# the PRIMARY trigger for auto-compaction. Why: the local
-# `_estimate_tokens(messages)` is a naive `len//4` estimator that
-# misses three large fixed costs the LLM actually pays for on every
-# call:
-#   1. The system prompt (~3-5K tokens, NOT in the messages list)
-#   2. The tool-definition schema list (~2-3K tokens, NOT in messages)
-#   3. JSON envelope wrapping on every tool_use / tool_result block
-#      (id, type, role markers) — measured at ~3-5× the estimator's
-#      per-message count for code-generation sessions.
-# In a real Calculator App Build session the estimator said 15,716
-# tokens while the LLM was actually getting 87,906 — a 5.6×
-# underestimate. The chip's "% used" was driven by the LLM's number
-# (correct), so it showed 176% — but maybe_compact never fired
-# because the local estimate stayed under the 50K threshold. This
-# contextvar bridges that gap: trust the LLM's own count when we
-# have one (i.e. after the first turn), fall back to the local
-# estimate only for the very first call.
+# LLM-reported input_tokens from the most recent call (per-context).
+# The local `len//4` estimator underestimates by 5-6× (no system prompt,
+# no tool defs, no JSON envelope), so we trust the LLM's own count when
+# we have one. The module-level dict below survives `copy_context()` —
+# without it the per-context value resets to 0 every turn (run_turn does
+# `ctx = copy_context()` per turn) and the trigger never fires.
 _LAST_LLM_INPUT_TOKENS: ContextVar[int] = ContextVar(
     "ojas_last_llm_input_tokens", default=0,
 )
-# Module-level cross-turn cache: session_id -> last reported LLM
-# input_tokens. The ContextVar above is per-context, and
-# `session_runner.run_turn` does `ctx = copy_context()` for every
-# turn before invoking the agent loop — so without this dict the
-# value would reset to 0 at the start of every turn and the
-# LLM-count-based auto-compact trigger would never fire. The DB
-# column `sessions.last_context_used` is the durable mirror; this
-# dict is the hot-path cache.
 _LAST_INPUT_TOKENS_BY_SESSION: dict[str, int] = {}
 
-# --- Auto-compaction thresholds ---
-# COMPACT_BUDGET: when estimated message-list tokens cross this, auto-compact
-# fires BEFORE the next LLM call. Default 80K so the chip's "% used" stays
-# in the calm/warn range for normal sessions (35-45k prompts read as
-# 44-56% rather than 70-90%), and compactions only fire on the genuinely
-# over-stuffed sessions. At 50K (the prior default) the chip was hitting
-# 100% on every tool-heavy turn because system prompt + tool defs alone
-# are ~16K and a few file-edits push the rest over the threshold.
-#
-# CONTEXT_WINDOW: the working context the LLM can actually reason over. Used
-# for the UI context-used percentage bar — Claude Code-style "75% used"
-# indicator. MiniMax-M3-512k nominally fits 512K, but quality holds up to
-# ~200K. Tune via env if needed.
+# Default auto-compact threshold: 80K. 50K was too tight — system prompt
+# + tool defs alone are ~16K and a few file-edits push the rest over.
+# CONTEXT_WINDOW_TOKENS is what the chip's "100% used" represents
+# (the working context the model can reason over — quality holds up to
+# ~200K for MiniMax-M3 even though its nominal window is 512K).
 DEFAULT_AUTO_COMPACT_INPUT_TOKENS = 80_000
-AUTO_COMPACT_THRESHOLD_ENV_VAR = "OJAS_AUTO_COMPACT_INPUT_TOKENS"  # was CLAUDE_CODE_…
+AUTO_COMPACT_THRESHOLD_ENV_VAR = "OJAS_AUTO_COMPACT_INPUT_TOKENS"
 AUTO_COMPACT_THRESHOLD_LEGACY_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
-CONTEXT_WINDOW_TOKENS = 200_000  # what the UI's 100% fill represents
+CONTEXT_WINDOW_TOKENS = 200_000
 
 CHARS_PER_TOKEN = 4
-# How many of the most-recent messages to keep VERBATIM when compacting.
-#
-# Tuning history:
-#   - 4 (≈1 turn) — too small. The agent would re-derive context on every
-#     few tool calls and lose the thread of what it was mid-edit on.
-#   - 80 (≈7 turns) — too large. Each edit_file tool_call embeds the
-#     full `new_string` argument (often 1-3KB), so 80 messages could
-#     easily weigh 80K+ tokens — bigger than the 80K threshold. The
-#     compact fired but the post-compact recent-window was still over
-#     the threshold, so the LLM call stayed at ~97K and the chip never
-#     moved off 100%.
-#   - 30 (≈2-3 turns) — sweet spot. Two-to-three full agent iterations
-#     is enough for the agent to see its current reasoning chain and
-#     the most recent tool calls + results without losing the thread.
-#     At ~500-1000 tokens / message (post-mask, post-strip), 30
-#     messages is ~15-30K — well under the 80K threshold, so a
-#     post-compact LLM call lands at ~25-40K and the chip drops from
-#     100% to ~30-50%. The next turn's growth brings it back up the
-#     curve naturally, and the next compact cycle catches it.
+# Most-recent messages to keep verbatim when compacting. 4 was too small
+# (the agent lost the thread of mid-edit context); 80 was too large
+# (each edit_file tool_call embeds a 1-3KB new_string arg, so 80
+# messages could be 80K+ tokens — bigger than the threshold itself, and
+# the compact stopped actually reducing anything). 30 ≈ 2-3 turns is
+# the sweet spot: post-mask/strip/truncate, ~15-30K tokens.
 PRESERVE_RECENT = 30
 PRESERVE_RECENT_ENV_VAR = "OJAS_PRESERVE_RECENT"
 
-# --- Tool-result truncation ---
-# A single `Read` of a 30k-token log file would otherwise fill most of the
-# live window with stale content. The agent can re-`Read` if it needs the
-# fresh content — we keep the tool CALL (path + args) verbatim, since
-# that's the agent's intent, but replace the oversized result body with
-# a one-line pointer. ~200 tokens / 800 chars keeps the live window lean
-# while still letting the agent recognise "oh, that's the file I just
-# read" via the head snippet.
+# Tool-result truncation: bodies over 800 chars get collapsed to a
+# one-line pointer. The agent can re-invoke the tool to get the fresh
+# body. We keep the tool CALL (path + args) verbatim since that's
+# the agent's intent.
 TOOL_RESULT_TRUNCATE_AT_CHARS = 800
 TOOL_RESULT_TRUNCATE_ENV_VAR = "OJAS_TRUNCATE_TOOL_RESULT_AT"
 
-# COMPACT_DIRECT_RESUME_INSTRUCTION (compact.rs)
+# Preamble + tail injected as a HumanMessage at compact time, so the
+# next LLM call sees a single "this is a continuation" block followed
+# by the kept tail. Borrowed from the Rust runtime/compact.rs format.
 COMPACT_PREAMBLE = (
     "This session is being continued from a previous conversation that ran out "
     "of context. The summary below covers the earlier portion of the "
@@ -120,11 +76,8 @@ COMPACT_DIRECT_RESUME_INSTRUCTION = (
 )
 
 def _auto_compact_threshold() -> int:
-    """Auto-compaction token threshold.
-
-    Reads `OJAS_AUTO_COMPACT_INPUT_TOKENS` (new name) first, then
-    `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` (legacy alias, kept for
-    backward compatibility with anything that still sets the old var)."""
+    """Auto-compaction token threshold. New var takes precedence over the
+    legacy CLAUDE_CODE_* alias for backward compatibility."""
     for var in (AUTO_COMPACT_THRESHOLD_ENV_VAR, AUTO_COMPACT_THRESHOLD_LEGACY_ENV_VAR):
         raw = os.getenv(var)
         if raw:
@@ -162,16 +115,10 @@ def _tool_result_truncate_at() -> int:
 
 
 def _truncate_tool_result(content) -> str:
-    """Replace an oversized tool result body with a one-line pointer so the
-    live window stays small. The agent can re-`Read` / re-invoke the tool
-    if it needs the actual content again.
-
-    Keeping the first ~200 chars in the pointer is enough for the agent
-    to recognise the content (file header, first error line, command
-    output's first row). Non-string content (lists, dicts) is returned
-    unchanged — that's typically structured tool output (file diffs, JSON
-    responses) that should not be silently truncated.
-    """
+    """Replace an oversized tool result body with a one-line pointer.
+    Non-string content (lists, dicts) is returned unchanged — those are
+    typically structured tool output (diffs, JSON) that should not be
+    silently truncated."""
     if not isinstance(content, str):
         return content
     limit = _tool_result_truncate_at()
@@ -223,19 +170,12 @@ def _keep_recent_observations() -> int:
 
 
 def mask_old_observations(messages: list) -> list:
-    """Walk the message list and replace `ToolMessage.content` (and the
-    `tool_result` content-block on a list-shaped `AIMessage`) for any
-    observation older than the most recent `KEEP_RECENT_OBSERVATIONS`.
-
-    Returns a new list — original messages are not mutated. Tool CALLS
-    (on the preceding `AIMessage.tool_calls` or `tool_use` blocks) are
-    preserved verbatim: the agent's *intent* (which file it wanted to
-    read, which command it wanted to run) is what matters; the *body*
-    of the result is what's safe to mask.
-
-    Like `_truncate_live_history` in agents/nodes.py, this is a per-turn
-    transformation — the on-disk checkpoint keeps the full body. Only
-    the per-turn request gets the masked view.
+    """Replace `ToolMessage.content` (and list-shaped AIMessage
+    `tool_result` blocks) for any observation older than the most recent
+    `KEEP_RECENT_OBSERVATIONS`. Tool CALLS on the preceding AIMessage
+    are preserved — the agent's *intent* matters, the result body
+    doesn't. Per-turn transformation; the on-disk checkpoint keeps the
+    full body.
     """
     keep = _keep_recent_observations()
 
@@ -459,75 +399,36 @@ def _summarize_messages(messages: list) -> str:
     return "\n".join(parts) or "Previous conversation."
 
 def _compact_messages(messages: list) -> list:
-    """Summarise old messages, keep recent tail, return a new message list.
-
-    Bug fixes vs the prior version (round 1 of this refactor):
-
-    Bug A — system prompt preservation: the system prompt is NOT in
-    `state["messages"]`; it's rebuilt each turn from `system_prompt_pair`.
-    So `_compact_messages` doesn't need to (and shouldn't) preserve any
-    SystemMessage. The summary itself is injected as a `HumanMessage`
-    (see Bug B).
-
-    Bug B — three SystemMessages in a row: prior versions injected the
-    summary as a `SystemMessage`, which combined with the static +
-    dynamic SystemMessages at the start of the next LLM call produced
-    three consecutive system messages. Anthropic rejects this; some
-    OpenAI-compatible providers tolerate it but inconsistently. Fix:
-    the summary is now a `HumanMessage` (synthetic), so it lands in the
-    user/AI/tool flow naturally — between the dynamic system message
-    and the recent tool calls.
-
-    Bug F — dangling ToolMessage in the kept tail: prior versions walked
-    the cut BACKWARDS past tool_use/tool_result pairs but never walked
-    FORWARDS to ensure the kept tail doesn't start with a `ToolMessage`
-    whose `AIMessage` got summarised away. `_repair_orphan_tool_calls`
-    catches it downstream but at the cost of dropping the unsatisfied
-    `tool_calls` from the kept AIMessage — losing context. Fix: walk
-    the cut forward past any leading ToolMessage in the kept tail too,
-    so the AIMessage that owns them stays in the kept window.
-
-    Bug G — already-correct orphan-repair is preserved (it runs in
-    `node_agent` after compaction, so the result is consistent).
-
-    Returns a new list: `[HumanMessage(summary), ...recent_kept]`. If
-    there's nothing to summarise (cut walked all the way to 0), returns
-    the original list unchanged.
+    """Summarise old messages, keep recent tail. Returns a new list:
+    `[HumanMessage(summary), ...recent_kept]`. The summary is injected
+    as a HumanMessage (not SystemMessage) so it doesn't produce three
+    consecutive SystemMessages at the start of the next LLM call.
     """
     preserve = _preserve_recent()
-    # Standard short-circuit: not enough messages, and the local
-    # estimate is below threshold. The estimate check (in addition to
-    # the count check) is what catches the "user pasted an 1.8 MB
-    # short story" case — 4 messages but 450k tokens. Without it the
-    # compact would skip a session whose prompt is already over the
-    # threshold, and the chip would stay at 100% forever.
-    if len(messages) <= preserve and _estimate_tokens(messages) < _auto_compact_threshold():
+    threshold = _auto_compact_threshold()
+    # Bail only when both count AND estimate are small. A 1.8 MB
+    # user-pasted short story is 4 messages but ~450K tokens, so the
+    # length check alone would skip a session that's already over
+    # threshold.
+    if len(messages) <= preserve and _estimate_tokens(messages) < threshold:
         return messages
 
-    # Pre-filter: drop any SystemMessage in the history. They don't belong
-    # in `state["messages"]` in the first place (the actual system prompt
-    # is in `state["system_prompt_pair"]` and rebuilt every turn), but if
-    # a stale one slipped in we don't want to leak it through compaction.
+    # Drop any stray SystemMessage (the real system prompt is rebuilt
+    # each turn from `system_prompt_pair`).
     messages = [m for m in messages if not isinstance(m, SystemMessage)]
-    if len(messages) <= preserve and _estimate_tokens(messages) < _auto_compact_threshold():
+    if len(messages) <= preserve and _estimate_tokens(messages) < threshold:
         return messages
 
-    # Standard cut: keep the last `preserve` messages verbatim, summarise
-    # the rest. If the list is shorter than `preserve` (e.g. 4 messages
-    # with one 1.8 MB paste) we still cut at least one message from the
-    # front so the single huge message gets replaced by a summary
-    # instead of staying in full. The cut is bounded below by 1 — we
-    # never summarise ALL messages (an empty kept-tail would leave the
-    # next LLM call with no conversation to continue from).
+    # Keep the last `preserve` messages verbatim, summarise the rest.
+    # If the list is shorter than `preserve` but still over threshold
+    # (the 4-message / 1.8MB case), cut at least 1 from the front so
+    # the giant message gets replaced with a summary.
     cut = max(1, len(messages) - preserve) if len(messages) > preserve else 1
 
-    # Walk the cut BACKWARDS past any tool-result blocks so we don't
-    # summarise the AIMessage that owns them while keeping its result
-    # (or vice versa). Two equivalent shapes to detect:
-    #   - Anthropic: a single message whose content list contains a
-    #     `tool_result` block (paired with the preceding `tool_use` block).
-    #   - OpenAI / MiniMax: a separate ToolMessage whose `tool_call_id`
-    #     points back to a tool_calls entry on the preceding AIMessage.
+    # Walk cut BACKWARDS past tool_result blocks so we don't summarise
+    # an AIMessage while keeping its result, or vice versa. Two shapes
+    # to detect: separate ToolMessage (OpenAI/MiniMax) or list-shaped
+    # AIMessage with a `tool_result` content block (Anthropic).
     while cut > 0:
         msg = messages[cut]
         if isinstance(msg, ToolMessage):
@@ -581,22 +482,10 @@ def _compact_messages(messages: list) -> list:
 
 
 def record_llm_input_tokens(input_tokens: int, session_id: str | None = None) -> None:
-    """Called by nodes.py after each LLM call. Stores the LLM-reported
-    `input_tokens` so maybe_compact() can use it as the primary trigger.
-
-    Pass 0 or a negative value to clear (e.g. on a session restart).
-
-    Also writes to a module-level dict keyed by `session_id` so the
-    value survives ACROSS turns. The ContextVar
-    (_LAST_LLM_INPUT_TOKENS) is per-context, and `run_turn` does
-    `ctx = contextvars.copy_context()` for each turn — so the
-    ContextVar resets to 0 at the start of every turn, and the
-    primary "did the LLM just see > threshold tokens?" trigger
-    never fires. The module-level dict + (when session_id is
-    available) DB-persisted `sessions.last_context_used` is the
-    actual primary trigger; the ContextVar is kept for backwards
-    compat (some test paths still call it without a session_id).
-    """
+    """Stores the LLM-reported `input_tokens` so maybe_compact() can use
+    it as the trigger. Writes to a module-level dict keyed by
+    `session_id` (the ContextVar alone is per-context and resets to 0
+    at the start of every turn — run_turn does `copy_context()`)."""
     value = 0
     try:
         value = max(0, int(input_tokens))
@@ -608,13 +497,10 @@ def record_llm_input_tokens(input_tokens: int, session_id: str | None = None) ->
 
 
 def _last_llm_input_tokens(session_id: str | None = None) -> int:
-    """The LLM-reported input_tokens from the most recent call. 0 if no
-    call has happened yet — in which case maybe_compact falls back
-    to the local character-based estimate.
-
-    Reads from the per-session module dict first (cross-turn),
-    then falls back to the ContextVar (per-context, for tests
-    and code paths that call without a session_id)."""
+    """LLM-reported input_tokens from the most recent call. 0 if no
+    call has happened yet (maybe_compact falls back to the local
+    estimate). Per-session module dict first (cross-turn), then the
+    ContextVar (per-context, for tests)."""
     if session_id:
         v = _LAST_INPUT_TOKENS_BY_SESSION.get(session_id)
         if v is not None:
@@ -623,83 +509,49 @@ def _last_llm_input_tokens(session_id: str | None = None) -> int:
 
 
 def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, bool, dict]:
-    """Compact the message list NOW if it crosses the auto-compaction threshold.
+    """Compact the message list NOW if it crosses the auto-compaction
+    threshold. Called by the agent loop BEFORE `model.invoke(messages)`
+    so the turn that crosses threshold pays for the smaller compacted
+    context, not the giant one.
 
-    Called by the agent loop BEFORE `model.invoke(messages)`, so the turn that
-    crosses the threshold pays for the smaller compacted context rather than
-    the giant one. The old `put()`-time check fired AFTER the LLM had already
-    been billed for the full history — late fire, paid twice.
-
-    Returns `(messages, did_compact, info)`. `info` is empty when no
-    compaction happened. When compaction did happen, `info` carries the
-    structured payload for the chat-visible `context_compacted` event:
-      - removed (int): messages summarised away
-      - kept (int): messages kept verbatim
-      - tokens_before (int): local estimate of the message-list size before
-      - tokens_after (int): same, after
-      - summary_preview (str): first 280 chars of the summary that was
-        injected as a HumanMessage, so the user can SEE what the agent
-        now remembers about the earlier turns.
+    Returns `(messages, did_compact, info)`. `info` is the payload for
+    the chat-visible `context_compacted` event — `removed`, `kept`,
+    `tokens_before`, `tokens_after`, and `summary_preview` (first 280
+    chars of the injected summary).
     """
-    # Bail out only when the local estimate is BOTH small in message
-    # count AND small in token count. A `len(messages) <= preserve_recent`
-    # short-circuit was wrong here: a single user-pasted 1.8 MB short
-    # story is 4 messages but ~450k tokens, and the LLM's prompt cache
-    # is fully saturated. The compact must still fire to summarise the
-    # giant content. The cost of always running the local estimate is
-    # ~one pass over a small list, so dropping the short-circuit is
-    # safe.
+    threshold = _auto_compact_threshold()
     est = _estimate_tokens(messages)
-    if len(messages) <= _preserve_recent() and est < _auto_compact_threshold():
+    if len(messages) <= _preserve_recent() and est < threshold:
         return messages, False, {}
 
-    # Primary trigger: the LLM's own reported input_tokens from the
-    # most recent call. This is the same number the chat chip shows
-    # as "% used", so the two stay in lockstep — when the chip goes
-    # red (>=90%), auto-compact will fire on the next turn. Falls
-    # back to the local estimate for the very first turn (no LLM
-    # call has happened yet, so we have no input_tokens to compare).
-    # `session_id` is needed to read the cross-turn module-level
-    # cache; without it, we'd fall back to the per-context
-    # ContextVar which resets to 0 every turn (each `run_turn` does
-    # `copy_context()`). The local estimator underestimates by 5-6x
-    # (no system prompt, no tool defs, no JSON envelope), so a
-    # session genuinely above threshold can look "fine" by the local
-    # number — the LLM-count trigger is the only reliable one.
-    threshold = _auto_compact_threshold()
+    # Primary trigger: the LLM's own reported input_tokens (same number
+    # the chip shows, so chip + trigger stay in lockstep). Local
+    # estimate underestimates by 5-6× (no system prompt, no tool defs,
+    # no JSON envelope), so the LLM-count is the only reliable signal.
+    # Falls back to the local estimate for the very first turn.
     last_input = _last_llm_input_tokens(session_id)
     if last_input > 0:
         if last_input < threshold:
             return messages, False, {}
-    else:
-        # First-turn path: no LLM call yet, use the local estimator.
-        if _estimate_tokens(messages) < threshold:
-            return messages, False, {}
-    tokens_before = _estimate_tokens(messages)
+    elif est < threshold:
+        return messages, False, {}
+
+    tokens_before = est
     compacted = _compact_messages(messages)
     removed = len(messages) - len(compacted)
-    # "Did the compact actually shrink the prompt?" Two ways to answer:
-    #   (a) message count went down — many small messages summarised away
-    #   (b) token count went down — one giant message summarised, but
-    #       the message count is the same. The "user pasted 1.8 MB" case
-    #       hits (b) only: 4 messages in, 4 messages out, but msg[0] is
-    #       now a 1 KB summary instead of 1.8 MB. Without the (b) check
-    #       the compact would silently no-op, the chip would stay at
-    #       100%, and the user would never see the 📦 card.
+    # "Did the compact shrink the prompt?" Two ways: (a) message count
+    # went down (many small messages), or (b) tokens went down (one
+    # giant message replaced by a summary — the 1.8MB user-paste case:
+    # 4 messages in, 4 out, but msg[0] is now 1KB instead of 1.8MB).
     tokens_after = _estimate_tokens(compacted)
     if removed <= 0 and tokens_after >= tokens_before:
         return messages, False, {}
 
-    # Pull the first 280 chars of the summary block for the chat-visible
-    # message. The full summary is in the conversation as a HumanMessage
-    # — the user can always scroll up to read it, but a one-line preview
-    # in the chat header tells them WHAT got summarised at a glance.
+    # First 280 chars of the summary, with the preamble + tail stripped
+    # (both are noise for the chat-visible preview).
     summary_preview = ""
     if compacted and isinstance(compacted[0], HumanMessage):
         first = compacted[0].content if isinstance(compacted[0].content, str) else ""
-        # Strip the "this session is being continued…" preamble and
-        # the "Recent messages are preserved verbatim" tail — both are
-        # noise for the chat-visible preview. Just keep the summary body.
         if "Summary:" in first:
             first = first.split("Summary:", 1)[1]
         if "Recent messages are preserved verbatim" in first:

@@ -1506,18 +1506,10 @@ def sessions_get(session_id: str, user: dict = Depends(require_user)):
 
 @app.get("/api/sessions/{session_id}/llm-trace")
 def sessions_llm_trace(session_id: str, user: dict = Depends(require_user)):
-    """Return the recent LLM call trace for this session.
-
-    Each entry is one wire-level request/response pair: the full
-    prompt sent to the provider (system + history + tools), the full
-    response (content + tool_calls + thinking), the provider's
-    usage_metadata (input / output / cache_read / cache_creation),
-    the wall-clock duration, and the model name. Used by the
-    LLM Trace debug panel to let the user see EXACTLY what was
-    sent and what came back — so they can debug prompt-size,
-    cache-hit, and tool-call questions without tailing journalctl.
-
-    Capped at the 50 most-recent calls (memory.llm_trace.MAX_RECORDS).
+    """Return the recent LLM call trace for this session. Each entry
+    is one wire-level request/response pair: full prompt, full
+    response, usage_metadata, duration, model name. Capped at the
+    50 most-recent calls (memory.llm_trace.MAX_RECORDS).
     The trace is process-local; it does not survive a backend restart.
     The full message history is still in the LangGraph checkpointer —
     this is the wire-level audit log only.

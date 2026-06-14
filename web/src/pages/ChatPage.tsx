@@ -243,11 +243,7 @@ export default function ChatPage() {
     try { return localStorage.getItem("debug_stream") === "1"; }
     catch { return false; }
   });
-  // LLM trace panel: wire-level view of every request/response pair
-  // the server made to the LLM provider (system prompt + history +
-  // tools, and the response that came back). Persists across reloads
-  // because the user will want to keep it open while iterating on
-  // the agent's behaviour.
+  // LLM trace panel toggle (⌥ llm button).
   const [llmTraceOpen, setLlmTraceOpen] = useState<boolean>(false);
   const [debugEvents, setDebugEvents] = useState<
     { kind: string; payload: any; ts: number }[]
@@ -1634,9 +1630,7 @@ export default function ChatPage() {
         />
       )}
 
-      {/* LLM call trace — wire-level view of every request/response
-          pair the server made to the provider. Use this to debug
-          prompt-size, cache-hit, and tool-call questions. */}
+      {/* Wire-level LLM call trace panel (⌥ llm). */}
       {llmTraceOpen && sessionId && (
         <LLMTracePanel
           sessionId={sessionId}

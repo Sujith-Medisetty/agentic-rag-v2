@@ -1,30 +1,7 @@
 // LLMTracePanel — wire-level LLM call trace for the active session.
-//
-// What this shows:
-//   For every LLM call the agent made in this session (capped at the
-//   server's MAX_RECORDS=50 ring buffer), show the EXACT request
-//   payload (system prompt + message history + tool definitions) and
-//   the EXACT response that came back. Plus usage_metadata so you
-//   can see the input/output/cache split.
-//
-// Why:
-//   The per-turn stats the chat shows ("In 97k · 114 cached · 97k
-//   new") are aggregated summaries. To debug why the prompt is
-//   unexpectedly large, why the cache isn't hitting, or which tool
-//   call the model produced, you need the raw bytes. This is that
-//   view.
-//
-// UX:
-//   - Full-screen overlay (similar to DebugStream)
-//   - List of LLM calls on the left, newest first
-//   - Each call shows: timestamp, iteration #, model, duration,
-//     in/out tokens, cache split, finish_reason
-//   - Click → expands to show full request_messages + response
-//   - Request messages: role, content, tool_calls, thinking blocks
-//   - Response: content + tool_calls + additional_kwargs
-//   - "Refresh" button to re-fetch (since the buffer grows during
-//     the session and stale panels miss the latest call)
-//   - "Clear" button wipes the server-side buffer
+// Full-screen overlay: list of calls on the left, request/response
+// detail on the right. Refetches on Refresh; Clear wipes the server
+// buffer. Esc to close.
 
 import { memo, useEffect, useState, useCallback } from "react";
 import { sessionApi } from "@/lib/api";
@@ -75,10 +52,9 @@ function bytesOf(x: unknown): number {
 }
 
 function approxTokensOf(x: unknown): number {
-  // Rough — 1 token ≈ 4 chars. Same heuristic the server uses
-  // locally for the compact estimate; the actual LLM-reported
-  // `input_tokens` is the truth, this is for the per-message
-  // visual only.
+  // 1 token ≈ 4 chars. Same heuristic the server uses for the compact
+  // estimate; the LLM-reported `input_tokens` is the truth, this is
+  // for the per-message visual only.
   return Math.round(bytesOf(x) / 4);
 }
 
@@ -134,7 +110,7 @@ function summarizeUsage(usage: Record<string, unknown>): {
   cacheCreation = Number(
     (details as any).cache_creation_tokens ?? (details as any).cache_creation ?? 0,
   );
-  // OpenAI/Anthropic native shape: cache fields at top level
+  // OpenAI/Anthropic native shape: cache fields at top level.
   if (!cacheRead)
     cacheRead = Number(
       (usage as any).cache_read_input_tokens ?? 0,
@@ -255,8 +231,7 @@ function LLMTracePanelImpl({ sessionId, onClose }: Props) {
     try {
       const res = await sessionApi.llmTrace(sessionId);
       setData(res);
-      // Auto-expand the most recent call so the user lands on
-      // something useful rather than a closed list.
+      // Auto-expand the most recent call.
       if (res.calls.length > 0 && expandedCall == null) {
         setExpandedCall(res.calls.length - 1);
       }
@@ -282,7 +257,6 @@ function LLMTracePanelImpl({ sessionId, onClose }: Props) {
     }
   }, [sessionId, load]);
 
-  // Esc to close
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();

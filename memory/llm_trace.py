@@ -1,28 +1,9 @@
 """
-Per-session LLM call trace store.
-
-Records every request/response pair the agent makes to the LLM, so the
-user can see the EXACT prompt being sent and the EXACT response coming
-back — including the system prompt, the message history (post-compact,
-post-mask, post-strip, post-trim), the tool definitions, and the
-usage_metadata the provider reports back.
-
-Why: the "In 97k · 114 cached · 97k new" stat the user sees on a turn
-is a SUMMARY. To debug why the prompt is large, why the cache isn't
-hitting, or why a specific tool call was made, you need to see the
-raw bytes. This is that view.
-
-Design:
-  - In-memory ring buffer per session, capped at MAX_RECORDS = 50 calls.
-  - Records are dropped on session end (no persistence — the LangGraph
-    checkpointer already has the canonical message history; the trace
-    is a debug-only artifact of "what actually went over the wire").
-  - Thread-safe: writes happen from the LangGraph worker thread, reads
-    happen from the FastAPI async handler. The store uses a Lock.
-  - Defensive serialization: messages can contain non-JSON-able
-    objects (e.g. tool_call_id, structured content blocks). We
-    `model_dump()` them to plain dicts on write so the GET endpoint
-    returns pure JSON.
+Per-session LLM call trace store. In-memory ring buffer (capped at
+MAX_RECORDS=50) of the wire-level request/response pair for each LLM
+call. Process-local (no persistence — the LangGraph checkpointer has
+the canonical history; the trace is a debug-only view of "what
+actually went over the wire"). Thread-safe via a Lock.
 """
 
 from __future__ import annotations
@@ -44,18 +25,17 @@ class LLMCallRecord:
     `request_messages` is the list passed to `model.stream(messages)`
     in agents.nodes._stream_model_call. Includes the SystemMessages
     (static + dynamic), all prior HumanMessages / AIMessages /
-    ToolMessages, and the freshly-appended HumanMessage for this turn
-    (or not, depending on where in the loop we are).
-
-    `response` is the aggregated AIMessageChunk (or AIMessage) returned
-    by the model. Includes `content` (text + thinking), `tool_calls`,
-    `additional_kwargs`, `response_metadata`, `usage_metadata`.
-
-    `duration_ms` is wall-clock from `model.stream()` start to end —
-    includes network time, model thinking, and the streaming send
-    back. Useful to distinguish "the model took 8s to think" from
-    "we waited 5s for the network".
-    """
+    (system + history + tools) and the model's reply. `duration_ms` is
+    wall-clock from `model.stream()` start to end (includes network,
+    model thinking, and the streaming send-back)."""
+    ts: float
+    iteration: int
+    model: str
+    request_messages: list[dict]
+    response: dict
+    usage: dict
+    duration_ms: int
+    finish_reason: str = ""
     ts: float                         # time.time() at end of call
     iteration: int                    # node_agent's iteration counter
     model: str                        # model name (MiniMax-M3, etc.)
@@ -79,11 +59,8 @@ class LLMCallRecord:
 
 
 class LLMTraceStore:
-    """Per-session ring buffer of LLMCallRecord.
-
-    Used as a process-wide singleton: a single instance is created at
-    server startup and shared across all requests. Keys are session_id.
-    """
+    """Per-session ring buffer of LLMCallRecord. Process-wide singleton
+    shared across all requests. Keys are session_id."""
 
     def __init__(self) -> None:
         self._by_session: dict[str, deque[LLMCallRecord]] = {}
@@ -109,7 +86,7 @@ class LLMTraceStore:
             self._by_session.pop(session_id, None)
 
 
-# Module-level singleton, lazily initialised on first call.
+# Lazy module-level singleton.
 _store: LLMTraceStore | None = None
 _store_lock = threading.Lock()
 
@@ -129,17 +106,8 @@ def get_store() -> LLMTraceStore:
 # ---------------------------------------------------------------------------
 
 def _message_to_dict(m: Any) -> dict:
-    """Best-effort plain-dict conversion of a LangChain message.
-
-    Handles:
-      - BaseMessage (use .model_dump() since langchain-core>=0.1)
-      - Plain dict (pass through)
-      - Anything else: repr()
-
-    We pull the fields a debugger cares about and let the rest fall
-    through `additional_kwargs` / `response_metadata` (which model_dump
-    already flattens).
-    """
+    """Plain-dict conversion of a LangChain message for JSON output.
+    Falls back to manual attr read if model_dump() isn't available."""
     if isinstance(m, dict):
         return m
     if hasattr(m, "model_dump"):
@@ -170,10 +138,9 @@ def _message_to_dict(m: Any) -> dict:
 
 
 def _role_of(m: Any) -> str:
-    """Map a LangChain message class to its short role name.
-
-    `AIMessage` → 'assistant', `HumanMessage` → 'user', etc.
-    The class name is the most reliable signal — `type` is overloaded."""
+    """Map a LangChain message class to its short role name (AIMessage →
+    'assistant', HumanMessage → 'user', etc). Class name is the most
+    reliable signal — `type` is overloaded."""
     cls = type(m).__name__
     return {
         "SystemMessage": "system",
