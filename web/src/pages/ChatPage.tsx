@@ -2108,6 +2108,48 @@ function ContextChip({
 }) {
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
+  // Popover state. The chip is a click-toggle target — clicking
+  // it (or tapping it on mobile) opens a detailed popover with
+  // the same info the old `title=` hover-tooltip showed, but
+  // readable and dismissable on touch devices. The browser's
+  // native `title` only works on hover and is invisible on
+  // mobile, so we replace it with a real popover. Clicking the
+  // chip again toggles the popover closed; clicking outside
+  // closes it; Esc closes it. Hover-to-open on desktop is
+  // deliberately NOT added back — it would conflict with the
+  // click toggle (hover-then-mouseout would close what hover
+  // just opened on devices that have a mouse) and the click
+  // model is the one that works on touch.
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  // Click-outside-to-close. The popover lives inside `wrapperRef`
+  // along with the chip button, so a click on the chip toggles
+  // (button onClick) but a click anywhere else on the page closes
+  // (this document listener). Mouse and touch are bound separately
+  // because TS infers the event type from the listener name —
+  // MouseEvent and TouchEvent don't share a base class with the
+  // fields we need.
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: Event) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("touchstart", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("touchstart", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   // Cap the displayed percentage at 100% — the chip is a
   // "till the next auto-compact" gauge, not a "how many times
   // over" indicator. Once `used >= threshold`, auto-compact
@@ -2139,57 +2181,86 @@ function ContextChip({
 
   const label = compacting ? "Compacting…" : `${pctUsed}% used`;
 
-  // Tooltip: full context + compact trail + cache split. The
-  // chip's "% used" label is computed against `used` (the NEW
-  // tokens — what the model has to actually think about this
-  // turn, net of cache). The tooltip unpacks the breakdown so
-  // the user can see "X new (this is the chip), Y cached
+  // Popover body: full context + compact trail + cache split.
+  // The chip's "% used" label is computed against `used` (the
+  // NEW tokens — what the model has to actually think about
+  // this turn, net of cache). The popover unpacks the breakdown
+  // so the user can see "X new (this is the chip), Y cached
   // (served from prefix, much cheaper), Z total prompt (the
   // model was given Z tokens of context this turn)". The
   // breakdown matters for users who want to know "why is the
   // chip calm while the model call was big" — answer: most
   // of it was cached.
-  const tooltipLines: string[] = [];
-  if (compacting) {
-    tooltipLines.push("Compacting context — summarising older turns to keep the session running");
-  } else {
-    const totalPrompt = used + cacheRead + cacheCreation;
-    tooltipLines.push(
-      `Context: ${fmt(used)} new (uncached + writes). `
-      + `Auto-compact fires at ${fmt(threshold)}.`
-    );
-    if (totalPrompt > used || cacheRead > 0) {
-      const hitRate = totalPrompt > 0
-        ? Math.round((cacheRead / Math.max(1, totalPrompt)) * 100)
-        : 0;
-      tooltipLines.push(
-        `Total prompt this turn: ${fmt(totalPrompt)} (${fmt(cacheRead)} cache hits${cacheCreation > 0 ? `, ${fmt(cacheCreation)} cache writes` : ""}${hitRate > 0 ? `, ${hitRate}% hit rate` : ""})`
-      );
-    }
-  }
-  if (compactCount > 0) {
-    tooltipLines.push(
-      `${compactCount} compaction${compactCount === 1 ? "" : "s"} this session`
-      + (lastCompactSavedTokens > 0
-        ? ` · last one freed ${fmt(lastCompactSavedTokens)} tokens`
-        : ""),
-    );
-  }
+  const totalPrompt = used + cacheRead + cacheCreation;
+  const hitRate = totalPrompt > 0
+    ? Math.round((cacheRead / Math.max(1, totalPrompt)) * 100)
+    : 0;
 
   return (
-    <div
-      className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border ${borderCls} px-2 py-0.5 font-sans backdrop-blur-sm`}
-      title={tooltipLines.join("\n")}
-    >
-      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
-      <span className={`text-tx-xs font-medium ${textCls}`}>{label}</span>
-      {compactCount > 0 && !compacting && (
-        <span
-          className="text-tx-xs text-text/50"
-          title={`${compactCount} auto-compact${compactCount === 1 ? "" : "s"} fired this session`}
+    <div ref={wrapperRef} className="relative inline-flex shrink-0">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border ${borderCls} px-2 py-0.5 font-sans backdrop-blur-sm transition hover:border-text/30`}
+        title="Click for context details"
+      >
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
+        <span className={`text-tx-xs font-medium ${textCls}`}>{label}</span>
+        {compactCount > 0 && !compacting && (
+          <span className="text-tx-xs text-text/50">
+            ·{compactCount}×
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div
+          role="dialog"
+          aria-label="Context usage details"
+          className="absolute right-0 top-full z-50 mt-1.5 w-72 rounded-md border border-border bg-elevated/95 p-3 text-tx-xs text-text shadow-lift backdrop-blur-md"
+          // Stop the popover itself from registering a mousedown that
+          // the document-level click-outside listener would otherwise
+          // treat as "outside" and close. Clicks INSIDE the popover
+          // (e.g. selecting text) shouldn't dismiss it.
+          onMouseDown={(e) => e.stopPropagation()}
+          onTouchStart={(e) => e.stopPropagation()}
         >
-          ·{compactCount}×
-        </span>
+          {compacting ? (
+            <p className="text-text/80">
+              <span className="font-medium text-accent">Compacting context</span>
+              {" — summarising older turns to keep the session running."}
+            </p>
+          ) : (
+            <>
+              <p className="mb-1.5 text-text/90">
+                <span className="font-medium">{fmt(used)}</span> new (uncached + writes).
+                {" "}Auto-compact fires at <span className="font-medium">{fmt(threshold)}</span>.
+              </p>
+              {(totalPrompt > used || cacheRead > 0) && (
+                <p className="mb-1.5 text-text/70">
+                  Total prompt this turn: <span className="font-medium">{fmt(totalPrompt)}</span>
+                  {cacheRead > 0 && <> · <span className="font-medium">{fmt(cacheRead)}</span> cache hits</>}
+                  {cacheCreation > 0 && <> · <span className="font-medium">{fmt(cacheCreation)}</span> cache writes</>}
+                  {hitRate > 0 && <> · <span className="font-medium">{hitRate}%</span> hit rate</>}
+                </p>
+              )}
+            </>
+          )}
+          {compactCount > 0 && (
+            <p className="mt-1.5 border-t border-border/40 pt-1.5 text-text/70">
+              <span className="font-medium">{compactCount}</span>
+              {" "}compaction{compactCount === 1 ? "" : "s"} this session
+              {lastCompactSavedTokens > 0 && (
+                <> · last one freed <span className="font-medium">{fmt(lastCompactSavedTokens)}</span> tokens</>
+              )}
+            </p>
+          )}
+          <p className="mt-2 border-t border-border/40 pt-1.5 text-tx-[10px] text-text/40">
+            Click the chip again or press Esc to close.
+          </p>
+        </div>
       )}
     </div>
   );
