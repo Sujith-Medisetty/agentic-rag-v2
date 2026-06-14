@@ -542,11 +542,20 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
                 parts.append(f"[{raw.return_code_interpretation}]")
             out = "\n".join(parts) or "(no output)"
         _hook_runner.post_tool_use("bash", json.dumps(inp), out[:500])
-        # Cap output at 50 KB — the LLM doesn't need a 900 KB `grep` result,
-        # and a 900 KB message sits in the conversation history for every
-        # subsequent turn. Keep first 25K + last 5K + a clear truncation
-        # marker so the agent can re-run with a more specific filter.
-        return _truncate_output(out, max_chars=50_000)
+        # Smart head+tail truncation with failure-aware weights and a
+        # session-scoped spill file. The bash tool's old head-only 16 KB
+        # cap dropped the tail (where TS errors / stack traces live); the
+        # new strategy:
+        #   - 10 KB inline cap by default (≈ 2,500 tokens; tunable via
+        #     OJAS_BASH_MAX_OUTPUT_CHARS up to 150 KB to match CC).
+        #   - Success: 50/50 head/tail — universal across `cat`, build
+        #     logs, test summaries.
+        #   - Failure: 28/62 head/tail — error blocks and stack traces
+        #     are always at the end, and they need to survive intact.
+        #   - Full output is spilled to /tmp/ojas-bash/<sid>/... and
+        #     the marker tells the LLM exactly how to `grep` or
+        #     `sed -n 'N,Mp'` a middle slice out of it.
+        return _smart_truncate_bash_output(out, raw.return_code_interpretation)
     except Exception as e:
         _hook_runner.post_tool_failure("bash", json.dumps(inp), str(e))
         return f"Error: {e}"
@@ -619,6 +628,221 @@ def _truncate_output(out: str, *, max_chars: int = 50_000) -> str:
           f"\\| head -200) to see this section…]\n\n"
         + tail
     )
+
+
+# ---------------------------------------------------------------------------
+# Smart bash output truncation
+# ---------------------------------------------------------------------------
+# The bash tool's output is the most expensive piece of context we hand
+# to the LLM: `npm run verify`, `cargo test`, `pytest -v`, and `vite build`
+# routinely produce 5-50 KB of stdout, and the agent's first instinct on
+# a failure is to retry — which re-injects the same large tool_result into
+# the next turn's prompt, paying the cost N times.
+#
+# Strategy (head+tail with failure-aware weights + spill to temp file):
+#   1. Keep an inline preview of <max_chars> bytes (default 10 KB, tunable
+#      via OJAS_BASH_MAX_OUTPUT_CHARS; ceiling 150 KB to match the CC
+#      default — going higher than that means the inline preview is
+#      costing more than the full file would).
+#   2. For SUCCESSES, split ~50/50 head/tail — universal enough for
+#      `cat`, `git log`, `find`, build logs, and test summaries alike.
+#      For FAILURES, flip to ~30 head / ~65 tail — the error block, exit
+#      code, and concluding line are always at the end, and the LLM
+#      needs them intact to diagnose.
+#   3. Anything that was cut is written to a session-scoped temp file
+#      (`/tmp/ojas-bash/<session_id>/bash-<ts>-<hash>.log`) and the
+#      path is embedded in the truncation marker. The agent can
+#      `read_file` that path (full content) or `sed -n 'N,Mp' <spill>`
+#      (a 1–2 KB slice) or `grep -E 'error|Error' <spill>` (a filtered
+#      view) — all of these are cheap, single bash calls.
+#   4. The marker explicitly tells the LLM how to recover middle
+#      content. Without that hint, a model that sees "everything looks
+#      fine" in the inline preview will sometimes declare success
+#      instead of grepping the spill for the real error.
+
+import os
+
+def _bash_inline_max_chars() -> int:
+    """Resolve the inline cap from the env var, clamped to a sane range.
+    The env-var ceiling of 150 KB matches the CC spec — going higher
+    would defeat the point of truncation (the inline preview costs
+    ~37,500 tokens at 150 KB, and the full file would have been
+    cheaper)."""
+    raw = os.getenv("OJAS_BASH_MAX_OUTPUT_CHARS", "10000")
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 10_000
+    return max(2_000, min(n, 150_000))
+
+def _bash_spill_dir() -> Path:
+    """Resolve the spill dir from the env var (default /tmp/ojas-bash)."""
+    return Path(os.getenv("OJAS_BASH_SPILL_DIR", "/tmp/ojas-bash"))
+
+# Per-session cap on the spill dir, so a runaway session can't fill /tmp.
+# 100 MiB is ~25× the largest realistic session, so the cap is a true
+# safety net — not a budget.
+_BASH_SPILL_DIR_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _bash_spill_dir_for_session(session_id: str | None) -> Path:
+    """Return (and create) the spill dir for this session. Sessions scope
+    spill files so a `read_file` call gets a clear, self-explanatory path
+    and so cleanup can target one dir per session. Falls back to
+    `_global` when there's no active session (CLI, tests)."""
+    sub = session_id or "_global"
+    d = _bash_spill_dir() / sub
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _bash_spill_dir_size(d: Path) -> int:
+    total = 0
+    try:
+        for p in d.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _spill_bash_output(out: str, session_id: str | None) -> str | None:
+    """Write the full bash output to a session-scoped temp file. Returns
+    the file path (as a string) so the caller can embed it in the
+    truncation marker, or None if the spill couldn't be written.
+
+    Failure is non-fatal — the truncation marker just won't reference a
+    file, and the agent will see the inline preview only.
+
+    Naming: nanosecond timestamp + content hash. The hash lets us
+    visually confirm two spills are identical (cheap dedup-by-eyeball
+    for the agent), and the nanosecond timestamp keeps two consecutive
+    identical-output commands from overwriting each other. (Millisecond
+    resolution wasn't enough — fast test suites or parallel bash calls
+    can produce two truncations within the same ms.)"""
+    if not out:
+        return None
+    try:
+        d = _bash_spill_dir_for_session(session_id)
+        # Soft cap: skip the spill if the session's spill dir is already
+        # over budget. The inline preview still goes to the LLM.
+        if _bash_spill_dir_size(d) > _BASH_SPILL_DIR_MAX_BYTES:
+            return None
+        import hashlib
+        import time
+        h = hashlib.sha1(out.encode("utf-8", errors="replace")).hexdigest()[:10]
+        ts = time.time_ns()
+        path = d / f"bash-{ts}-{h}.log"
+        path.write_text(out, encoding="utf-8")
+        return str(path)
+    except Exception:
+        return None
+
+
+def _smart_truncate_bash_output(
+    out: str,
+    return_code_interp: str | None,
+    *,
+    max_chars: int | None = None,
+) -> str:
+    """Head+tail truncate bash output with failure-aware weights, and
+    spill the full output to a temp file the agent can read.
+
+    Args:
+        out: The combined stdout+stderr+exit-code string, already
+            formatted by the bash wrapper.
+        return_code_interp: e.g. "exit_code:1" — non-None + starts with
+            "exit_code:" indicates a failure. None / anything else is a
+            success or a control flow event (timeout, refused-by-guard).
+        max_chars: Inline cap override. Defaults to OJAS_BASH_MAX_OUTPUT_CHARS
+            (10 KB), clamped to [2 KB, 150 KB]. 10 KB ≈ 2,500 tokens —
+            rich enough to fit a build summary and most pytest failures,
+            cheap enough that 20 bash calls in a session costs ~50K
+            tokens (vs 150K at the 30K CC default).
+    """
+    if max_chars is None:
+        max_chars = _bash_inline_max_chars()
+    if not out or len(out) <= max_chars:
+        return out
+
+    is_failure = bool(return_code_interp) and return_code_interp.startswith("exit_code:")
+    # Reserve ~5% of the budget for the marker so the LLM always gets
+    # a clear pointer to the spill file and a recipe for fetching a
+    # middle slice. The actual marker is 400-700 chars depending on
+    # whether the spill was written and how long the path is.
+    if is_failure:
+        head_budget = int(max_chars * 0.28)
+        tail_budget = int(max_chars * 0.62)
+    else:
+        # 50/50 split is more universal than 70/30: it works equally
+        # well for `cat`, `git log`, `find`, and build outputs.
+        head_budget = int(max_chars * 0.45)
+        tail_budget = int(max_chars * 0.45)
+
+    head = out[:head_budget]
+    tail = out[-tail_budget:]
+    dropped = len(out) - head_budget - tail_budget
+
+    # Try to spill the full output to a session-scoped temp file so the
+    # agent can `read_file` the original if the inline preview isn't
+    # enough.
+    sid: str | None = None
+    try:
+        from tools.sandbox import active_session_id
+        sid = active_session_id()
+    except Exception:
+        sid = None
+    spill_path = _spill_bash_output(out, sid)
+
+    # Build the marker. The marker text is the single most important
+    # defence against the "model hallucinates success after a middle
+    # error" footgun — we explicitly tell the LLM what to do if it
+    # doesn't see an error in the inline preview.
+    #
+    # The marker also carries structured numbers (kept_first / kept_last /
+    # dropped / total) that the chat UI parses to render a clear
+    # "Output was truncated: first N + last M of T total chars" notice
+    # under the bash tool card. Format is stable: grep the marker text
+    # for `kept_first=X, kept_last=Y, dropped=Z, total=T` if you need
+    # to extract it programmatically.
+    verdict = "FAILURE" if is_failure else "SUCCESS"
+    total_chars = len(out)
+    lines: list[str] = [
+        f"\n\n[…truncated {dropped:,} chars; this was a {verdict}.",
+        f"# truncation: kept_first={head_budget}, kept_last={tail_budget}, dropped={dropped}, total={total_chars}",
+    ]
+    if spill_path:
+        lines.append(
+            f"Full output saved to `{spill_path}`."
+        )
+        if is_failure:
+            # Specific recipe for the footgun case: the error might be
+            # in the middle, not in the tail. Don't trust the inline
+            # preview alone.
+            lines.append(
+                "If you don't see the error here, it may be in the "
+                "truncated middle — scan the spill with: "
+                f"`grep -E 'error|Error|ERROR|ENOENT|EACCES|TS[0-9]+' {spill_path}`."
+            )
+        else:
+            lines.append(
+                "To see a specific middle section, run e.g. "
+                f"`sed -n '5000,5500p' {spill_path}` for a small slice."
+            )
+    else:
+        lines.append(
+            "Re-run with a tighter filter (e.g. `… 2>&1 | tail -200`, "
+            "`… 2>&1 | grep -E 'error|Error|ERROR'`) to see the missing "
+            "section inline."
+        )
+    lines.append("…]\n\n")
+    marker = "\n".join(lines)
+
+    return head + marker + tail
 # ============================================================================
 # GIT (single tool covering read + write; mode is gated by the safety layer)
 # ============================================================================

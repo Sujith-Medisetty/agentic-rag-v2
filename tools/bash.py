@@ -22,9 +22,11 @@ import subprocess
 from dataclasses import dataclass
 
 
-# Per-command output cap. Long-form outputs (full test suite logs, large
-# `cat` dumps) are truncated to keep context cost predictable.
-MAX_OUTPUT_BYTES = 16_384
+# Per-stream ceiling before we hand off to the wrapper for smart truncation.
+# The wrapper applies a small head+tail cap inline (≈4 KB) and spills the
+# full output to a session-scoped temp file. This 1 MB cap is just an
+# OOM guardrail for the rare command that dumps gigabytes (e.g. `cat /dev/urandom`).
+_MAX_RAW_OUTPUT_BYTES = 1_048_576  # 1 MiB per stream
 
 
 @dataclass
@@ -358,12 +360,15 @@ def _guess_port(command: str) -> int | None:
 
 
 def _truncate_output(s: str) -> str:
-    """Truncate output to MAX_OUTPUT_BYTES (16 KiB), appending a clear
-    marker when trimmed so the model knows the output was cut."""
+    """OOM guardrail only. Caps each stream at 1 MiB and appends a clear
+    marker. Smart head+tail truncation happens in the bash wrapper, where
+    the return code is available to weight head vs tail differently for
+    failures vs successes, and the full output can be spilled to a
+    session-scoped temp file the agent can read_file on demand."""
     encoded = s.encode("utf-8")
-    if len(encoded) <= MAX_OUTPUT_BYTES:
+    if len(encoded) <= _MAX_RAW_OUTPUT_BYTES:
         return s
-    end = MAX_OUTPUT_BYTES
+    end = _MAX_RAW_OUTPUT_BYTES
     while end > 0:
         try:
             truncated = encoded[:end].decode("utf-8")
@@ -372,4 +377,4 @@ def _truncate_output(s: str) -> str:
             end -= 1
     else:
         truncated = ""
-    return truncated + f"\n\n[output truncated — exceeded {MAX_OUTPUT_BYTES} bytes]"
+    return truncated + f"\n\n[output capped at {_MAX_RAW_OUTPUT_BYTES} bytes — wrapper will truncate further]"
