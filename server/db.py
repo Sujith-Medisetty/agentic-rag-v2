@@ -490,7 +490,7 @@ def update_project_settings(
 
 _SESSION_COLS = (
     "id, project_id, user_id, name, workspace_subdir, "
-    "last_active_at, created_at"
+    "last_active_at, created_at, last_context_used"
 )
 
 
