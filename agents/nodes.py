@@ -192,6 +192,37 @@ class _RunBudget:
 _run_budget = _RunBudget()
 
 
+# Module-level wall-clock for the in-flight LLM call. Set at the top
+# of `_stream_model_call`, read at the bottom when recording the
+# per-session trace. A module-level is fine because the agent loop
+# is single-threaded per process (the default asyncio executor is
+# single-threaded); concurrent sessions would race here only if we
+# ever raised the executor pool, in which case we'd switch this to
+# a thread-local.
+_t_call_start: float = 0.0
+
+
+def _iterations_for_trace() -> int:
+    """The current node_agent iteration counter, for the LLM trace.
+
+    Reads the module-level `_run_budget` (set in `reset_run_budget`
+    once per turn). The trace stores this so the user can match a
+    wire-level call back to "iteration N of the current turn"."""
+    try:
+        return int(_run_budget.iters)
+    except Exception:
+        return 0
+
+
+def _model_name_for_trace() -> str:
+    """The model name for the LLM trace — the configured model the
+    call was actually made with (e.g. "MiniMax-M3")."""
+    try:
+        return str(_model)
+    except Exception:
+        return ""
+
+
 def reset_run_budget(
     *, max_iters: int = 0, max_tokens: int = 0, max_seconds: int = 0,
     no_progress_limit: int = 8,
@@ -476,9 +507,24 @@ class _ThinkingTagSplitter:
 
 def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage:
     """Stream a single model call: forward text chunks + tool announcements
-    through the reporter, return the aggregated assistant message."""
+    through the reporter, return the aggregated assistant message.
+
+    Also records the full request/response pair to the per-session LLM
+    trace store (memory.llm_trace). The trace is the WIRE-level view —
+    the exact prompt sent over the API, the exact response that came
+    back, and the provider's usage_metadata. Exposed via
+    /api/sessions/:id/llm-trace so the user can debug prompt-size,
+    cache-hit, and tool-call questions without having to tail
+    journalctl.
+    """
     from agents.reporter import get_reporter
     reporter = get_reporter()
+    # Capture wall-clock start so the trace can report per-call duration.
+    # Module-level so the trace-recording block at the end of the
+    # function can read it without us threading it through every helper.
+    global _t_call_start
+    import time as _time
+    _t_call_start = _time.monotonic()
 
     aggregate: AIMessageChunk | None = None
     announced: set[str] = set()
@@ -578,6 +624,34 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
                 )
             except Exception:
                 pass
+    except Exception:
+        pass
+
+    # Record the wire-level LLM call to the per-session trace store.
+    # Best-effort: a failure here must not break the agent loop.
+    try:
+        from memory.llm_trace import get_store, LLMCallRecord, serialize_messages
+        from agents.reporter import get_reporter as _get_rep
+        rep = _get_rep()
+        # The reporter scope carries the session_id; if not present
+        # (e.g. tests), fall back to the empty string and skip.
+        sid = getattr(rep, "session_id", "") or ""
+        if sid:
+            import time as _time
+            from agents.nodes import _model_name_for_trace, _iterations_for_trace
+            rec = LLMCallRecord(
+                ts=_time.time(),
+                iteration=_iterations_for_trace(),
+                model=_model_name_for_trace(),
+                request_messages=serialize_messages(messages),
+                response=serialize_messages([ai])[0] if ai else {},
+                usage=dict(usage) if usage else {},
+                duration_ms=int((_time.monotonic() - _t_call_start) * 1000),
+                finish_reason=str(
+                    (getattr(ai, "response_metadata", {}) or {}).get("finish_reason", "")
+                ),
+            )
+            get_store().record(sid, rec)
     except Exception:
         pass
 

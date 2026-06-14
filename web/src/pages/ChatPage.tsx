@@ -49,6 +49,7 @@ import type {
 // the turn during which the compact fired). The local handler here
 // imports it under the same name.
 import PlanPanel from "@/components/PlanPanel";
+import LLMTracePanel from "@/components/LLMTracePanel";
 import TurnCard, { ActiveTurnCard } from "@/components/TurnCard";
 import RunningTotals from "@/components/RunningTotals";
 import { formatDuration } from "@/lib/format";
@@ -242,6 +243,12 @@ export default function ChatPage() {
     try { return localStorage.getItem("debug_stream") === "1"; }
     catch { return false; }
   });
+  // LLM trace panel: wire-level view of every request/response pair
+  // the server made to the LLM provider (system prompt + history +
+  // tools, and the response that came back). Persists across reloads
+  // because the user will want to keep it open while iterating on
+  // the agent's behaviour.
+  const [llmTraceOpen, setLlmTraceOpen] = useState<boolean>(false);
   const [debugEvents, setDebugEvents] = useState<
     { kind: string; payload: any; ts: number }[]
   >([]);
@@ -1550,6 +1557,15 @@ export default function ChatPage() {
           >
             ⌘ debug
           </button>
+          <button
+            type="button"
+            onClick={() => setLlmTraceOpen((v) => !v)}
+            title="Inspect every LLM call — request, response, token usage"
+            aria-label="Toggle LLM trace"
+            className={`pill min-h-touch ${llmTraceOpen ? "pill-accent" : ""}`}
+          >
+            ⌥ llm
+          </button>
         </div>
       </header>
 
@@ -1615,6 +1631,16 @@ export default function ChatPage() {
           events={debugEvents}
           onClear={() => setDebugEvents([])}
           onClose={toggleDebug}
+        />
+      )}
+
+      {/* LLM call trace — wire-level view of every request/response
+          pair the server made to the provider. Use this to debug
+          prompt-size, cache-hit, and tool-call questions. */}
+      {llmTraceOpen && sessionId && (
+        <LLMTracePanel
+          sessionId={sessionId}
+          onClose={() => setLlmTraceOpen(false)}
         />
       )}
 

@@ -514,6 +514,49 @@ export const sessionApi = {
       `/api/sessions/${encodeURIComponent(sessionId)}/compact`,
       { method: "POST" },
     ),
+  // Per-session LLM call trace. The server keeps the last 50 wire-level
+  // request/response pairs in an in-memory ring buffer; this fetches them
+  // for the LLM Trace debug panel. Each entry is large (full prompt +
+  // full response + usage), so don't poll — fetch on panel open.
+  llmTrace: (sessionId: string) =>
+    request<{
+      session_id: string;
+      count: number;
+      calls: Array<{
+        ts: number;
+        iteration: number;
+        model: string;
+        duration_ms: number;
+        finish_reason: string;
+        request_messages: Array<{
+          role: string;
+          type: string;
+          content: unknown;
+          tool_calls?: unknown;
+          tool_call_id?: string | null;
+          name?: string | null;
+          additional_kwargs?: Record<string, unknown>;
+          response_metadata?: Record<string, unknown>;
+          id?: string | null;
+        }>;
+        response: {
+          role: string;
+          type: string;
+          content: unknown;
+          tool_calls?: unknown;
+          additional_kwargs?: Record<string, unknown>;
+          response_metadata?: Record<string, unknown>;
+        };
+        usage: Record<string, unknown>;
+      }>;
+    }>(`/api/sessions/${encodeURIComponent(sessionId)}/llm-trace`),
+  // Wipe the in-memory LLM trace buffer for this session. Useful
+  // before a fresh debug run to start with an empty list.
+  clearLlmTrace: (sessionId: string) =>
+    request<{ ok: boolean }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/llm-trace`,
+      { method: "DELETE" },
+    ),
   // Promote a session's built dist/ to a permanent subdomain URL.
   // Returns 202 Accepted with a {job_id, slug, url, placeholder_app}
   // envelope; the actual work runs in a background task and the

@@ -1503,6 +1503,45 @@ def sessions_get(session_id: str, user: dict = Depends(require_user)):
     session = _session_or_404(session_id, user)
     return SessionResponse(**session)
 
+
+@app.get("/api/sessions/{session_id}/llm-trace")
+def sessions_llm_trace(session_id: str, user: dict = Depends(require_user)):
+    """Return the recent LLM call trace for this session.
+
+    Each entry is one wire-level request/response pair: the full
+    prompt sent to the provider (system + history + tools), the full
+    response (content + tool_calls + thinking), the provider's
+    usage_metadata (input / output / cache_read / cache_creation),
+    the wall-clock duration, and the model name. Used by the
+    LLM Trace debug panel to let the user see EXACTLY what was
+    sent and what came back — so they can debug prompt-size,
+    cache-hit, and tool-call questions without tailing journalctl.
+
+    Capped at the 50 most-recent calls (memory.llm_trace.MAX_RECORDS).
+    The trace is process-local; it does not survive a backend restart.
+    The full message history is still in the LangGraph checkpointer —
+    this is the wire-level audit log only.
+    """
+    session = _session_or_404(session_id, user)
+    from memory.llm_trace import get_store
+    store = get_store()
+    records = store.list(session_id)
+    return {
+        "session_id": session_id,
+        "count": len(records),
+        "calls": [r.to_json() for r in records],
+    }
+
+
+@app.delete("/api/sessions/{session_id}/llm-trace")
+def sessions_llm_trace_clear(session_id: str, user: dict = Depends(require_user)):
+    """Clear the LLM call trace buffer for this session. Useful for
+    'start clean' before a fresh debugging run."""
+    session = _session_or_404(session_id, user)
+    from memory.llm_trace import get_store
+    get_store().clear(session_id)
+    return {"ok": True, "session_id": session_id}
+
 @app.patch("/api/sessions/{session_id}", response_model=SessionResponse)
 def sessions_rename(
     session_id: str,
