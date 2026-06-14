@@ -495,7 +495,13 @@ def _compact_messages(messages: list) -> list:
     the original list unchanged.
     """
     preserve = _preserve_recent()
-    if len(messages) <= preserve:
+    # Standard short-circuit: not enough messages, and the local
+    # estimate is below threshold. The estimate check (in addition to
+    # the count check) is what catches the "user pasted an 1.8 MB
+    # short story" case — 4 messages but 450k tokens. Without it the
+    # compact would skip a session whose prompt is already over the
+    # threshold, and the chip would stay at 100% forever.
+    if len(messages) <= preserve and _estimate_tokens(messages) < _auto_compact_threshold():
         return messages
 
     # Pre-filter: drop any SystemMessage in the history. They don't belong
@@ -503,10 +509,17 @@ def _compact_messages(messages: list) -> list:
     # is in `state["system_prompt_pair"]` and rebuilt every turn), but if
     # a stale one slipped in we don't want to leak it through compaction.
     messages = [m for m in messages if not isinstance(m, SystemMessage)]
-    if len(messages) <= preserve:
+    if len(messages) <= preserve and _estimate_tokens(messages) < _auto_compact_threshold():
         return messages
 
-    cut = len(messages) - preserve
+    # Standard cut: keep the last `preserve` messages verbatim, summarise
+    # the rest. If the list is shorter than `preserve` (e.g. 4 messages
+    # with one 1.8 MB paste) we still cut at least one message from the
+    # front so the single huge message gets replaced by a summary
+    # instead of staying in full. The cut is bounded below by 1 — we
+    # never summarise ALL messages (an empty kept-tail would leave the
+    # next LLM call with no conversation to continue from).
+    cut = max(1, len(messages) - preserve) if len(messages) > preserve else 1
 
     # Walk the cut BACKWARDS past any tool-result blocks so we don't
     # summarise the AIMessage that owns them while keeping its result
@@ -628,7 +641,16 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
         injected as a HumanMessage, so the user can SEE what the agent
         now remembers about the earlier turns.
     """
-    if len(messages) <= _preserve_recent():
+    # Bail out only when the local estimate is BOTH small in message
+    # count AND small in token count. A `len(messages) <= preserve_recent`
+    # short-circuit was wrong here: a single user-pasted 1.8 MB short
+    # story is 4 messages but ~450k tokens, and the LLM's prompt cache
+    # is fully saturated. The compact must still fire to summarise the
+    # giant content. The cost of always running the local estimate is
+    # ~one pass over a small list, so dropping the short-circuit is
+    # safe.
+    est = _estimate_tokens(messages)
+    if len(messages) <= _preserve_recent() and est < _auto_compact_threshold():
         return messages, False, {}
 
     # Primary trigger: the LLM's own reported input_tokens from the
@@ -656,9 +678,17 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
     tokens_before = _estimate_tokens(messages)
     compacted = _compact_messages(messages)
     removed = len(messages) - len(compacted)
-    if removed <= 0:
-        return messages, False, {}
+    # "Did the compact actually shrink the prompt?" Two ways to answer:
+    #   (a) message count went down — many small messages summarised away
+    #   (b) token count went down — one giant message summarised, but
+    #       the message count is the same. The "user pasted 1.8 MB" case
+    #       hits (b) only: 4 messages in, 4 messages out, but msg[0] is
+    #       now a 1 KB summary instead of 1.8 MB. Without the (b) check
+    #       the compact would silently no-op, the chip would stay at
+    #       100%, and the user would never see the 📦 card.
     tokens_after = _estimate_tokens(compacted)
+    if removed <= 0 and tokens_after >= tokens_before:
+        return messages, False, {}
 
     # Pull the first 280 chars of the summary block for the chat-visible
     # message. The full summary is in the conversation as a HumanMessage
