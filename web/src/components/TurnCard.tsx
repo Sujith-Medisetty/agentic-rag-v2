@@ -76,11 +76,15 @@ function TurnCardImpl({ turn, index }: { turn: Turn; index: number }) {
           />
         ))}
 
-        {/* Auto-compact breadcrumb cards. Rendered inline in the
-            turn during which they fired, NOT stacked at the bottom
-            of the transcript, so the user sees the 📦 card at the
-            exact moment their chat was shortened. Each card is
-            collapsible to read the summary preview or fold away. */}
+        {/* Auto-compact breadcrumb cards. Attached to the LAST
+            COMPLETED TURN (the one whose accumulated context just
+            crossed the threshold and got summarised), so the 📦
+            card appears at the bottom of that turn's body — right
+            after the agent's last response / tool call, before
+            the user typed the new prompt that triggered the next
+            LLM call. The card is collapsible to read the summary
+            preview or fold away. See the WS handler in ChatPage
+            for the attach logic. */}
         {(turn.compactNotes ?? []).map((n) => (
           <CompactBreadcrumbRow key={n.id} note={n} />
         ))}

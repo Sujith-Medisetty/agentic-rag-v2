@@ -549,23 +549,48 @@ export default function ChatPage() {
           summaryPreview: String(p.summary_preview ?? ""),
           threshold: Number(p.threshold ?? 0),
         };
+        // Attach the 📦 card to the LAST COMPLETED TURN, not the
+        // just-started currentTurn. The backend's `context_compacted`
+        // event fires PRE-LLM inside `node_agent`: by the time it
+        // reaches the WS, the user has already submitted the new
+        // prompt, so currentTurn = the NEW turn. But the *summarised*
+        // history belongs to the PREVIOUS turn's response — the
+        // one whose context just barely crossed the threshold. The
+        // user wants to see the card at the bottom of that prior
+        // turn (right after its final response / tool calls), not
+        // at the top of the new turn they just typed.
+        //
+        // Why this is the right place semantically:
+        //   - The compact happens because the *previous* turn's
+        //     accumulated tool calls + reasoning pushed context
+        //     over the threshold. The previous turn is what got
+        //     "squeezed out".
+        //   - The new turn just inherits the compacted context;
+        //     the compact event isn't really about it.
+        //   - Reading top-to-bottom, the user sees their prior
+        //     turn end with "📦 auto-compacted: summarised 80
+        //     older messages" — a natural narrative beat.
         let attached = false;
-        setCurrentTurn((curr) => {
-          if (!curr) return curr;
+        setTurns((prev) => {
+          if (prev.length === 0) return prev;
           attached = true;
-          return { ...curr, compactNotes: [...(curr.compactNotes ?? []), note] };
+          const last = prev[prev.length - 1];
+          return [
+            ...prev.slice(0, -1),
+            { ...last, compactNotes: [...(last.compactNotes ?? []), note] },
+          ];
         });
         if (!attached) {
-          // No active turn — append to the last completed turn so the
-          // card still appears at a sensible chronological point.
-          setTurns((prev) => {
-            if (prev.length === 0) return prev;
-            const last = prev[prev.length - 1];
-            return [
-              ...prev.slice(0, -1),
-              { ...last, compactNotes: [...(last.compactNotes ?? []), note] },
-            ];
-          });
+          // No completed turns yet — this is the first user prompt
+          // ever and the very first call already crossed the
+          // threshold (possible on a rehydrate from a previously-
+          // long session). Fall back to attaching on currentTurn
+          // so the card has SOME home; the user sees it inline in
+          // the first turn rather than losing it to the orphan
+          // fallback.
+          setCurrentTurn((curr) =>
+            curr ? { ...curr, compactNotes: [...(curr.compactNotes ?? []), note] } : curr,
+          );
         }
         // Keep the legacy parent-level list in sync too — it's
         // displayed (a) as a fallback when the parent-level rerender
@@ -1993,18 +2018,17 @@ function rebuildTranscript(events: LiveEvent[]): {
         plan = Array.isArray(p.items) ? (p.items as TodoItem[]) : [];
         break;
       case "context_compacted": {
-        // Attach the compact breadcrumb to the turn that was active
-        // when the compact fired. That's the turn the user is reading
-        // when the auto-compact surprise hits, so showing the card
-        // inline (rather than stacked at the bottom of the transcript)
-        // is what makes the "📦" breadcrumb feel like part of the
-        // conversation, not a footnote.
-        //
-        // If no turn is active (rare — the very first event in a
-        // session, or a stale log) we still want the card to appear
-        // SOMEWHERE, so we fall back to the last completed turn. Worst
-        // case: it shows at the bottom, but every turn in normal flow
-        // gets its own in-place card.
+        // Attach the compact breadcrumb to the LAST COMPLETED TURN,
+        // not the in-progress `curr`. The backend fires this event
+        // PRE-LLM in `node_agent`; by the time the event reaches the
+        // WS replay, the *new* turn has already been opened, so
+        // `curr` = the new turn. But the summarised history belongs
+        // to the PRIOR turn's response — the one whose accumulated
+        // tool calls + reasoning just pushed context over the
+        // threshold. The user wants to see the card at the bottom
+        // of that prior turn, not at the top of the new one. See
+        // the live WS handler (line 533) for the matching change +
+        // a longer rationale on the semantic split.
         const removed = Number(p.removed ?? 0);
         if (removed <= 0) break;
         const note: ContextCompactedNote = {
@@ -2017,14 +2041,18 @@ function rebuildTranscript(events: LiveEvent[]): {
           summaryPreview: String(p.summary_preview ?? ""),
           threshold: Number(p.threshold ?? 0),
         };
-        if (curr) {
-          curr.compactNotes = [...(curr.compactNotes ?? []), note];
-        } else if (completed.length > 0) {
+        if (completed.length > 0) {
           const last = completed[completed.length - 1];
           completed[completed.length - 1] = {
             ...last,
             compactNotes: [...(last.compactNotes ?? []), note],
           };
+        } else if (curr) {
+          // Edge case: the very first user prompt of a fresh
+          // session was already at threshold. No completed turns
+          // to attach to. Fall back to the active turn so the
+          // card has SOME home.
+          curr.compactNotes = [...(curr.compactNotes ?? []), note];
         }
         break;
       }
