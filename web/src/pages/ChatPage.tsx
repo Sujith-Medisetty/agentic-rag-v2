@@ -24,7 +24,7 @@
 // fold into turns[]. This gives full restore-on-reload behaviour.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useOutletContext } from "react-router-dom";
+import { useParams, useOutletContext, useLocation } from "react-router-dom";
 import type { Project as ProjectType } from "@/lib/types";
 import { sessionApi, sessionsApi, deployedAppsApi } from "@/lib/api";
 import type { DeployedApp, DeployJobStatus, DetectedDist } from "@/lib/api";
@@ -110,6 +110,34 @@ export default function ChatPage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Prefill from the home screen's "Try saying" cards. The Workspace
+  // page creates a new session, then navigates here with
+  // `state: { prefill: "Build me a to-do list app." }` (or whichever
+  // card the user clicked). We pick it up once on mount and pop it
+  // into the composer input — the user still has to hit send, which
+  // is intentional: clicking a starter card should land them in a
+  // chat that's ready to send, not in one that's already burning
+  // a turn. We strip `prefill` from location.state afterwards so a
+  // re-render (or back-button + forward) doesn't re-apply it. The
+  // useLocation reference is captured as a const so the empty
+  // dep-array effect doesn't trigger React's "missing dep" warning
+  // — and so a navigation that DOESN'T carry a prefill (typing the
+  // session URL directly, refreshing) leaves `input` alone.
+  const location = useLocation();
+  useEffect(() => {
+    const prefill = (location.state as { prefill?: string } | null)?.prefill;
+    if (typeof prefill === "string" && prefill.length > 0) {
+      setInput(prefill);
+      // Strip the state so re-renders / hot-reload don't re-prefill
+      // on top of whatever the user has since typed. `replace: true`
+      // avoids polluting browser history with two entries.
+      window.history.replaceState({}, "");
+    }
+    // location is intentionally not in the dep array — re-running
+    // on every location change would clobber user edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Deployed apps from THIS session — populated on mount from
   // /api/sessions/<id>/deployed-apps, refreshed when the user deploys a

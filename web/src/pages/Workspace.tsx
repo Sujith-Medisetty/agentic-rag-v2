@@ -126,6 +126,38 @@ export default function Workspace() {
     }
   };
 
+  // Same as startNew() but pre-fills the chat composer's input with
+  // `prompt` once the new chat mounts. The handoff is via React
+  // Router's `state` (not URL search params) so:
+  //   1. The URL stays clean (/s/<id>, not /s/<id>?q=...)
+  //   2. The text can contain spaces, quotes, em-dashes — anything —
+  //      without URL-encoding noise
+  //   3. Refreshing the chat page clears the prefill (the text is in
+  //      navigation state, not in the URL), which is what the user
+  //      would expect (a refresh = "start fresh on this chat")
+  // We deliberately do NOT auto-send: the user wants to read the
+  // pre-filled prompt, maybe edit it, then hit send themselves. Auto
+  // -send would surprise them and burn a turn.
+  const startNewWithPrefill = async (prompt: string) => {
+    if (!project) return;
+    try {
+      const s = await sessionsApi.create(
+        project.id,
+        // Use the first ~40 chars of the prompt as the session name
+        // (plus a timestamp suffix) so the sidebar entry is
+        // recognisable — otherwise every "Try saying" click creates
+        // a session literally named "Chat 6/14/2026, 10:42 AM" and
+        // the user has no idea which is which.
+        prompt.length > 40 ? `${prompt.slice(0, 40).trim()}…` : prompt,
+      );
+      sessionsStore.add(project.id, s);
+      navigate(`/s/${s.id}`, { state: { prefill: prompt } });
+      if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
+    } catch (e: any) {
+      setLoadErr(e?.message ?? "failed to create chat");
+    }
+  };
+
   const openSession = (sid: string) => {
     navigate(`/s/${sid}`);
     if (!window.matchMedia("(min-width: 768px)").matches) setSidebarOpen(false);
@@ -453,25 +485,29 @@ export default function Workspace() {
                 Or pick an existing chat from the sidebar to resume it.
               </p>
 
-              {/* Try-saying examples. Concrete prompts make it obvious
-                  what kind of asks Ojas handles best. Clicking one starts
-                  a new chat with the prompt pre-filled (the agent picks
-                  up the message when the user hits send). */}
+              {/* Try-saying examples. Concrete, app-shaped prompts —
+                  not "make a React app that does X" (mentioning a tech
+                  stack turns the starter into a homework assignment).
+                  These read like things a person would actually want
+                  built. Clicking one starts a new chat with the prompt
+                  pre-filled in the composer (the user still hits send
+                  themselves, so they can edit it first). See
+                  `startNewWithPrefill` for the navigation handoff. */}
               <div className="mt-10 w-full max-w-2xl">
                 <p className="mb-3 text-xs font-medium uppercase tracking-wider text-muted">
                   Try saying
                 </p>
                 <div className="grid gap-2 text-left text-sm sm:grid-cols-2">
                   {[
-                    "Build a small todo app I can install on my phone.",
-                    "Make a snake game in vanilla JS.",
-                    "Set up a FastAPI backend with a hello endpoint.",
-                    "Add dark mode to my React app.",
+                    "Build me a simple to-do list app.",
+                    "Build me a calculator app.",
+                    "Build me a snake and ladder board game.",
+                    "Build me a small Instagram-style photo feed.",
                   ].map((prompt) => (
                     <button
                       key={prompt}
                       type="button"
-                      onClick={startNew}
+                      onClick={() => startNewWithPrefill(prompt)}
                       className="rounded-lg border border-border bg-elevated px-3 py-2.5 text-muted transition-colors hover:border-accent/40 hover:bg-surface hover:text-text"
                     >
                       &ldquo;{prompt}&rdquo;
