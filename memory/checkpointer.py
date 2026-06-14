@@ -136,6 +136,126 @@ def _truncate_tool_result(content) -> str:
         f"re-invoke the tool to see the full body]"
     )
 
+
+# --- Observation masking ---
+# JetBrains research (2024) + Claude Code / Cursor production behavior:
+# after N turns, the same tool result is being re-sent on every subsequent
+# turn (via Anthropic's automatic prefix cache), but the agent almost never
+# actually re-reads the result after it's been a few turns away. The
+# tool result just bloats the cache_read and inflates the per-turn cost.
+#
+# Masking replaces old tool results with a one-line stub ("obsolete — re-invoke
+# if you need the content"). The agent can always re-call the tool to get
+# the fresh body, so masking is lossless for the agent's actual capability
+# but cuts the per-turn cache_read dramatically on long sessions.
+#
+# Without masking, the 5.9M-token calculator session saw cache_read grow to
+# 240K per turn (the entire previous history), driving cost to $2.22 per
+# build. With masking at KEEP_RECENT_OBSERVATIONS=12, the same build would
+# cap cache_read at ~30-50K (the recent window only) — a 5-7× reduction
+# in cache_read and a comparable drop in cost.
+KEEP_RECENT_OBSERVATIONS = 12
+KEEP_RECENT_OBSERVATIONS_ENV_VAR = "OJAS_KEEP_RECENT_OBSERVATIONS"
+_MASKED_RESULT_STUB = (
+    "[observation masked — this tool result is from an earlier turn and has "
+    "been collapsed to save context. If you need the full content, re-invoke "
+    "the tool.]"
+)
+
+
+def _keep_recent_observations() -> int:
+    raw = os.getenv(KEEP_RECENT_OBSERVATIONS_ENV_VAR)
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return KEEP_RECENT_OBSERVATIONS
+
+
+def mask_old_observations(messages: list) -> list:
+    """Walk the message list and replace `ToolMessage.content` (and the
+    `tool_result` content-block on a list-shaped `AIMessage`) for any
+    observation older than the most recent `KEEP_RECENT_OBSERVATIONS`.
+
+    Returns a new list — original messages are not mutated. Tool CALLS
+    (on the preceding `AIMessage.tool_calls` or `tool_use` blocks) are
+    preserved verbatim: the agent's *intent* (which file it wanted to
+    read, which command it wanted to run) is what matters; the *body*
+    of the result is what's safe to mask.
+
+    Like `_truncate_live_history` in agents/nodes.py, this is a per-turn
+    transformation — the on-disk checkpoint keeps the full body. Only
+    the per-turn request gets the masked view.
+    """
+    keep = _keep_recent_observations()
+
+    # Collect indices of all ToolMessage / tool_result-bearing messages,
+    # in order. Walk back from the end; the last `keep` are kept verbatim.
+    obs_indices: list[int] = []
+    for i, m in enumerate(messages):
+        if isinstance(m, ToolMessage):
+            obs_indices.append(i)
+            continue
+        content = getattr(m, "content", None)
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content
+        ):
+            obs_indices.append(i)
+
+    if len(obs_indices) <= keep:
+        return messages
+
+    to_mask = set(obs_indices[:-keep])
+
+    masked_count = 0
+    out: list = []
+    for i, m in enumerate(messages):
+        if i not in to_mask:
+            out.append(m)
+            continue
+
+        if isinstance(m, ToolMessage):
+            # Replace ToolMessage.content with the stub. Preserve
+            # tool_call_id so the agent's preceding AIMessage still
+            # sees its result slot satisfied (no orphan-repair needed).
+            out.append(
+                m.model_copy(update={"content": _MASKED_RESULT_STUB})
+            )
+            masked_count += 1
+            continue
+
+        # List-shaped AIMessage content with a tool_result block: replace
+        # the block's content with the stub; leave the rest of the message
+        # (other blocks, the preceding text) alone.
+        content = m.content
+        if isinstance(content, list):
+            new_blocks = []
+            changed = False
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    nb = dict(b)
+                    nb["content"] = _MASKED_RESULT_STUB
+                    new_blocks.append(nb)
+                    changed = True
+                else:
+                    new_blocks.append(b)
+            if changed:
+                out.append(m.model_copy(update={"content": new_blocks}))
+                masked_count += 1
+                continue
+        out.append(m)
+
+    if masked_count:
+        import logging
+        logging.getLogger(__name__).info(
+            "[observation-mask] masked %d old tool result(s) (keeping most recent %d)",
+            masked_count, keep,
+        )
+    return out
+
+
 def _estimate_block_tokens(block: Any) -> int:
     """Per content-block estimate.
     every block contributes `len // 4 + 1`."""

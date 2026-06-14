@@ -785,6 +785,78 @@ def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
     return out
 
 
+# How many of the most recent AIMessages to keep their reasoning_content /
+# thinking blocks in `additional_kwargs`. Older AIMessages have their
+# thinking blocks stripped — the agent doesn't need its own past reasoning
+# to keep working, and every thinking block re-ships on every turn via
+# Anthropic's prefix cache. Tuned to 8 because the agent's "I think I
+# should..." / "let me reconsider..." reasoning stays useful for the
+# next 2-3 tool calls, but a reasoning block from 20 turns ago is just
+# dead weight. Override with OJAS_KEEP_RECENT_THINKING.
+KEEP_RECENT_THINKING = 8
+KEEP_RECENT_THINKING_ENV_VAR = "OJAS_KEEP_RECENT_THINKING"
+_THINKING_KEYS = (
+    "reasoning_content",       # Anthropic native
+    "reasoning",               # OpenAI-style
+    "thinking",                # some providers
+    "thinking_blocks",         # some providers (list-shaped)
+)
+
+
+def _keep_recent_thinking() -> int:
+    import os
+    raw = os.getenv(KEEP_RECENT_THINKING_ENV_VAR)
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return KEEP_RECENT_THINKING
+
+
+def _strip_old_thinking(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Remove `reasoning_content` / thinking blocks from AIMessages older
+    than the most recent `KEEP_RECENT_THINKING`. The agent doesn't need
+    its own past reasoning to keep working — and those blocks are
+    re-shipped on every turn via Anthropic's automatic prefix cache,
+    inflating per-turn cost on long sessions.
+
+    The visible text content of each AIMessage is preserved. Only the
+    `additional_kwargs` keys for thinking are dropped. Operates on a
+    shallow copy: original messages are not mutated.
+    """
+    keep = _keep_recent_thinking()
+    # Walk back from the end; count AIMessages. Older than `keep` get
+    # their thinking keys stripped.
+    ai_indices = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
+    if len(ai_indices) <= keep:
+        return messages
+    to_strip = set(ai_indices[:-keep])
+
+    n_stripped = 0
+    out: list[BaseMessage] = []
+    for i, m in enumerate(messages):
+        if i not in to_strip:
+            out.append(m)
+            continue
+        ak = getattr(m, "additional_kwargs", None) or {}
+        if not any(k in ak for k in _THINKING_KEYS):
+            out.append(m)
+            continue
+        new_ak = {k: v for k, v in ak.items() if k not in _THINKING_KEYS}
+        out.append(m.model_copy(update={"additional_kwargs": new_ak}))
+        n_stripped += 1
+
+    if n_stripped:
+        import logging
+        logging.getLogger(__name__).info(
+            "[thinking-strip] stripped thinking blocks from %d old AIMessage(s) "
+            "(keeping most recent %d)",
+            n_stripped, keep,
+        )
+    return out
+
+
 def node_agent(state: RunnerState) -> dict:
     """One model call = one
 
@@ -837,7 +909,7 @@ def node_agent(state: RunnerState) -> dict:
     # fired after the turn that crossed the threshold had already been billed
     # at full price — late fire, paid twice. See memory.checkpointer.maybe_compact
     # for the threshold + summary logic.
-    from memory.checkpointer import maybe_compact
+    from memory.checkpointer import maybe_compact, mask_old_observations
     history, did_compact = maybe_compact(history)
     if did_compact:
         try:
@@ -850,6 +922,22 @@ def node_agent(state: RunnerState) -> dict:
             )
         except Exception:
             pass
+
+    # Observation masking — collapse old tool results to a one-line stub
+    # so Anthropic's automatic prefix cache doesn't re-send the entire
+    # previous history on every turn. See memory.checkpointer.mask_old_observations
+    # for the rationale + JetBrains research citation. The agent can
+    # always re-invoke the tool to get the fresh body, so masking is
+    # lossless for the agent's capability.
+    history = mask_old_observations(history)
+
+    # Strip thinking / reasoning_content from old AIMessages. The agent
+    # doesn't need its own past reasoning to keep working, and those
+    # blocks are re-shipped on every turn via Anthropic's automatic
+    # prefix cache — the largest single contributor to per-turn cost on
+    # long sessions. See _strip_old_thinking for the JetBrains-style
+    # "stop feeding the model its own past thoughts" rationale.
+    history = _strip_old_thinking(history)
 
     # Truncate oversized ToolMessage bodies so a single `Read` of a 30k-token
     # log file doesn't bloat the live window for the rest of the session.
