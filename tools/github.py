@@ -120,26 +120,6 @@ def get_issue(repo: str, issue_number: int) -> GitHubIssue:
         comments = comments,
     )
 
-def list_issues(
-    repo: str,
-    state: str = "open",
-    limit: int = 20,
-) -> list[dict]:
-    """List issues in a repo."""
-    owner, repo_name = _parse_repo(repo)
-    resp = requests.get(
-        f"{BASE}/repos/{owner}/{repo_name}/issues",
-        headers = _headers(),
-        params = {"state": state, "per_page": limit},
-        timeout = 15,
-    )
-    resp.raise_for_status()
-    return [
-        {"number": i["number"], "title": i["title"], "state": i["state"], "url": i["html_url"]}
-        for i in resp.json()
-        if "pull_request" not in i  # exclude PRs from issue list
-    ]
-
 # Issue commenting (comment_on_issue), branch listing (list_branches), and
 # branch creation (create_branch) helpers were removed alongside the CLI —
 # they were never exposed as agent tools and no caller invoked them. If you
@@ -182,25 +162,6 @@ def create_pr(
         branch = head_branch,
     )
 
-def get_pr(repo: str, pr_number: int) -> dict:
-    """Get PR details."""
-    owner, repo_name = _parse_repo(repo)
-    resp = requests.get(
-        f"{BASE}/repos/{owner}/{repo_name}/pulls/{pr_number}",
-        headers = _headers(),
-        timeout = 15,
-    )
-    resp.raise_for_status()
-    d = resp.json()
-    return {
-        "number": d["number"],
-        "title": d["title"],
-        "state": d["state"],
-        "url": d["html_url"],
-        "branch": d["head"]["ref"],
-        "mergeable": d.get("mergeable"),
-    }
-
 def list_prs(repo: str, state: str = "open") -> list[dict]:
     """List pull requests."""
     owner, repo_name = _parse_repo(repo)
@@ -215,28 +176,3 @@ def list_prs(repo: str, state: str = "open") -> list[dict]:
         {"number": p["number"], "title": p["title"], "url": p["html_url"], "branch": p["head"]["ref"]}
         for p in resp.json()
     ]
-
-# ---------------------------------------------------------------------------
-# Repo info
-# ---------------------------------------------------------------------------
-
-def get_repo_info(repo: str) -> dict:
-    """Get basic repo information."""
-    owner, repo_name = _parse_repo(repo)
-    resp = requests.get(
-        f"{BASE}/repos/{owner}/{repo_name}",
-        headers = _headers(),
-        timeout = 15,
-    )
-    resp.raise_for_status()
-    d = resp.json()
-    return {
-        "name": d["name"],
-        "full_name": d["full_name"],
-        "description": d.get("description", ""),
-        "default_branch": d["default_branch"],
-        "language": d.get("language", ""),
-        "url": d["html_url"],
-        "clone_url": d["clone_url"],
-        "private": d["private"],
-    }

@@ -17,6 +17,10 @@ import type { Project, Session } from "@/lib/types";
 import { useSessions } from "@/lib/sessionContext";
 import InstallButton from "@/components/InstallButton";
 import DeleteProgressModal from "@/components/DeleteProgressModal";
+import {
+  MenuIcon, ChevronLeftIcon, TrashIcon, PlusIcon, LogoutIcon,
+  ShieldIcon, CogIcon, PencilIcon,
+} from "@/components/icons";
 
 export default function Workspace() {
   const navigate = useNavigate();
@@ -56,12 +60,6 @@ export default function Workspace() {
     job: DeleteJobStart | null;
   } | null>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
-  // Name-conflict modal (real React <dialog>, not a native alert).
-  const [conflict, setConflict] = useState<{
-    desired: string;
-    existingId: string;
-    existingName: string;
-  } | null>(null);
   useEffect(() => {
     if (editingId && editInputRef.current) {
       editInputRef.current.focus();
@@ -273,7 +271,7 @@ export default function Workspace() {
             title="Collapse sidebar"
             aria-label="Collapse sidebar"
           >
-            <ChevronLeftIcon />
+            <ChevronLeftIcon className="h-4 w-4" />
           </button>
         </div>
 
@@ -286,7 +284,7 @@ export default function Workspace() {
             disabled={!project}
             className="flex w-full items-center justify-center gap-1.5 rounded-md border border-accent/40 bg-accent/10 px-3 py-2 text-sm font-medium text-accent transition-colors hover:bg-accent/15 hover:border-accent/60 disabled:opacity-50"
           >
-            <PlusIcon />
+            <PlusIcon className="h-3.5 w-3.5" />
             <span>New chat</span>
           </button>
         </div>
@@ -374,7 +372,7 @@ export default function Workspace() {
                           title="Rename chat"
                           aria-label={`Rename chat ${s.name}`}
                         >
-                          <PencilIcon />
+                          <PencilIcon className="h-3.5 w-3.5" />
                         </button>
                         {/* Delete (trash) — always visible, red */}
                         <button
@@ -387,7 +385,7 @@ export default function Workspace() {
                           title="Delete chat"
                           aria-label="Delete chat"
                         >
-                          <TrashIcon />
+                          <TrashIcon className="h-3.5 w-3.5" />
                         </button>
                       </>
                     )}
@@ -416,7 +414,7 @@ export default function Workspace() {
             to="/settings"
             className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-md border border-border bg-bg px-3 py-1.5 text-sm font-medium text-fg transition-colors hover:border-accent/40 hover:text-accent"
           >
-            <CogIcon />
+            <CogIcon className="h-3.5 w-3.5" />
             <span>Settings</span>
           </Link>
           {me?.role === "root" && (
@@ -424,7 +422,7 @@ export default function Workspace() {
               to="/admin"
               className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-md border border-accent/30 bg-accent/10 px-3 py-1.5 text-sm font-medium text-accent transition-colors hover:border-accent/50 hover:bg-accent/15"
             >
-              <ShieldIcon />
+              <ShieldIcon className="h-3.5 w-3.5" />
               <span>Admin</span>
             </Link>
           )}
@@ -432,7 +430,7 @@ export default function Workspace() {
             onClick={logout}
             className="inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-danger/30 bg-danger/10 px-3 py-1.5 text-sm font-medium text-danger transition-colors hover:border-danger/50 hover:bg-danger/15"
           >
-            <LogoutIcon />
+            <LogoutIcon className="h-3.5 w-3.5" />
             <span>Log out</span>
           </button>
         </div>
@@ -448,7 +446,7 @@ export default function Workspace() {
             title="Open sidebar"
             aria-label="Open sidebar"
           >
-            <MenuIcon />
+            <MenuIcon className="h-4 w-4" />
           </button>
         )}
 
@@ -536,15 +534,6 @@ export default function Workspace() {
         )}
       </div>
 
-      {/* Name-conflict modal — real React <dialog>, not a native alert. */}
-      {conflict && (
-        <NameConflictModal
-          desired={conflict.desired}
-          existingName={conflict.existingName}
-          existingId={conflict.existingId}
-          onClose={() => setConflict(null)}
-        />
-      )}
       {deletingSession && (
         <DeleteProgressModal
           open={!!deletingSession}
@@ -574,157 +563,5 @@ export default function Workspace() {
   );
 }
 
-// Name-conflict modal (same behavior as in SessionList.tsx). Real <dialog>
-// so we get a focus trap + Esc to close + backdrop click to close. The
-// "Open existing session →" button jumps the user to the conflicting
-// session in the same project.
-function NameConflictModal({
-  desired,
-  existingName,
-  existingId,
-  onClose,
-}: {
-  desired: string;
-  existingName: string;
-  existingId: string;
-  onClose: () => void;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    ref.current?.showModal();
-  }, []);
-  return (
-    <dialog
-      ref={ref}
-      onClose={onClose}
-      onClick={(e) => {
-        if (e.target === ref.current) ref.current?.close();
-      }}
-      className="rounded-xl border border-border bg-bg p-0 text-text shadow-2xl backdrop:bg-black/40"
-    >
-      <div className="w-[min(90vw,28rem)] p-5">
-        <div className="flex items-start gap-3">
-          <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-warning/40 bg-warning/10 text-warning">
-            ⚠
-          </div>
-          <div className="min-w-0 flex-1">
-            <h2 className="font-serif text-lg font-semibold leading-tight">
-              Name already in use
-            </h2>
-            <p className="mt-1.5 text-sm text-muted">
-              Another chat in this project is already named{" "}
-              <span className="font-mono text-text">{existingName}</span>.
-              Chat names must be unique within a project.
-            </p>
-            <p className="mt-2 text-xs text-muted">
-              You tried to rename to{" "}
-              <span className="font-mono text-text">{desired}</span>.
-            </p>
-          </div>
-        </div>
-        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn-ghost min-h-touch"
-            autoFocus
-          >
-            Try a different name
-          </button>
-          {existingId && (
-            <a
-              href={`/s/${existingId}`}
-              className="btn-primary inline-flex min-h-touch items-center justify-center"
-            >
-              Open existing chat →
-            </a>
-          )}
-        </div>
-      </div>
-    </dialog>
-  );
-}
-
 // ── Icons ──────────────────────────────────────────────────────────────────
-function MenuIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M3 6h18M3 12h18M3 18h18" />
-    </svg>
-  );
-}
-function ChevronLeftIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M15 18l-6-6 6-6" />
-    </svg>
-  );
-}
-function TrashIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6" />
-    </svg>
-  );
-}
-function PlusIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 5v14M5 12h14" />
-    </svg>
-  );
-}
-function LogoutIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
-    </svg>
-  );
-}
-function ShieldIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-    </svg>
-  );
-}
-function CogIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
-function PencilIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M12 20h9" />
-      <path d="M16.5 3.5a2.121 2.121 0 113 3L7 19l-4 1 1-4 12.5-12.5z" />
-    </svg>
-  );
-}
-
-// Compact relative time: "just now", "12m", "3h", "yesterday", "Mon", "Mar 4".
-// Used in the sidebar session rows so the user can scan "was that last hour
-// or last week?" without doing math.
-function formatRelativeTime(secs: number): string {
-  const diff = Math.max(0, Math.floor(Date.now() / 1000 - secs));
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  const days = Math.floor(diff / 86400);
-  if (days === 1) return "yesterday";
-  if (days < 7) {
-    return new Date(secs * 1000).toLocaleDateString(undefined, { weekday: "short" });
-  }
-  return new Date(secs * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
+// (icons imported from @/components/icons)

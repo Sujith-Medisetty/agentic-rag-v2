@@ -224,7 +224,3 @@ class TokenCounter:
             + f" | cost: {c.format()}"
             + f" | turns: {self._turns}"
         )
-
-    def estimate_tokens_in_text(self, text: str) -> int:
-        """Rough token estimate for a string."""
-        return len(text) // 4 + 1

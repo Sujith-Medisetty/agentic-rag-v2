@@ -50,7 +50,6 @@ class Task:
     created_at: int
     updated_at: int
     messages: list[TaskMessage] = field(default_factory=list)
-    output: str = ""
 
 
 class TaskRegistry:
@@ -113,15 +112,6 @@ class TaskRegistry:
         task.updated_at = _now_secs()
         return task
 
-    def set_output(self, task_id: str, output: str) -> Task | None:
-        """Update output buffer."""
-        task = self._tasks.get(task_id)
-        if not task:
-            return None
-        task.output = output
-        task.updated_at = _now_secs()
-        return task
-
     def stop(self, task_id: str) -> Task:
         """Stop a running task."""
         task = self._tasks.get(task_id)
@@ -134,13 +124,6 @@ class TaskRegistry:
         task.status = TaskStatus.STOPPED
         task.updated_at = _now_secs()
         return task
-
-    def output(self, task_id: str) -> str:
-        """Return the raw output buffer for a task."""
-        task = self._tasks.get(task_id)
-        if not task:
-            raise KeyError(f"task not found: {task_id}")
-        return task.output
 
     def format_list(self) -> str:
         """Python-side convenience: formatted human-readable task list."""

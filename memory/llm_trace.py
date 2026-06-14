@@ -9,9 +9,8 @@ actually went over the wire"). Thread-safe via a Lock.
 from __future__ import annotations
 
 import threading
-import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -28,14 +27,6 @@ class LLMCallRecord:
     (system + history + tools) and the model's reply. `duration_ms` is
     wall-clock from `model.stream()` start to end (includes network,
     model thinking, and the streaming send-back)."""
-    ts: float
-    iteration: int
-    model: str
-    request_messages: list[dict]
-    response: dict
-    usage: dict
-    duration_ms: int
-    finish_reason: str = ""
     ts: float                         # time.time() at end of call
     iteration: int                    # node_agent's iteration counter
     model: str                        # model name (MiniMax-M3, etc.)
@@ -44,18 +35,6 @@ class LLMCallRecord:
     usage: dict                       # usage_metadata, flattened
     duration_ms: int                  # wall-clock for the call
     finish_reason: str = ""           # stop / tool_calls / length / etc.
-
-    def to_json(self) -> dict:
-        return {
-            "ts": self.ts,
-            "iteration": self.iteration,
-            "model": self.model,
-            "duration_ms": self.duration_ms,
-            "finish_reason": self.finish_reason,
-            "request_messages": self.request_messages,
-            "response": self.response,
-            "usage": self.usage,
-        }
 
 
 class LLMTraceStore:

@@ -32,7 +32,6 @@ export default function TurnFooter({ summary }: { summary: TurnSummary }) {
   const costIn   = summary.cost_input_usd      ?? 0;
   const costOut  = summary.cost_output_usd     ?? 0;
   const costCR   = summary.cost_cache_read_usd ?? 0;
-  const costCW   = summary.cost_cache_write_usd?? 0;
   // Cost math — visible inline as the parenthetical, full version in
   // tooltip. Built from the rates × the same token counts the IN/OUT
   // stats show, so the multiplication is verifiable by eye.

@@ -12,6 +12,7 @@ import { authApi, adminApi, deployedAppsApi, ApiError } from "@/lib/api";
 import type {
   AuthUser, AdminProcess, OjasService, DeployedApp,
 } from "@/lib/api";
+import { KeyIcon, TrashIcon } from "@/components/icons";
 
 type SourceFilter = "all" | "ojas-main" | "ojas-proxy" | "ojas-deployed" | "ojas-mcp" | "ojas-external";
 
@@ -605,58 +606,4 @@ function sourcePillColor(source: string): string {
   }
 }
 
-// Compact inline SVG icons. No external icon dep — kept simple so the
-// bundle stays small. All icons render at the size set by the parent
-// (use h-* w-* Tailwind classes on the consumer).
-//
-// Using stroke-based outlines (not fills) so the shapes read clearly
-// even at small sizes (14px on mobile). Filled icons can look like
-// abstract blobs at 14×14; outlines remain recognisable.
-function KeyIcon({ className = "" }: { className?: string }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      {/* Key bow (the round head) */}
-      <circle cx="8" cy="15" r="4" />
-      {/* Key shaft going up-right */}
-      <path d="M10.85 12.15L19 4" />
-      {/* Two teeth (the bumps on the shaft) */}
-      <path d="M18 5l3 3" />
-      <path d="M15 8l3 3" />
-    </svg>
-  );
-}
-
-function TrashIcon({ className = "" }: { className?: string }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      {/* Lid */}
-      <path d="M3 6h18" />
-      {/* Top handle */}
-      <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" />
-      {/* Bin body with side handles */}
-      <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6" />
-      <path d="M10 11v6" />
-      <path d="M14 11v6" />
-    </svg>
-  );
-}
+// (icons imported from @/components/icons)

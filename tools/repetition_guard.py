@@ -160,25 +160,3 @@ def check_and_record(
         f"Do not call `{tool_name}` again on the same input until you "
         f"have changed your approach."
     )
-
-
-def reset_session(session_id: str) -> None:
-    """Drop all entries for a session. Called when a session is closed
-    or after a manual reset — keeps the dict from accumulating dead
-    sessions indefinitely."""
-    with _lock:
-        for k in list(_calls.keys()):
-            if k[0] == session_id:
-                _calls.pop(k, None)
-
-
-def stats() -> dict:
-    """Debug/observability — how many distinct call fingerprints are
-    tracked, and how many are over threshold."""
-    with _lock:
-        over = sum(1 for r in _calls.values() if r.count > THRESHOLD)
-        return {
-            "tracked": len(_calls),
-            "over_threshold": over,
-            "threshold": THRESHOLD,
-        }

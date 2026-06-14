@@ -63,12 +63,6 @@ def set_session_sandbox(workspace: str | Path, is_root: bool, session_id: str) -
     _active.set(cfg)
 
 
-def clear_session_sandbox() -> None:
-    """Pair to `set_session_sandbox` — called at the end of a turn so a
-    later un-scoped tool call doesn't see stale state."""
-    _active.set(None)
-
-
 def active_sandbox() -> SandboxConfig | None:
     return _active.get()
 

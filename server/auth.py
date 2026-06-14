@@ -258,11 +258,6 @@ def _issue_token(user_id: str, device_label: str = "unknown") -> str:
     return signed
 
 
-def verify_token(token: str) -> bool:
-    """Backward-compatible bool check used by the WebSocket envelope path."""
-    return _user_from_token(token) is not None
-
-
 def user_from_token(token: str) -> dict | None:
     """Return the user dict (with role) the token belongs to, or None if
     the token is invalid / revoked. This is the new canonical lookup used

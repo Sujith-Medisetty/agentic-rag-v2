@@ -340,7 +340,6 @@ def _guess_port(command: str) -> int | None:
     """Cheap heuristic: scan the command string for `--port N`, `-p N`,
     `:PORT`, or `PORT=N`. Used to surface preview/dev ports in the admin
     UI without parsing real stdout. Returns None if no number found."""
-    import re
     patterns = [
         r"--port[= ](\d{2,5})",
         r"\b-p[= ](\d{2,5})",

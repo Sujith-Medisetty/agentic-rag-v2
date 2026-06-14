@@ -2304,8 +2304,7 @@ async def _run_delete_job(
                         #    only) — stop+disable+rm+daemon-reload.
                         print(f"[ojas-delete]   slug={slug} step=unit row_app_dir={row.get('app_dir')!r}")
                         _remove_app_service_files(slug, row)
-                        # 2. Unlink the per-slug Caddy fragment. We do
-                        #    this directly (not via _drop_caddy_fragment)
+                        # 2. Unlink the per-slug Caddy fragment inline
                         #    so we can batch the Caddy reload to ONCE at
                         #    the end of the loop instead of once per
                         #    app — N reloads of Caddy for N apps is
@@ -3084,7 +3083,6 @@ def _deployed_app_or_404(slug: str, user: dict) -> dict:
 
 OJAS_APPS_PORT_RANGE_START = 9100
 OJAS_APPS_PORT_RANGE_END = 9899
-OJAS_APPS_PORT_RANGE_SIZE = OJAS_APPS_PORT_RANGE_END - OJAS_APPS_PORT_RANGE_START + 1
 OJAS_APPS_UNIT_DIR = Path("/etc/systemd/system")
 OJAS_APPS_VENV_BIN = "bin"  # relative to backend dir
 
@@ -3652,16 +3650,6 @@ def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
     # Reload Caddy so it picks up the new fragment on its next request
     _reload_caddy()
 
-def _drop_caddy_fragment(slug: str) -> None:
-    """Remove a single per-slug Caddy fragment. Used on app-delete."""
-    f = OJAS_CADDY_ROUTES_DIR / f"{slug}.caddy"
-    try:
-        if f.exists():
-            f.unlink()
-    except OSError:
-        pass
-    _reload_caddy()
-
 # Shared "Deploying..." placeholder directory. Holds a single index.html
 # served by the eager-Caddy fragment below. Idempotent: _ensure_deploying_page
 # is called every time we need the page, and writes only if the content
@@ -3715,7 +3703,7 @@ def _write_caddy_deploying_fragment(slug: str) -> None:
     _run_deploy_job via _regenerate_caddy_routes_for_user -- this
     function's output is overwritten.
 
-    If the job is cancelled before step 9, _drop_caddy_fragment removes
+    If the job is cancelled before step 9, the rollback helper unlinks
     this file so the public URL falls back to the wildcard block.
 
     Self-contained: no DB lookup, no slug-existence check, safe to
@@ -4084,8 +4072,11 @@ async def _run_deploy_job(
     # dist/backend. Runs on any failure path that leaves the deploy
     # state inconsistent.
     def _rollback_caddy() -> None:
+        f = OJAS_CADDY_ROUTES_DIR / f"{slug}.caddy"
         try:
-            loop.run_in_executor(None, lambda: _drop_caddy_fragment(slug))
+            if f.exists():
+                f.unlink()
+            _reload_caddy()
         except Exception:
             pass
 

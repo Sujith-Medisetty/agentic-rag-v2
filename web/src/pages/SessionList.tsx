@@ -6,6 +6,7 @@ import {
 } from "@/lib/api";
 import type { Project, Session } from "@/lib/types";
 import ProjectSettings from "@/components/ProjectSettings";
+import { PencilIcon, TrashIcon } from "@/components/icons";
 import DeleteProgressModal from "@/components/DeleteProgressModal";
 
 export default function SessionList() {
@@ -37,15 +38,6 @@ export default function SessionList() {
     job: DeleteJobStart | null;
   } | null>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
-
-  // React modal state for name conflicts. `null` = hidden. Otherwise:
-  // the desired name that conflicted + the id+name of the existing
-  // session that's already using it (so the user can jump to it).
-  const [conflict, setConflict] = useState<{
-    desired: string;
-    existingId: string;
-    existingName: string;
-  } | null>(null);
 
   // Fetch the project + ALL sessions for the project in one round trip.
   // The server returns the full list (newest-first) — no pagination.
@@ -320,16 +312,6 @@ export default function SessionList() {
         })}
       </div>
 
-      {/* Name-conflict modal — a real React dialog, not a native alert(). */}
-      {conflict && (
-        <NameConflictModal
-          desired={conflict.desired}
-          existingName={conflict.existingName}
-          existingId={conflict.existingId}
-          projectId={projectId ?? ""}
-          onClose={() => setConflict(null)}
-        />
-      )}
       {deletingSession && (
         <DeleteProgressModal
           open={!!deletingSession}
@@ -359,124 +341,4 @@ export default function SessionList() {
   );
 }
 
-// =============================================================================
-// Name-conflict modal
-// =============================================================================
-// Real <dialog> element (semantic + keyboard-friendly). Shows the user that
-// the name they tried to use is already taken by another session in the
-// same project, with two clear actions: jump to the existing session, or
-// close and try a different name. Dismisses on Esc / backdrop click / X.
-function NameConflictModal({
-  desired,
-  existingName,
-  existingId,
-  projectId,
-  onClose,
-}: {
-  desired: string;
-  existingName: string;
-  existingId: string;
-  projectId: string;
-  onClose: () => void;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    ref.current?.showModal();
-  }, []);
-  return (
-    <dialog
-      ref={ref}
-      onClose={onClose}
-      onClick={(e) => {
-        // Click on the backdrop (outside the inner box) closes the dialog.
-        if (e.target === ref.current) ref.current?.close();
-      }}
-      className="rounded-xl border border-border bg-bg p-0 text-text shadow-2xl backdrop:bg-black/40"
-    >
-      <div className="w-[min(90vw,28rem)] p-5">
-        <div className="flex items-start gap-3">
-          <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-warning/40 bg-warning/10 text-warning">
-            ⚠
-          </div>
-          <div className="min-w-0 flex-1">
-            <h2 className="font-serif text-lg font-semibold leading-tight">
-              Name already in use
-            </h2>
-            <p className="mt-1.5 text-sm text-muted">
-              Another session in this project is already named{" "}
-              <span className="font-mono text-text">{existingName}</span>.
-              Session names must be unique within a project.
-            </p>
-            <p className="mt-2 text-xs text-muted">
-              You tried to rename to{" "}
-              <span className="font-mono text-text">{desired}</span>.
-            </p>
-          </div>
-        </div>
-        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn-ghost min-h-touch"
-            autoFocus
-          >
-            Try a different name
-          </button>
-          {existingId && projectId && (
-            <a
-              href={`/p/${projectId}/s/${existingId}`}
-              className="btn-primary inline-flex min-h-touch items-center justify-center"
-            >
-              Open existing session →
-            </a>
-          )}
-        </div>
-      </div>
-    </dialog>
-  );
-}
-
-// =============================================================================
-// Icons (match the ones in Admin.tsx — outline strokes for clarity at small
-// sizes). Duplicated locally to keep the page self-contained.
-// =============================================================================
-function PencilIcon({ className = "" }: { className?: string }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M12 20h9" />
-      <path d="M16.5 3.5a2.121 2.121 0 113 3L7 19l-4 1 1-4 12.5-12.5z" />
-    </svg>
-  );
-}
-
-function TrashIcon({ className = "" }: { className?: string }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M3 6h18" />
-      <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" />
-      <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6" />
-      <path d="M10 11v6" />
-      <path d="M14 11v6" />
-    </svg>
-  );
-}
+// (icons imported from @/components/icons)

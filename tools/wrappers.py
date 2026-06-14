@@ -219,7 +219,7 @@ class WebSearchInput(BaseModel):
     allowed_domains: list | None = Field(None, description="Only return results from these domains")
     blocked_domains: list | None = Field(None, description="Exclude these domains")
 class GitHubInput(BaseModel):
-    action: str = Field(description="get_issue | list_issues | comment_issue | create_pr | get_pr | list_prs | get_repo_info | get_file")
+    action: str = Field(description="get_issue | create_pr | list_prs")
     repo: str = Field(description="owner/repo e.g. anthropics/claude")
     issue_number: int | None = Field(None)
     pr_number: int | None = Field(None)
@@ -953,7 +953,7 @@ def WebSearch(
 # ============================================================================
 @tool("github", args_schema=GitHubInput)
 def github(action: str, repo: str, **kwargs) -> str:
-    """GitHub API (via `gh` CLI). Actions: `get_issue`, `list_issues`, `comment_issue`, `create_pr`, `get_pr`, `list_prs`, `get_repo_info`, `get_file`.
+    """GitHub API (via `gh` CLI). Actions: `get_issue`, `create_pr`, `list_prs`.
     PR creation:
     - Keep titles under 70 characters; use the body for detail.
     - Body format: `## Summary` with 1–3 bullets, then `## Test plan` with a markdown checklist of how to verify.
@@ -967,7 +967,7 @@ def github(action: str, repo: str, **kwargs) -> str:
         from tools.github import get_issue, list_prs, create_pr
         if action == "get_issue":
             return str(get_issue(repo=repo, issue_number=kwargs.get("issue_number", 1)))
-        elif action in ("list_prs", "get_pr"):
+        elif action == "list_prs":
             return str(list_prs(repo=repo, state=kwargs.get("state", "open")))
         elif action == "create_pr":
             result = create_pr(

@@ -95,15 +95,6 @@ class PermissionContext:
     override_decision: PermissionOverride | None = None
     override_reason: str | None = None
 
-@dataclass
-class PermissionRequest:
-    """Authorization request presented to a prompter."""
-    tool_name: str
-    input: str
-    current_mode: PermissionMode
-    required_mode: PermissionMode
-    reason: str | None = None
-
 _SUBJECT_KEYS = (
     "command", "path", "file_path", "filePath", "notebook_path",
     "notebookPath", "url", "pattern", "code", "message",
@@ -334,10 +325,6 @@ class PermissionPolicy:
         return PermissionOutcome.deny(
             reason or f"tool '{tool_name}' requires approval to run while mode is {current.value}"
         )
-
-    def always_allow_tool(self, tool_name: str) -> None:
-        """Mark a tool as always allowed for this session (user chose 'always allow')."""
-        self._always_allow.add(tool_name)
 
 # Note: the old terminal_prompter() helper was removed when the CLI was
 # retired. Web-mode permission prompts will route through a UI modal in a

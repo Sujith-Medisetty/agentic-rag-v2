@@ -3,21 +3,13 @@ import { authApi } from "@/lib/api";
 import { clearToken } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
 import InstallButton from "@/components/InstallButton";
+import { SunIcon, MoonIcon, LogoutIcon } from "@/components/icons";
 
 // Top chrome shown above non-chat pages. ChatPage renders full-screen so it
 // has its own header. Designed mobile-first: compact on phones, generous on
 // tablet+ (max-w-5xl). All controls hit ≥44pt targets.
-//
-// No custom PWA install UI here on purpose — see comment in App.tsx.
-// Users install via the browser's native flow (URL bar install icon
-// on Chrome/Edge, Share → Add to Home Screen on iOS).
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { effective, toggle } = useTheme();
-
-  // SW updates are now AUTO-handled in src/pwa/registerSW.ts (auto-skip-
-  // waiting + auto-reload). No user-facing toast is needed; the old one
-  // lived here but only fired on routes wrapped in <Layout>, missing the
-  // main chat routes (Workspace). Removed entirely.
 
   const logout = async () => {
     try { await authApi.logout(); } catch { /* clear either way */ }
@@ -51,7 +43,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             title={`Switch to ${effective === "dark" ? "light" : "dark"} mode`}
             aria-label={`Switch to ${effective === "dark" ? "light" : "dark"} mode`}
           >
-            {effective === "dark" ? <SunIcon /> : <MoonIcon />}
+            {effective === "dark" ? <SunIcon className="h-4 w-4" /> : <MoonIcon className="h-4 w-4" />}
           </button>
           <button
             onClick={logout}
@@ -65,51 +57,11 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             title="Log out"
             aria-label="Log out"
           >
-            <LogoutIcon />
+            <LogoutIcon className="h-4 w-4" />
           </button>
         </div>
       </header>
       <main>{children}</main>
     </div>
-  );
-}
-
-// Inline icons (no extra deps). Sized to match btn-icon's 36×36 frame
-// (16×16 inside a 9×9 padding). Stroke uses currentColor so they pick up
-// `text-muted` / `text-text` from the parent.
-function SunIcon() {
-  return (
-    <svg
-      width="16" height="16" viewBox="0 0 24 24"
-      fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" aria-hidden
-    >
-      <circle cx="12" cy="12" r="4" />
-      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
-    </svg>
-  );
-}
-
-function MoonIcon() {
-  return (
-    <svg
-      width="16" height="16" viewBox="0 0 24 24"
-      fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" aria-hidden
-    >
-      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-    </svg>
-  );
-}
-
-function LogoutIcon() {
-  return (
-    <svg
-      width="16" height="16" viewBox="0 0 24 24"
-      fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" aria-hidden
-    >
-      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
-    </svg>
   );
 }

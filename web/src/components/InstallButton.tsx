@@ -203,6 +203,3 @@ function ShareIcon({ className = "" }: { className?: string }) {
     </svg>
   );
 }
-
-// Re-export utility so any other component can hide UI when standalone.
-export { isStandalone };

@@ -33,9 +33,7 @@ export default function PlanPanel({ items }: { items: TodoItem[] }) {
   // chrome doesn't carry a stale "all green" widget after the work is over.
   // The panel reappears automatically if the agent emits a new TodoWrite
   // (e.g. starting a follow-up phase).
-  if (done === items.length && inProgress === 0 && pending === 0) {
-    return null;
-  }
+  if (done === items.length) return null;
 
   // If the user hasn't toggled, default to expanded for small lists.
   const expanded = open == null ? items.length <= 5 : open;

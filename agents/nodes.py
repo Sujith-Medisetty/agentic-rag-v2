@@ -105,7 +105,7 @@ class _RunBudget:
     # Poll-style tools are legitimately repetitive (e.g. the orchestrator waiting
     # on a sub-agent), so they are excluded from the stall signature — otherwise a
     # normal wait would false-trip the no-progress detector.
-    _POLL_TOOLS = frozenset({"AgentStatus", "WorkerGet", "WorkerAwaitReady", "WorkerObserve"})
+    _POLL_TOOLS = frozenset({"AgentStatus"})
 
     def __init__(self) -> None:
         self.max_iters = 0
@@ -202,27 +202,6 @@ _run_budget = _RunBudget()
 _t_call_start: float = 0.0
 
 
-def _iterations_for_trace() -> int:
-    """The current node_agent iteration counter, for the LLM trace.
-
-    Reads the module-level `_run_budget` (set in `reset_run_budget`
-    once per turn). The trace stores this so the user can match a
-    wire-level call back to "iteration N of the current turn"."""
-    try:
-        return int(_run_budget.iters)
-    except Exception:
-        return 0
-
-
-def _model_name_for_trace() -> str:
-    """The model name for the LLM trace — the configured model the
-    call was actually made with (e.g. "MiniMax-M3")."""
-    try:
-        return str(_model)
-    except Exception:
-        return ""
-
-
 def reset_run_budget(
     *, max_iters: int = 0, max_tokens: int = 0, max_seconds: int = 0,
     no_progress_limit: int = 8,
@@ -243,26 +222,6 @@ def get_token_counter():
         except Exception:
             pass
     return _token_counter
-
-
-def _tools() -> list:
-    # Native tools + any MCP tools registered at startup. bind_tools(...) sees
-    # the union; the LLM treats them identically.
-    return get_all_tools() + _mcp_tools
-
-
-def _llm_request_timeout() -> float:
-    # Hard per-call timeout for ANY single LLM request. Without this, a
-    # silent provider stall (Anthropic/OpenAI infra hiccup, dropped TCP
-    # connection, slow streaming response) would sit forever in the worker
-    # thread — the UI freezes, the cancel button only closes the asyncio
-    # task while the thread stays blocked on the socket read. With a
-    # timeout, the model raises, the agent loop catches it, and the turn
-    # closes cleanly via the existing error path.
-    try:
-        return float(os.getenv("AGENT_LLM_TIMEOUT_SECS", "300"))
-    except ValueError:
-        return 300.0
 
 
 def _get_llm(
@@ -288,7 +247,7 @@ def _get_llm(
     eff_provider = (provider or _provider).lower()
     eff_model    = model or _model
     eff_thinking = _thinking if thinking is None else thinking
-    timeout      = _llm_request_timeout()
+    timeout      = float(os.getenv("AGENT_LLM_TIMEOUT_SECS", "300") or 300)
 
     if eff_provider == "anthropic":
         kwargs: dict = {
@@ -629,8 +588,8 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
         if sid:
             rec = LLMCallRecord(
                 ts=time.time(),
-                iteration=_iterations_for_trace(),
-                model=_model_name_for_trace(),
+                iteration=_run_budget.iters if _run_budget else 0,
+                model=_model,
                 request_messages=serialize_messages(messages),
                 response=serialize_messages([ai])[0] if ai else {},
                 usage=dict(usage) if usage else {},
@@ -823,21 +782,6 @@ def _repair_orphan_tool_calls(messages: list[BaseMessage]) -> list[BaseMessage]:
         else:
             cleaned.append(m)
     return cleaned
-
-
-def _auto_compact_threshold_value() -> int:
-    """Read the auto-compact threshold for the chat-visible notification.
-
-    The threshold lives in memory.checkpointer (so the runtime override via
-    OJAS_AUTO_COMPACT_INPUT_TOKENS is respected) — we import lazily so this
-    module doesn't pull in checkpointer on every agents.nodes import. Returns
-    the default 50_000 if the import fails for any reason.
-    """
-    try:
-        from memory.checkpointer import _auto_compact_threshold
-        return int(_auto_compact_threshold())
-    except Exception:
-        return 50_000
 
 
 def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -1053,7 +997,7 @@ def node_agent(state: RunnerState) -> dict:
     # Auto-compact BEFORE the LLM call (turn that crosses threshold pays
     # for the smaller compacted context, not the giant one). The `put()`
     # safety net only fires on restart or paths that bypass the loop.
-    from memory.checkpointer import maybe_compact, mask_old_observations
+    from memory.checkpointer import maybe_compact, mask_old_observations, _auto_compact_threshold
     history, did_compact, compact_info = maybe_compact(history, session_id=session_id)
     if did_compact:
         # Chat-visible notification. No `context_update` here — the
@@ -1068,7 +1012,7 @@ def node_agent(state: RunnerState) -> dict:
                 tokens_before=compact_info.get("tokens_before", 0),
                 tokens_after=compact_info.get("tokens_after", 0),
                 summary_preview=compact_info.get("summary_preview", ""),
-                threshold=_auto_compact_threshold_value(),
+                threshold=_auto_compact_threshold(),
             )
         except Exception:
             pass
@@ -1110,7 +1054,7 @@ def node_agent(state: RunnerState) -> dict:
         messages.append(SystemMessage(content=dynamic_suffix))
     messages.extend(history)
 
-    llm = _get_llm().bind_tools(_tools())
+    llm = _get_llm().bind_tools(get_all_tools() + _mcp_tools)
     ai = _stream_model_call(llm, messages)
     _run_budget.record(ai)
 
@@ -1240,7 +1184,7 @@ def node_tools(state: RunnerState) -> dict:
     from agents.reporter import get_reporter
     reporter = get_reporter()
 
-    result = ToolNode(_tools()).invoke(state)
+    result = ToolNode(get_all_tools() + _mcp_tools).invoke(state)
 
     for msg in result.get("messages", []):
         content = msg.content if isinstance(msg.content, str) else str(msg.content)

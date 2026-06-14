@@ -53,16 +53,6 @@ class ValidationResult:
     def is_warning(self) -> bool:
         return self.status == ValidationStatus.WARN
 
-class CommandIntent(Enum):
-    READ_ONLY = "read_only"
-    WRITE = "write"
-    DESTRUCTIVE = "destructive"
-    NETWORK = "network"
-    PROCESS_MANAGEMENT = "process_management"
-    PACKAGE_MANAGEMENT = "package_management"
-    SYSTEM_ADMIN = "system_admin"
-    UNKNOWN = "unknown"
-
 # ---------------------------------------------------------------------------
 # Command lists
 # ---------------------------------------------------------------------------
@@ -297,45 +287,6 @@ def validate_paths(command: str, workspace: str) -> ValidationResult:
         )
 
     return ValidationResult.allow()
-
-# ---------------------------------------------------------------------------
-# 6. Command classification
-# ---------------------------------------------------------------------------
-
-def classify_command(command: str) -> CommandIntent:
-    first = _extract_first_command(command)
-
-    if first in SEMANTIC_READ_ONLY_COMMANDS:
-        if first == "sed" and " -i" in command:
-            return CommandIntent.WRITE
-        return CommandIntent.READ_ONLY
-
-    if first in ALWAYS_DESTRUCTIVE_COMMANDS or first == "rm":
-        return CommandIntent.DESTRUCTIVE
-
-    if first in WRITE_COMMANDS:
-        return CommandIntent.WRITE
-
-    if first in NETWORK_COMMANDS:
-        return CommandIntent.NETWORK
-
-    if first in PROCESS_COMMANDS:
-        return CommandIntent.PROCESS_MANAGEMENT
-
-    if first in PACKAGE_COMMANDS:
-        return CommandIntent.PACKAGE_MANAGEMENT
-
-    if first in SYSTEM_ADMIN_COMMANDS:
-        return CommandIntent.SYSTEM_ADMIN
-
-    if first == "git":
-        parts = command.split()
-        sub = next((p for p in parts[1:] if not p.startswith("-")), None)
-        if sub and sub in GIT_READ_ONLY_SUBCOMMANDS:
-            return CommandIntent.READ_ONLY
-        return CommandIntent.WRITE
-
-    return CommandIntent.UNKNOWN
 
 # ---------------------------------------------------------------------------
 # Full pipeline — run all validations in order

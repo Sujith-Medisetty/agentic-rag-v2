@@ -14,6 +14,7 @@ old messages → continue.
 """
 
 import json
+import logging
 import os
 from contextvars import ContextVar
 from pathlib import Path
@@ -565,9 +566,9 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
         "tokens_after": tokens_after,
         "summary_preview": summary_preview,
     }
-    print(
-        f"\033[2m[auto-compact: {removed} messages summarised, "
-        f"~{removed * 200} tokens freed]\033[0m"
+    logging.getLogger(__name__).info(
+        "auto-compact: %d messages summarised, ~%d tokens freed",
+        removed, removed * 200,
     )
     return compacted, True, info
 
@@ -617,9 +618,9 @@ class CompactingCheckpointer(SqliteSaver):
             compacted = _compact_messages(messages)
             removed = len(messages) - len(compacted)
             if removed > 0:
-                print(
-                    f"\033[2m[auto-compact (safety net): {removed} messages summarised, "
-                    f"~{removed * 200} tokens freed]\033[0m"
+                logging.getLogger(__name__).info(
+                    "auto-compact (safety net): %d messages summarised, ~%d tokens freed",
+                    removed, removed * 200,
                 )
             checkpoint = {
                 **checkpoint,

@@ -107,24 +107,9 @@ def execute_sandboxed(
     timeout_secs: float = 120.0,
 ) -> SandboxResult:
     """Run a shell command inside the namespace sandbox, or directly if inactive."""
-    if not status.active:
-        return _run_direct(command, timeout_secs)
-    if status.mode == SandboxMode.UNSHARE:
-        return _run_unshare(command, status, timeout_secs)
-    return _run_direct(command, timeout_secs)
-
-# ---------------------------------------------------------------------------
-# Linux unshare execution — port of build_linux_sandbox_command()
-# ---------------------------------------------------------------------------
-
-def _run_unshare(
-    command: str,
-    status: SandboxStatus,
-    timeout_secs: float,
-) -> SandboxResult:
-    """Run command in a Linux user namespace."""
     workspace = Path(status.workspace).resolve()
-
+    if not status.active or status.mode != SandboxMode.UNSHARE:
+        return _run_subprocess(["sh", "-c", command], timeout_secs)
     args = [
         "unshare",
         "--user", "--map-root-user",
@@ -135,20 +120,10 @@ def _run_unshare(
     if status.network_isolated:
         args.append("--net")
     args += ["sh", "-lc", command]
-
     env = os.environ.copy()
     env["HOME"] = str(workspace / ".sandbox-home")
     env["TMPDIR"] = str(workspace / ".sandbox-tmp")
-
     return _run_subprocess(args, timeout_secs, env=env)
-
-def _run_direct(command: str, timeout_secs: float) -> SandboxResult:
-    """Run command directly on host. No isolation."""
-    return _run_subprocess(["sh", "-c", command], timeout_secs)
-
-# ---------------------------------------------------------------------------
-# Shared subprocess runner
-# ---------------------------------------------------------------------------
 
 def _run_subprocess(
     cmd: list[str],
@@ -167,12 +142,15 @@ def _run_subprocess(
             stdout=result.stdout, stderr=result.stderr, exit_code=result.returncode,
         )
     except subprocess.TimeoutExpired as e:
+        out = e.stdout
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
         return SandboxResult(
-            stdout=(e.stdout or b"").decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
+            stdout=out or "",
             stderr=f"[timed out after {timeout_secs:.0f}s]",
             exit_code=-1, interrupted=True,
         )
-    except Exception as e: # noqa: BLE001
+    except Exception as e:
         return SandboxResult(stdout="", stderr=f"Failed to execute: {e}", exit_code=-1)
 
 # ---------------------------------------------------------------------------

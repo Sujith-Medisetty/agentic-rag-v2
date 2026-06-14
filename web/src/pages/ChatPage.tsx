@@ -52,7 +52,8 @@ import PlanPanel from "@/components/PlanPanel";
 import LLMTracePanel from "@/components/LLMTracePanel";
 import TurnCard, { ActiveTurnCard } from "@/components/TurnCard";
 import RunningTotals from "@/components/RunningTotals";
-import { formatDuration } from "@/lib/format";
+import { formatDuration, formatTokens } from "@/lib/format";
+import { SunIcon, MoonIcon } from "@/components/icons";
 
 // Single source of truth for slash commands. Used by both the inline
 // autocomplete picker (live, as the user types) and the /help overlay (full
@@ -1534,7 +1535,7 @@ export default function ChatPage() {
             title={`Switch to ${themeEffective === "dark" ? "light" : "dark"} mode`}
             aria-label={`Switch to ${themeEffective === "dark" ? "light" : "dark"} mode`}
           >
-            {themeEffective === "dark" ? <SunGlyph /> : <MoonGlyph />}
+            {themeEffective === "dark" ? <SunIcon className="h-4 w-4" /> : <MoonIcon className="h-4 w-4" />}
           </button>
           <button
             type="button"
@@ -2501,7 +2502,7 @@ function ChatStatusBar({
             </span>
           </span>
           <Sep />
-          <StatItem label="Elapsed" value={formatDurationCompact(now - currentTurn.startedAt)} />
+          <StatItem label="Elapsed" value={formatDuration(now - currentTurn.startedAt)} />
           <Sep />
           <StatItem
             label="Tools"
@@ -2525,15 +2526,15 @@ function ChatStatusBar({
                 label="In"
                 value={
                   liveCacheRead > 0
-                    ? `${formatTokensTiny(totalIn)} (${formatTokensTiny(liveCacheRead)} cached)`
-                    : formatTokensTiny(totalIn)
+                    ? `${formatTokens(totalIn)} (${formatTokens(liveCacheRead)} cached)`
+                    : formatTokens(totalIn)
                 }
                 valueClass="text-accent"
                 title={liveCacheRead > 0
                   ? `${totalIn.toLocaleString()} in · ${liveCacheRead.toLocaleString()} cache hits · ${(totalIn - liveCacheRead).toLocaleString()} new`
                   : `${totalIn.toLocaleString()} in`}
               />
-              <StatItem label="Out" value={formatTokensTiny(totalOut)} valueClass="text-accent-2" />
+              <StatItem label="Out" value={formatTokens(totalOut)} valueClass="text-accent-2" />
             </>
           )}
         </div>
@@ -2557,25 +2558,6 @@ function StatItem({
 
 function Sep() {
   return <span className="text-subtle">·</span>;
-}
-
-function formatDurationCompact(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
-  const m = Math.floor(s / 60);
-  const r = Math.round(s % 60);
-  return `${m}m ${r}s`;
-}
-
-function formatTokensTiny(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "k";
-  return (n / 1_000_000).toFixed(1) + "M";
-}
-
-function formatCostTiny(c: number): string {
-  return c < 0.01 ? `$${c.toFixed(4)}` : `$${c.toFixed(c < 1 ? 3 : 2)}`;
 }
 
 // Parse the bash-output status marker the bash tool always appends to
@@ -2614,24 +2596,6 @@ function parseBashOutputMarker(
   return { total, cap, status, keptFirst, keptLast, dropped, verdict, spillPath };
 }
 
-
-function StatusPill({
-  status,
-}: { status: "connecting" | "open" | "closed" | "error" }) {
-  const map = {
-    connecting: { cls: "pill",         dot: "bg-warn animate-pulse-soft", label: "connecting" },
-    open:       { cls: "pill pill-success", dot: "bg-success",            label: "live" },
-    closed:     { cls: "pill",         dot: "bg-subtle",                  label: "offline" },
-    error:      { cls: "pill pill-danger",  dot: "bg-danger",             label: "error" },
-  } as const;
-  const m = map[status];
-  return (
-    <div className={`${m.cls} text-[10px]`}>
-      <span className={`h-1.5 w-1.5 rounded-full ${m.dot}`} />
-      {m.label}
-    </div>
-  );
-}
 
 function BranchBadge({ git }: { git: GitInfo | null }) {
   if (!git || !git.is_git_repo || !git.branch) return null;
@@ -3961,29 +3925,4 @@ function truncForDebug(s: any, n: number): string {
   return str.length <= n ? str : str.slice(0, n - 1) + "…";
 }
 
-// Inline sun/moon glyphs — shared shape with Layout's header icons but kept
-// local so the chat page doesn't add an import cycle.
-function SunGlyph() {
-  return (
-    <svg
-      width="16" height="16" viewBox="0 0 24 24"
-      fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" aria-hidden
-    >
-      <circle cx="12" cy="12" r="4" />
-      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
-    </svg>
-  );
-}
-
-function MoonGlyph() {
-  return (
-    <svg
-      width="16" height="16" viewBox="0 0 24 24"
-      fill="none" stroke="currentColor" strokeWidth="2"
-      strokeLinecap="round" strokeLinejoin="round" aria-hidden
-    >
-      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-    </svg>
-  );
-}
+// (icons imported from @/components/icons)

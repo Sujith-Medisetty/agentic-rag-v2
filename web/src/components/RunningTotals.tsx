@@ -92,11 +92,7 @@ export default function RunningTotals({ totals }: { totals: SessionTotals }) {
           <span className="text-subtle">·</span>
           <span
             className="text-text"
-            title={
-              hasSubCosts
-                ? `${mathMultiline}\n\nRates: input $${MINIMAX_M3_PRICING.input}/M · output $${MINIMAX_M3_PRICING.output}/M · cache_read $${MINIMAX_M3_PRICING.cache_read}/M · cache_write $${MINIMAX_M3_PRICING.cache_write}/M`
-                : `${mathMultiline}\n\nRates: input $${MINIMAX_M3_PRICING.input}/M · output $${MINIMAX_M3_PRICING.output}/M · cache_read $${MINIMAX_M3_PRICING.cache_read}/M · cache_write $${MINIMAX_M3_PRICING.cache_write}/M`
-            }
+            title={`${mathMultiline}\n\nRates: input $${MINIMAX_M3_PRICING.input}/M · output $${MINIMAX_M3_PRICING.output}/M · cache_read $${MINIMAX_M3_PRICING.cache_read}/M · cache_write $${MINIMAX_M3_PRICING.cache_write}/M`}
           >
             {formatCost(totals.costUsd)}
             {inlineBreakdown && (

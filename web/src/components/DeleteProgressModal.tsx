@@ -36,15 +36,7 @@ const STEP_LABELS: Record<string, string> = {
   drop_rows: "Removing database rows",
 };
 
-const FALLBACK_LABELS = [
-  "Cancelling agent",
-  "Killing spawned processes",
-  "Tearing down sub-projects",
-  "Removing workspace files",
-  "Dropping agent checkpoint",
-  "Clearing event bus",
-  "Removing database rows",
-];
+const FALLBACK_LABELS = Object.values(STEP_LABELS);
 
 export interface DeleteProgressModalProps {
   open: boolean;

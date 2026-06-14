@@ -30,13 +30,14 @@
 //   ───── 23.4s · 5 tools · 1 agent · 3.4k in / 1.2k out ─────
 
 import { memo, useEffect, useState } from "react";
+
 import type {
   Turn, ToolEvent, FileChange, AgentRecord, CommitRecord, TimelineBlock, LlmCall,
   ContextCompactedNote,
 } from "@/lib/types";
 import TurnFooter from "@/components/TurnFooter";
 import Markdown from "@/components/Markdown";
-import { formatDuration } from "@/lib/format";
+import { formatDuration, formatTokens } from "@/lib/format";
 
 // ============================================================================
 // TurnCard
@@ -258,21 +259,21 @@ function LlmCallBlockImpl({
       >
         <span className="font-semibold uppercase tracking-[0.16em]">llm</span>
         <span className="font-mono text-tx-xs">
-          <span className="text-accent">{formatTokensCompact(inputTokens)}</span>
+          <span className="text-accent">{formatTokens(inputTokens)}</span>
           {cacheReadTokens > 0 && (
             <span
               className="text-success/80"
               title={`${cacheReadTokens.toLocaleString()} cache hits`}
             >
-              {" "}({formatTokensCompact(cacheReadTokens)} cached
-              {newTokens > 0 && <> · <span className="text-text">{formatTokensCompact(newTokens)} new</span></>})
+              {" "}({formatTokens(cacheReadTokens)} cached
+              {newTokens > 0 && <> · <span className="text-text">{formatTokens(newTokens)} new</span></>})
             </span>
           )}
           {cacheReadTokens === 0 && newTokens > 0 && (
-            <span className="text-subtle"> ({formatTokensCompact(newTokens)} new)</span>
+            <span className="text-subtle"> ({formatTokens(newTokens)} new)</span>
           )}
           <span className="text-subtle"> in · </span>
-          <span className="text-accent-2">{formatTokensCompact(outputTokens)}</span>
+          <span className="text-accent-2">{formatTokens(outputTokens)}</span>
           <span className="text-subtle"> out</span>
         </span>
       </span>
@@ -304,20 +305,20 @@ function SubAgentCallsBreakdownImpl({ calls }: { calls: LlmCall[] }) {
           LLM calls
         </span>
         <span className="font-mono text-muted">
-          {calls.length} · {formatTokensCompact(totalIn)} in
+          {calls.length} · {formatTokens(totalIn)} in
           {totalCacheRead > 0 ? (
             <span
               className="text-success/80"
               title={`${totalCacheRead.toLocaleString()} cache hits across this sub-agent's calls`}
             >
-              {" "}({formatTokensCompact(totalCacheRead)} cached
-              {totalNew > 0 && <> · <span className="text-text">{formatTokensCompact(totalNew)} new</span></>})
+              {" "}({formatTokens(totalCacheRead)} cached
+              {totalNew > 0 && <> · <span className="text-text">{formatTokens(totalNew)} new</span></>})
             </span>
           ) : totalNew > 0 ? (
-            <span className="text-subtle"> ({formatTokensCompact(totalNew)} new)</span>
+            <span className="text-subtle"> ({formatTokens(totalNew)} new)</span>
           ) : null}
           <span className="text-subtle"> / </span>
-          {formatTokensCompact(totalOut)} out
+          {formatTokens(totalOut)} out
         </span>
         <span>{open ? "▾" : "▸"}</span>
       </button>
@@ -328,17 +329,17 @@ function SubAgentCallsBreakdownImpl({ calls }: { calls: LlmCall[] }) {
             return (
               <li key={`${c.ts}-${i}`} className="flex items-baseline gap-3 font-mono text-tx-xs">
                 <span className="w-10 text-right text-subtle">#{i + 1}</span>
-                <span className="text-accent">{formatTokensCompact(c.inputTokens)}</span>
+                <span className="text-accent">{formatTokens(c.inputTokens)}</span>
                 {c.cacheReadTokens > 0 ? (
                   <span className="text-success/80" title={`${c.cacheReadTokens.toLocaleString()} cache hits`}>
-                    ({formatTokensCompact(c.cacheReadTokens)} cached
-                    {callNew > 0 && <> · <span className="text-text">{formatTokensCompact(callNew)} new</span></>})
+                    ({formatTokens(c.cacheReadTokens)} cached
+                    {callNew > 0 && <> · <span className="text-text">{formatTokens(callNew)} new</span></>})
                   </span>
                 ) : callNew > 0 ? (
-                  <span className="text-subtle">({formatTokensCompact(callNew)} new)</span>
+                  <span className="text-subtle">({formatTokens(callNew)} new)</span>
                 ) : null}
                 <span className="text-subtle">in</span>
-                <span className="text-accent-2">{formatTokensCompact(c.outputTokens)}</span>
+                <span className="text-accent-2">{formatTokens(c.outputTokens)}</span>
                 <span className="text-subtle">out</span>
               </li>
             );
@@ -393,110 +394,6 @@ function ThinkingBlockViewImpl({ text }: { text: string }) {
   );
 }
 const ThinkingBlockView = memo(ThinkingBlockViewImpl);
-
-// ============================================================================
-// LiveProgress — ticking stats card shown while a turn is still streaming.
-// Mirrors TurnFooter's layout so the final swap (live → final) is seamless.
-// ============================================================================
-
-function LiveProgressImpl({ turn }: { turn: Turn }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 250);
-    return () => clearInterval(id);
-  }, []);
-
-  const totalTok = turn.liveInputTokens + turn.liveOutputTokens;
-  const runningTools = turn.tools.filter((t) => t.status === "running").length;
-  const runningAgents = Object.values(turn.agents)
-    .filter((a) => a.status === "running").length;
-  // Live cache hits from this turn's orchestrator-level llm_call blocks.
-  // Mirrors the sticky ChatStatusBar above the compose divider so the two
-  // stay in sync — whichever surface the user is looking at, the cache
-  // hit fraction is visible.
-  const liveCacheRead = turn.blocks.reduce((acc, b) => {
-    return b.kind === "llm_call" ? acc + (b.cacheReadTokens ?? 0) : acc;
-  }, 0);
-
-  return (
-    <div className="mt-5 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 font-sans backdrop-blur-sm">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-tx-xs">
-        <div className="inline-flex items-center gap-1.5">
-          <span className="stream-dot" />
-          <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-accent">
-            Live
-          </span>
-        </div>
-        <Divider />
-        <LiveStat label="Elapsed" value={formatDuration(now - turn.startedAt)} />
-        <Divider />
-        <LiveStat
-          label="Tools"
-          value={`${turn.tools.length}${runningTools ? ` (${runningTools} running)` : ""}`}
-          valueClass={runningTools ? "text-warn" : "text-text"}
-        />
-        {Object.keys(turn.agents).length > 0 && (
-          <>
-            <Divider />
-            <LiveStat
-              label="Agents"
-              value={`${Object.keys(turn.agents).length}${runningAgents ? ` (${runningAgents} running)` : ""}`}
-              valueClass={runningAgents ? "text-warn" : "text-text"}
-            />
-          </>
-        )}
-        {totalTok > 0 && (
-          <>
-            <Divider />
-            <LiveStat
-              label="In"
-              value={
-                liveCacheRead > 0
-                  ? `${formatTokensCompact(turn.liveInputTokens)} (${formatTokensCompact(liveCacheRead)} cached)`
-                  : formatTokensCompact(turn.liveInputTokens)
-              }
-              valueClass="text-accent"
-              title={liveCacheRead > 0
-                ? `${turn.liveInputTokens.toLocaleString()} in · ${liveCacheRead.toLocaleString()} cache hits · ${(turn.liveInputTokens - liveCacheRead).toLocaleString()} new`
-                : undefined}
-            />
-            <LiveStat
-              label="Out"
-              value={formatTokensCompact(turn.liveOutputTokens)}
-              valueClass="text-accent-2"
-            />
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-const LiveProgress = memo(LiveProgressImpl);
-
-function LiveStatImpl({
-  label, value, valueClass = "text-text", title,
-}: { label: string; value: string; valueClass?: string; title?: string }) {
-  return (
-    <div className="inline-flex items-baseline gap-1.5" title={title}>
-      <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">
-        {label}
-      </span>
-      <span className={`font-mono text-tx-sm ${valueClass}`}>{value}</span>
-    </div>
-  );
-}
-const LiveStat = memo(LiveStatImpl);
-
-function Divider() {
-  return <span className="text-subtle">·</span>;
-}
-// memo would be a no-op for an empty-props component, so leave Divider plain.
-
-function formatTokensCompact(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "k";
-  return (n / 1_000_000).toFixed(1) + "M";
-}
 
 // ============================================================================
 // Turn divider — sans eyebrow "TURN 3 · 09:42:15" with a thin connecting line
@@ -879,20 +776,20 @@ function AgentNodeImpl({ agent }: { agent: AgentRecord }) {
         {totalTok > 0 && (
           <span className="text-muted">
             <span className="text-subtle">tokens:</span>{" "}
-            <span className="text-accent">{formatTokensCompact(agent.liveInputTokens)}</span>
+            <span className="text-accent">{formatTokens(agent.liveInputTokens)}</span>
             {subCacheRead > 0 ? (
               <span
                 className="text-success/80"
                 title={`${subCacheRead.toLocaleString()} cache hits across this sub-agent's calls`}
               >
-                {" "}({formatTokensCompact(subCacheRead)} cached
-                {subNewTokens > 0 && <> · <span className="text-text">{formatTokensCompact(subNewTokens)} new</span></>})
+                {" "}({formatTokens(subCacheRead)} cached
+                {subNewTokens > 0 && <> · <span className="text-text">{formatTokens(subNewTokens)} new</span></>})
               </span>
             ) : subNewTokens > 0 ? (
-              <span className="text-subtle"> ({formatTokensCompact(subNewTokens)} new)</span>
+              <span className="text-subtle"> ({formatTokens(subNewTokens)} new)</span>
             ) : null}
             <span className="text-subtle"> in / </span>
-            <span className="text-accent-2">{formatTokensCompact(agent.liveOutputTokens)}</span>
+            <span className="text-accent-2">{formatTokens(agent.liveOutputTokens)}</span>
             <span className="text-subtle"> out</span>
           </span>
         )}

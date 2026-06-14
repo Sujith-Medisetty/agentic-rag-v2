@@ -25,6 +25,7 @@ import asyncio
 import contextvars
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -512,7 +513,6 @@ def _load_claude_md(workspace: str) -> str:
 # placeholder in place and let the next turn retry.
 
 _AUTO_RENAME_DEFAULT_PREFIXES = ("Session ", "Chat ")  # placeholder prefixes
-_AUTO_RENAME_MAX = 1                       # at most 1 auto-rename per session
 _AUTO_RENAME_HISTORY: set[str] = set()     # session_ids already auto-renamed
 # Title-suggestion LLM call budget. The configured model (e.g. MiniMax-M3)
 # thinks for a few seconds on a title-suggestion prompt and then emits a
@@ -622,16 +622,14 @@ async def _maybe_auto_rename(session_id: str) -> None:
         # Apply. Use allocate_unique_session_name for the suffix path so we
         # capture was_suffixed for the UI toast. (allocate_unique_session_name
         # just picks a name; rename_session actually writes it.)
-        from server import db as _db
-        from server.reporter import WebReporter
         try:
-            final = _db.allocate_unique_session_name(
+            final = db.allocate_unique_session_name(
                 project_id=sess["project_id"],
                 desired=title,
                 exclude_id=session_id,
             )
             was_suffixed = (final != title)
-            _db.rename_session(session_id, final)
+            db.rename_session(session_id, final)
             # Notify the WebSocket so the sidebar + chat header update
             # without a manual refresh.
             try:
@@ -681,9 +679,7 @@ async def _call_llm_for_title(prompt: str) -> str | None:
         that follow the "format as JSON" hint too literally.
       - Markdown code-fence wrapping around the answer.
     """
-    import sys as _sys
-    import time as _time
-    t0 = _time.monotonic()
+    t0 = time.monotonic()
     try:
         from agents.nodes import _get_llm
         llm = _get_llm(streaming=False, thinking=False)
@@ -704,7 +700,7 @@ async def _call_llm_for_title(prompt: str) -> str | None:
         else:
             raw = str(msg.content)
         if not raw:
-            print(f"[auto-rename] LLM returned empty content blocks", file=_sys.stderr, flush=True)
+            print(f"[auto-rename] LLM returned empty content blocks", file=sys.stderr, flush=True)
             return None
         # Strip <think>...</think> blocks. Use a non-greedy match
         # AND require the closing tag to actually appear. If the
@@ -729,13 +725,13 @@ async def _call_llm_for_title(prompt: str) -> str | None:
         cleaned = _re.sub(r"\n?```\s*$", "", cleaned.strip())
         cleaned = cleaned.strip()
         if not cleaned:
-            print(f"[auto-rename] LLM response stripped to empty after {_time.monotonic()-t0:.2f}s (raw was {raw[:200]!r})", file=_sys.stderr, flush=True)
+            print(f"[auto-rename] LLM response stripped to empty after {time.monotonic()-t0:.2f}s (raw was {raw[:200]!r})", file=sys.stderr, flush=True)
             return None
-        print(f"[auto-rename] LLM title OK in {_time.monotonic()-t0:.2f}s: {cleaned!r}", file=_sys.stderr, flush=True)
+        print(f"[auto-rename] LLM title OK in {time.monotonic()-t0:.2f}s: {cleaned!r}", file=sys.stderr, flush=True)
         return cleaned
     except _asyncio.TimeoutError:
         print(f"[auto-rename] LLM title-suggestion timed out ({_AUTO_RENAME_LLM_TIMEOUT_S}s)", file=_sys.stderr, flush=True)
         return None
     except Exception as e:
-        print(f"[auto-rename] LLM title-suggestion error after {_time.monotonic()-t0:.2f}s: {e}", file=_sys.stderr, flush=True)
+        print(f"[auto-rename] LLM title-suggestion error after {time.monotonic()-t0:.2f}s: {e}", file=sys.stderr, flush=True)
         return None

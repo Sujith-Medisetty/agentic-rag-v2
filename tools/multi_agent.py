@@ -20,6 +20,7 @@ import os
 import re
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -202,7 +203,7 @@ def _run_agent_job(job: dict) -> None:
         sub_reporter = job.get("reporter")
         ctx_mgr = (
             reporter_scope(sub_reporter) if sub_reporter is not None
-            else _nullctx()
+            else nullcontext()
         )
         with ctx_mgr:
             result = agent.invoke(
@@ -214,12 +215,6 @@ def _run_agent_job(job: dict) -> None:
     except Exception as e: # noqa: BLE001 - record any failure as terminal state
         _persist_terminal_state(job["manifest"], "failed", None, str(e))
 
-
-from contextlib import contextmanager
-
-@contextmanager
-def _nullctx():
-    yield
 
 def _build_subagent_system_prompt(subagent_type: str, model: str) -> str:
     """Mirror build_agent_system_prompt: base system prompt + sub-agent note."""

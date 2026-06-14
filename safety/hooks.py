@@ -36,7 +36,6 @@ class HookResult:
     failed: bool = False
     messages: list[str] = field(default_factory=list)
     updated_input: str | None = None  # hook can modify tool input
-    permission_override: str | None = None  # "allow" or "deny"
 
     @classmethod
     def allow(cls, messages: list[str] | None = None) -> "HookResult":

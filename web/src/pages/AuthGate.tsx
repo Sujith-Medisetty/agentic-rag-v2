@@ -36,13 +36,8 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
         setGate("ready");
       } catch (e) {
         if (cancelled) return;
-        if (e instanceof ApiError && e.status === 401) {
-          // Token is invalid — clear it and show the login form.
-          clearToken();
-          setGate("login");
-        } else {
-          setGate("login");
-        }
+        if (e instanceof ApiError && e.status === 401) clearToken();
+        setGate("login");
       }
     })();
     return () => {

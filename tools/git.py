@@ -53,7 +53,6 @@ def _git_stdout(args: list[str], cwd: str = ".") -> str | None:
 # ---------------------------------------------------------------------------
 
 def git_status(short: bool = True, cwd: str = ".") -> dict:
-    """"""
     args = ["status"]
     if short:
         args += ["--short", "--branch"]
@@ -100,7 +99,6 @@ def git_log(
     path: str | None = None,
     cwd: str = ".",
 ) -> dict:
-    """"""
     args = ["log", f"-n{count}"]
     if oneline:
         args.append("--oneline")
@@ -146,7 +144,6 @@ def git_blame(
     end_line: int | None = None,
     cwd: str = ".",
 ) -> dict:
-    """"""
     args = ["blame"]
     if start_line is not None and end_line is not None:
         args.append(f"-L{start_line},{end_line}")

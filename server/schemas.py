@@ -16,10 +16,6 @@ class AuthStatusResponse(BaseModel):
  # True when the server allows new signups via /api/auth/signup.
  signup_allowed: bool = True
 
-class SetupRequest(BaseModel):
- # Legacy passcode-style setup; kept for backward compat but not used.
- passcode: str = Field(min_length=4, description="Legacy field")
-
 class SignupRequest(BaseModel):
  email: str
  password: str = Field(min_length=6, description="At least 6 characters")
@@ -27,7 +23,6 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
  email: str
  password: str
- device_label: str | None = Field(None, description="Friendly label e.g. 'Sujith iPhone'")
 
 class UserResponse(BaseModel):
  id: str
