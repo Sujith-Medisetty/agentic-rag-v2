@@ -3781,7 +3781,17 @@ def _write_caddy_deploying_fragment(slug: str) -> None:
             "# Do not edit by hand. Overwritten by step 9 of\n"
             "# _run_deploy_job via _regenerate_caddy_routes_for_user.\n"
             + slug + "." + apps_root + " {\n"
-            "    tls { on_demand }\n"
+            # Caddy's parser requires directives inside a `block` to be
+            # on their own line. The post-deploy fragment is multi-line
+            # for that reason; the in-flight placeholder MUST match or
+            # `caddy validate` rejects the whole import chain (and
+            # EVERY per-slug fragment stops loading). The first
+            # occurrence of this was the `cal` deploy on 2026-06-14:
+            # the in-flight one-liner broke the import, the real
+            # fragment never got written, and the user saw 404.
+            "    tls {\n"
+            "        on_demand\n"
+            "    }\n"
             "    encode gzip\n"
             "    root * " + str(OJAS_APPS_DEPLOYING_DIR) + "\n"
             "    file_server\n"
