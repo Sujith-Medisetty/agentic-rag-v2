@@ -1048,42 +1048,39 @@ def node_agent(state: RunnerState) -> dict:
     # "154% is not correct right" — because a session
     # genuinely under the auto-compact ceiling should show a
     # calm chip, not a screaming red one.)
-    # The auto-compact trigger uses the NEW (uncached) number —
-    # compaction only affects future calls, so the trigger should
-    # fire on new content, not the static cache-served prefix.
+    # The chip shows the TOTAL prompt size the model was given
+    # (input + cache_read + cache_creation). This matches the
+    # number the user sees in the LLM call stats ("In 78k")
+    # and the auto-compact trigger uses the same number, so
+    # the chip and the trigger stay in lockstep. The cache
+    # fields are surfaced in the tooltip so the user can see
+    # how much of that 78k is genuinely new content vs
+    # cache-served prefix.
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold, record_llm_input_tokens
         _usage = getattr(ai, "usage_metadata", None) or {}
-        _input_total = int(_usage.get("input_tokens", 0) or 0)
+        _input_only = int(_usage.get("input_tokens", 0) or 0)
         _cache_creation, _cache_read = _extract_cache_fields(_usage)
-        # NEW tokens (uncached + writes) — what the chip label
-        # shows AND what the auto-compact trigger uses. If the
-        # provider surfaces cache fields, subtract them from the
-        # total; otherwise input_tokens is already the new number
-        # (Anthropic shape).
-        if _cache_read > 0 or _cache_creation > 0:
-            _input_new = max(0, _input_total - _cache_read - _cache_creation)
-        else:
-            _input_new = _input_total
-        if _input_new > 0:
+        # Total prompt = input + cache_read + cache_creation.
+        # If cache fields are present, we ADD them; if not, the
+        # provider is reporting the total in `input_tokens` and
+        # there's nothing to add.
+        _input_total = _input_only + _cache_read + _cache_creation
+        if _input_total > 0:
             get_reporter().context_update(
-                used_tokens=_input_new,
+                used_tokens=_input_total,
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
                 compacting=False,
                 threshold=int(_auto_compact_threshold()),
-                # Pass the total + cache fields so the chip tooltip
-                # can show "X new, Y cached" — the user wants to
-                # see the breakdown, just not have the chip LABEL
-                # # be the cache-inflated total.
                 cache_read=_cache_read,
                 cache_creation=_cache_creation,
                 input_total=_input_total,
             )
-            # Auto-compact trigger uses the same NEW number.
+            # Auto-compact trigger uses the same total number.
             # When the chip goes red (>=100% of threshold),
             # auto-compact fires on the next turn.
-            record_llm_input_tokens(_input_new)
+            record_llm_input_tokens(_input_total)
     except Exception:
         pass
 
