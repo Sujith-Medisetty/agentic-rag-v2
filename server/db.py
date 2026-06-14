@@ -993,7 +993,7 @@ def list_ojas_services() -> list[dict]:
         rows = cx.execute(
             "SELECT id, source, pid, label, command, port, bind_addr, url, "
             "       started_at, meta_json "
-            "FROM ojas_services ORDER BY source ASC, port ASC NULLS LAST, label ASC"
+            "FROM ojas_services ORDER BY source ASC, port IS NULL, port ASC, label ASC"
         ).fetchall()
     out: list[dict] = []
     for r in rows:

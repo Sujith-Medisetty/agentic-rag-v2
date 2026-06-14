@@ -139,9 +139,14 @@ DESTRUCTIVE_PATTERNS = [
 
 ALWAYS_DESTRUCTIVE_COMMANDS = {"shred", "wipefs"}
 
+# System paths the agent must NEVER target with a write command. Note we
+# intentionally exclude `/opt/` because Ojas itself lives at `/opt/ojas/`
+# and the deploy pipeline writes there. Subpaths under /opt (like
+# /opt/ojas-apps/) are still inside the deploy scope, so blanket-blocking
+# /opt/ would false-positive on every `cd /opt/ojas/...`.
 SYSTEM_PATHS = {
-    "/etc/", "/usr/", "/var/", "/boot/",
-    "/sys/", "/proc/", "/dev/", "/sbin/", "/lib/", "/opt/",
+    "/etc/", "/usr/", "/boot/",
+    "/sys/", "/proc/", "/dev/", "/sbin/", "/lib/",
 }
 
 # ---------------------------------------------------------------------------
@@ -219,11 +224,33 @@ def validate_mode(command: str, mode: PermissionMode) -> ValidationResult:
     return ValidationResult.allow()
 
 def _command_targets_outside_workspace(command: str) -> bool:
+    """True if the command appears to write to a system path that's outside
+    the workspace. We anchor the match to a path boundary (slash, space, or
+    end of string) so a substring like `var` inside `/tmp/myvar/` doesn't
+    trip the `/var/` check."""
     first = _extract_first_command(command)
     is_write = first in WRITE_COMMANDS or first in STATE_MODIFYING_COMMANDS
     if not is_write:
         return False
-    return any(sys_path in command for sys_path in SYSTEM_PATHS)
+    return any(
+        (sys_path in command)
+        and _path_at_boundary(command, sys_path)
+        for sys_path in SYSTEM_PATHS
+    )
+
+
+def _path_at_boundary(command: str, sys_path: str) -> bool:
+    """True if `sys_path` appears in `command` preceded by a non-alphanumeric
+    character (or at the start), so `/var/` inside `/tmp/myvar/x` doesn't
+    count as a system-path hit."""
+    idx = 0
+    while True:
+        i = command.find(sys_path, idx)
+        if i < 0:
+            return False
+        if i == 0 or not command[i - 1].isalnum():
+            return True
+        idx = i + 1
 
 # ---------------------------------------------------------------------------
 # 3. Sed validation

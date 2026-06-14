@@ -86,7 +86,7 @@ export default function ChatPage() {
   // routes still expose both via useParams as a fallback.
   const params = useParams<{ projectId?: string; sessionId?: string }>();
   const sessionId = params.sessionId;
-  const ctx = useOutletContext<{ project?: ProjectType; sidebarOpen?: boolean } | null>();
+  const ctx = useOutletContext<{ project?: ProjectType; sidebarOpen?: boolean; isAdmin?: boolean } | null>();
   const projectId = params.projectId ?? ctx?.project?.id ?? "";
   // The Workspace sidebar puts a hamburger icon at the top-left when it's
   // collapsed. The chat header needs to reserve space for it whenever the
@@ -94,6 +94,10 @@ export default function ChatPage() {
   // icon). Default to "reserve space" if context isn't available (legacy
   // standalone routes use this path).
   const needsHamburgerSpace = ctx ? !ctx.sidebarOpen : true;
+  // Admin-only debug + LLM-trace surfaces. The corresponding /api endpoints
+  // ALSO enforce admin role on the server, so hiding the buttons here is
+  // purely a UX guard (the network call would 403 anyway for non-admins).
+  const isAdmin = ctx?.isAdmin ?? false;
   // Shared session store — lets the WS handler update the sidebar's
   // session name (and any other consumers) via a normal React state
   // write. No custom events, no polling.
@@ -1205,13 +1209,17 @@ export default function ChatPage() {
     const t = input;
     if (!t.startsWith("/")) return [];
     const lower = t.toLowerCase();
-    const prefixMatches = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(lower));
+    // Filter out admin-only commands for non-admins (currently: /debug).
+    const visible = isAdmin
+      ? SLASH_COMMANDS
+      : SLASH_COMMANDS.filter((c) => c.cmd !== "/debug");
+    const prefixMatches = visible.filter((c) => c.cmd.startsWith(lower));
     return prefixMatches.length
       ? prefixMatches
       // Fallback: substring match in case the user types "/sto" and "/stop"
       // is the only sensible completion (here it's equivalent to prefix, but
       // future commands like "/run-tests" benefit from this).
-      : SLASH_COMMANDS.filter((c) => c.cmd.includes(lower.slice(1)));
+      : visible.filter((c) => c.cmd.includes(lower.slice(1)));
   })();
   const showSlashPicker = input.startsWith("/") && slashMatches.length > 0;
   const [slashIdx, setSlashIdx] = useState(0);
@@ -1280,6 +1288,7 @@ export default function ChatPage() {
         return true;
       }
       case "debug":
+        if (!isAdmin) return false;
         toggleDebug();
         return true;
       default:
@@ -1537,32 +1546,36 @@ export default function ChatPage() {
           >
             {themeEffective === "dark" ? <SunIcon className="h-4 w-4" /> : <MoonIcon className="h-4 w-4" />}
           </button>
-          <button
-            type="button"
-            onClick={toggleDebug}
-            title={debugOpen ? "Close debug stream" : "Open debug stream"}
-            aria-label="Toggle debug stream"
-            className={`shrink-0 ${debugOpen ? "pill-accent" : ""} btn-icon sm:hidden`}
-          >
-            ⌘
-          </button>
-          <button
-            type="button"
-            onClick={toggleDebug}
-            title="Toggle raw WebSocket event stream"
-            className={`pill min-h-touch hidden sm:inline-flex ${debugOpen ? "pill-accent" : ""}`}
-          >
-            ⌘ debug
-          </button>
-          <button
-            type="button"
-            onClick={() => setLlmTraceOpen((v) => !v)}
-            title="Inspect every LLM call — request, response, token usage"
-            aria-label="Toggle LLM trace"
-            className={`pill min-h-touch ${llmTraceOpen ? "pill-accent" : ""}`}
-          >
-            ⌥ llm
-          </button>
+          {isAdmin && (
+            <>
+              <button
+                type="button"
+                onClick={toggleDebug}
+                title={debugOpen ? "Close debug stream" : "Open debug stream"}
+                aria-label="Toggle debug stream"
+                className={`shrink-0 ${debugOpen ? "pill-accent" : ""} btn-icon sm:hidden`}
+              >
+                ⌘
+              </button>
+              <button
+                type="button"
+                onClick={toggleDebug}
+                title="Toggle raw WebSocket event stream"
+                className={`pill min-h-touch hidden sm:inline-flex ${debugOpen ? "pill-accent" : ""}`}
+              >
+                ⌘ debug
+              </button>
+              <button
+                type="button"
+                onClick={() => setLlmTraceOpen((v) => !v)}
+                title="Inspect every LLM call — request, response, token usage"
+                aria-label="Toggle LLM trace"
+                className={`pill min-h-touch ${llmTraceOpen ? "pill-accent" : ""}`}
+              >
+                ⌥ llm
+              </button>
+            </>
+          )}
         </div>
       </header>
 
@@ -1623,7 +1636,7 @@ export default function ChatPage() {
           delivery: if events appear here in real time but the transcript
           doesn't reflect them, it's a render bug; if they only appear after
           the turn ends, it's a backend buffering bug. */}
-      {debugOpen && (
+      {isAdmin && debugOpen && (
         <DebugStream
           events={debugEvents}
           onClear={() => setDebugEvents([])}
@@ -1631,8 +1644,10 @@ export default function ChatPage() {
         />
       )}
 
-      {/* Wire-level LLM call trace panel (⌥ llm). */}
-      {llmTraceOpen && sessionId && (
+      {/* Wire-level LLM call trace panel (⌥ llm). Admin-only — these
+          payloads include the full system prompt, tool defs, and every
+          message in the conversation, so non-admins must not see them. */}
+      {isAdmin && llmTraceOpen && sessionId && (
         <LLMTracePanel
           sessionId={sessionId}
           onClose={() => setLlmTraceOpen(false)}
@@ -1907,7 +1922,12 @@ export default function ChatPage() {
       </form>
 
       {/* Help overlay — opened by /help, the link in the input hints, or ? */}
-      {helpOpen && <HelpOverlay onClose={() => setHelpOpen(false)} />}
+      {helpOpen && (
+        <HelpOverlay
+          isAdmin={isAdmin}
+          onClose={() => setHelpOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -2690,7 +2710,7 @@ const SHORTCUTS: { keys: string; desc: string }[] = [
   { keys: "Double-click on a tool result", desc: "Expand / collapse the full preview" },
 ];
 
-function HelpOverlay({ onClose }: { onClose: () => void }) {
+function HelpOverlay({ isAdmin, onClose }: { isAdmin: boolean; onClose: () => void }) {
   return (
     <div
       className="fixed inset-0 z-30 flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
@@ -2715,7 +2735,7 @@ function HelpOverlay({ onClose }: { onClose: () => void }) {
             Slash commands
           </div>
           <div className="divide-y divide-border/60 rounded-lg border border-border/60 bg-elevated/40">
-            {SLASH_COMMANDS.map((c) => (
+            {(isAdmin ? SLASH_COMMANDS : SLASH_COMMANDS.filter((c) => c.cmd !== "/debug")).map((c) => (
               <div key={c.cmd} className="flex items-baseline gap-3 px-3 py-2 text-sm">
                 <kbd className="shrink-0 rounded border border-border bg-bg/60 px-1.5 py-0.5 font-mono text-tx-xs text-accent">
                   {c.cmd}

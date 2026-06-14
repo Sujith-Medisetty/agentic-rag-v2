@@ -1505,7 +1505,7 @@ def sessions_get(session_id: str, user: dict = Depends(require_user)):
 
 
 @app.get("/api/sessions/{session_id}/llm-trace")
-def sessions_llm_trace(session_id: str, user: dict = Depends(require_user)):
+def sessions_llm_trace(session_id: str, user: dict = Depends(require_root)):
     """Return the recent LLM call trace for this session. Each entry
     is one wire-level request/response pair: full prompt, full
     response, usage_metadata, duration, model name. Capped at the
@@ -1513,6 +1513,11 @@ def sessions_llm_trace(session_id: str, user: dict = Depends(require_user)):
     The trace is process-local; it does not survive a backend restart.
     The full message history is still in the LangGraph checkpointer —
     this is the wire-level audit log only.
+
+    Admin-only: the trace exposes the full system prompt, tool defs, and
+    every message in the conversation. The frontend already hides the
+    ⌥ llm button for non-admins, but the server enforces it too so a
+    crafted client can't bypass the UI.
     """
     session = _session_or_404(session_id, user)
     from memory.llm_trace import get_store
@@ -1526,9 +1531,9 @@ def sessions_llm_trace(session_id: str, user: dict = Depends(require_user)):
 
 
 @app.delete("/api/sessions/{session_id}/llm-trace")
-def sessions_llm_trace_clear(session_id: str, user: dict = Depends(require_user)):
+def sessions_llm_trace_clear(session_id: str, user: dict = Depends(require_root)):
     """Clear the LLM call trace buffer for this session. Useful for
-    'start clean' before a fresh debugging run."""
+    'start clean' before a fresh debugging run. Admin-only."""
     session = _session_or_404(session_id, user)
     from memory.llm_trace import get_store
     get_store().clear(session_id)

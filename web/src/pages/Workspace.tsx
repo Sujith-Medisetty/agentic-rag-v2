@@ -454,7 +454,7 @@ export default function Workspace() {
             CTA, or a loading state while the default project resolves. */}
         {project ? (
           activeSessionId ? (
-            <Outlet context={{ project, sidebarOpen }} />
+            <Outlet context={{ project, sidebarOpen, isAdmin: me?.role === "root" }} />
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center px-6 py-10 text-center">
               <div
