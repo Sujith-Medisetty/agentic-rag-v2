@@ -454,6 +454,23 @@ def get_ojas_app_rules_section() -> str:
         "Same rule for the static template's `<SectionsExample />` / "
         "`<ProductExample />` — those are placeholders, not your UI.",
         "",
+        "CRITICAL — the page chrome (app title, `<ThemeToggle />`, "
+        "`<InstallButton />`, the `<header>` bar) belongs to `App.tsx` "
+        "and ONLY to `App.tsx`. Your feature component (Calculator, "
+        "Calendar, Todo, etc.) is rendered INSIDE the App.tsx `<main>`. "
+        "It must NOT render its own `<header>`, must NOT import or "
+        "render `<ThemeToggle />` or `<InstallButton />` — those are "
+        "already in the page chrome above. If you put them in your "
+        "feature component too, the user sees them TWICE (the "
+        "calculator session on 2026-06-14 shipped with two ThemeToggle "
+        "buttons and two InstallButtons stacked, because the agent "
+        "duplicated the chrome in both App.tsx and calculator.tsx). The "
+        "feature component is for the feature ONLY — the keypad, the "
+        "calendar grid, the todo list, the form. Not the page title, "
+        "not the install prompt, not the theme switch. If your feature "
+        "needs a sub-header (e.g. a section title inside the calendar), "
+        "use a `<h2>` or `<h3>` — not a full `<header>` element.",
+        "",
         "## 4. Storage rule — localStorage is for tiny UI prefs only",
         "",
         "When you DO build a static app, do NOT default to localStorage "
