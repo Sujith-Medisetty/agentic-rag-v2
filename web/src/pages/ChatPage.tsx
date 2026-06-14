@@ -1222,8 +1222,16 @@ export default function ChatPage() {
         sessionId={sessionId ?? ""}
         sessionName={turns[0]?.userPrompt ?? "app"}
         apps={deployedApps}
-        freshBuild={!!lastDetected?.fresh_build}
-        freshMtime={lastDetected?.fresh_mtime ?? 0}
+        // "+ Deploy new" is enabled only when there's an unbuilt
+        // sub-app with a build (not a rebuild of an already-deployed
+        // one — those go through the pill's "🔄 Update" instead).
+        hasUnbuiltBuild={!!lastDetected?.has_unbuilt_build}
+        // Per-pill fresh-build lookup: each pill finds its own
+        // candidate by deployed_slug and uses THAT candidate's
+        // is_fresh (mtime > last_redeploy_at) — not the session-
+        // wide freshest mtime — so only the genuinely rebuilt pill
+        // shows Update in a multi-app session.
+        lastDetected={lastDetected}
         // Per-slug live deploy progress (set by deploy_progress WS
         // event). Pills use this to render a "Step 3/12 — Building…"
         // chip so the user sees the 10-30s fullstack deploy making
@@ -1303,22 +1311,6 @@ export default function ChatPage() {
           )}
           {turns.length === 0 && !currentTurn && !loadErr && (
             <EmptyState />
-          )}
-          {/* Build-ready banner — appears below the last finished turn
-              when a fresh build is detected (newer than the latest
-              deploy from this session, or no deploys yet). The user
-              clicks Deploy to open the same dialog as the strip's
-              button. The strip's "show modal" state is what we
-              trigger — keep them in sync. */}
-          {sessionId && lastDetected?.fresh_build && !currentTurn && (
-            <BuildReadyBanner
-              onDeploy={() => setShowDeployModal(true)}
-              mtime={lastDetected.fresh_mtime}
-              // Match the nav-strip pill: if the user already has a
-              // deployed app from this session, the banner says
-              // "Update"; otherwise "Deploy".
-              hasDeployedApp={deployedApps.length > 0}
-            />
           )}
         </div>
         </div>
@@ -2397,17 +2389,19 @@ function DebugStream({
 
 
 // ============================================================================
-// BuildReadyBanner — small CTA that sits directly under the agent's last
-// finished turn when a fresh build is detected. The user reads the
-// agent's "Build complete." line, sees this right below it, and clicks
-// the button to open the same deploy modal as the strip.
-//
-// The banner is shown for builds that are NEWER than the most recent
-// deploy FROM this session (mtime > last_redeploy_at) — see
-// `fresh_build` in the /detected-dist response. After a successful
-// deploy the banner goes away on its own (we re-fetch detected-dist).
+// DeployStrip — sticky horizontal strip between the plan panel and the chat
+// scroll area. Shows every app deployed FROM this session as a state-aware
+// pill (slug + public URL + 🔄 Update when a fresh build is detected, ✓ Up
+// to date when not). A single "+ Deploy new" button on the right opens the
+// modal for a *new* app (first-time deploy or a sibling project in a
+// multi-app session) — it is only enabled when the agent has produced a
+// build since the last re-deploy of the default project, so the user never
+// sees a "Deploy" button that would fail with "no dist/ found".
 // ============================================================================
 
+// "3m ago" / "2h ago" — short relative-time formatter for the
+// per-pill "last deployed" badge. Lives at module scope so the
+// pill doesn't re-allocate it on every render.
 function timeAgoShort(epochSeconds: number): string {
   if (!epochSeconds) return "";
   const sec = Math.max(1, Math.floor(Date.now() / 1000 - epochSeconds));
@@ -2419,68 +2413,29 @@ function timeAgoShort(epochSeconds: number): string {
   return `${Math.floor(hr / 24)}d ago`;
 }
 
-function BuildReadyBanner({
-  onDeploy, mtime, hasDeployedApp,
-}: {
-  onDeploy: () => void;
-  mtime: number;
-  hasDeployedApp: boolean;
-}) {
-  // Match the nav-strip pill's label: "Deploy" on the first deploy for
-  // this session, "Update" when there's already a deployed app and the
-  // user just rebuilt. The banner only renders when fresh_build is true
-  // (newer than the last deploy), so Update is always the right call
-  // when an app exists.
-  const cta = hasDeployedApp ? "Update" : "Deploy";
-  return (
-    <div
-      data-testid="build-ready-banner"
-      className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-accent/40 bg-accent/10 px-4 py-3"
-    >
-      <div className="flex items-center gap-2 text-tx-sm font-medium text-accent">
-        <span aria-hidden>✓</span>
-        Build complete
-        {mtime > 0 && (
-          <span className="font-normal text-tx-xs text-muted">
-            · built {timeAgoShort(mtime)}
-          </span>
-        )}
-      </div>
-      <button
-        type="button"
-        onClick={onDeploy}
-        className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/20 px-3 py-1.5 text-tx-sm font-medium text-accent hover:bg-accent/30"
-      >
-        <UploadIcon /> {cta}
-      </button>
-    </div>
-  );
-}
-
-
-// ============================================================================
-// DeployStrip — sticky horizontal strip between the plan panel and the chat
-// scroll area. Shows every app deployed FROM this session as a state-aware
-// pill (slug + public URL + 🔄 Update when a fresh build is detected, ✓ Up
-// to date when not). A single "+ Deploy new" button on the right opens the
-// modal for a *new* app (first-time deploy or a sibling project in a
-// multi-app session) — it is only enabled when the agent has produced a
-// build since the last re-deploy of the default project, so the user never
-// sees a "Deploy" button that would fail with "no dist/ found".
 // ============================================================================
 
 function DeployStrip({
-  sessionId, sessionName, apps, freshBuild, freshMtime, deployProgress, onUpdateClicked,
+  sessionId, sessionName, apps, hasUnbuiltBuild, lastDetected, deployProgress, onUpdateClicked,
   onDeployed, onDeleted, onToggled,
   showModal: showModalProp, onShowModalChange,
 }: {
   sessionId: string;
   sessionName: string;
   apps: DeployedApp[];
-  // Session-wide "any build newer than any deploy" flag. Used by the
-  // strip's "+ Deploy new" button. For the per-pill "🔄 Update"
-  // button, see `freshMtime` below.
-  freshBuild: boolean;
+  // True when at least one detected candidate is BUILT (mtime > 0)
+  // AND NOT YET DEPLOYED. Drives the "+ Deploy new" button — that
+  // button is the only deploy-new affordance, and it's only
+  // meaningful when there's something genuinely new to publish.
+  // When all sub-apps are already deployed, the user is steered to
+  // the per-pill "🔄 Update" buttons instead.
+  hasUnbuiltBuild: boolean;
+  // Full detected-dist payload — pills look themselves up in
+  // lastDetected.candidates by deployed_slug to get THIS app's
+  // is_fresh (mtime > last_redeploy_at for THIS app's dist), not
+  // the global session-freshest mtime. Lets a 3-app session where
+  // only one was rebuilt show "🔄 Update" on just that one pill.
+  lastDetected: DetectedDist | null;
   // Per-slug live progress. Empty when nothing is deploying. Pills
   // look themselves up by slug.
   deployProgress: Record<string, { phase: string; steps_done: number; steps_total: number }>;
@@ -2491,14 +2446,6 @@ function DeployStrip({
   onDeployed: (app: DeployedApp) => void;
   onDeleted: (slug: string) => void;
   onToggled: (slug: string, state: string) => void;
-  // mtime (epoch seconds) of the freshest dist in this session, or
-  // 0 if none. Pills use this to compute per-app staleness
-  // (freshMtime > this_app.last_redeploy_at) so only the genuinely
-  // stale pills show "🔄 Update". The session-wide `freshBuild` flag
-  // is still used for the strip's "+ Deploy new" button — that one
-  // asks "is there *anything* to publish?", which is the right
-  // question for an additive publish, not a per-app refresh.
-  freshMtime: number;
   // The build-ready banner also opens this dialog. State is hoisted
   // to ChatPage so the banner and the strip share one source of
   // truth. If the prop is omitted (e.g. in tests), we fall back to
@@ -2519,7 +2466,7 @@ function DeployStrip({
         <div className="mx-auto flex max-w-4xl flex-wrap items-center gap-2 px-4 py-2">
           {apps.length === 0 ? (
             <span className="flex-1 text-tx-xs text-muted">
-              {freshBuild
+              {hasUnbuiltBuild
                 ? "Build ready — click “Deploy new” to publish."
                 : "Build the app first (`npm run build`), then come back and click “Deploy new”."}
             </span>
@@ -2528,8 +2475,7 @@ function DeployStrip({
               <DeployedAppPill
                 key={a.slug}
                 app={a}
-                freshBuild={freshBuild}
-                freshMtime={freshMtime}
+                lastDetected={lastDetected}
                 // Pass the live progress slice for this slug (if
                 // any). Pills fall back to local `busy` state when
                 // the progress event hasn't arrived yet.
@@ -2543,16 +2489,18 @@ function DeployStrip({
           )}
           {/* "+ Deploy new" — for a *new* sub-app from this session
               (first-time deploy, or a sibling project in a multi-app
-              session). Always present so the user can start a fresh
-              deploy at any time, but disabled until a build exists --
-              otherwise the modal would 500 with "no dist/ found". */}
+              session). Disabled when every detected sub-app is
+              already deployed — in that case the user wants
+              "🔄 Update" on a pill, not a brand-new slug. */}
           <button
             type="button"
             onClick={() => setShowModal(true)}
-            disabled={!sessionId || !freshBuild}
+            disabled={!sessionId || !hasUnbuiltBuild}
             title={
-              !freshBuild
-                ? "Build the app first (`npm run build`) to enable"
+              !hasUnbuiltBuild
+                ? apps.length === 0
+                  ? "Build the app first (`npm run build`) to enable"
+                  : "All built sub-apps are already deployed — use a pill's 🔄 Update instead"
                 : "Publish a new sub-app from this session"
             }
             className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/15 px-3 py-1.5 text-tx-sm font-medium text-accent hover:bg-accent/25 disabled:cursor-not-allowed disabled:opacity-40"
@@ -2585,20 +2533,19 @@ function hostApps(): string {
 }
 
 function DeployedAppPill({
-  app, freshBuild, freshMtime, progress, onUpdateClicked,
+  app, lastDetected, progress, onUpdateClicked,
   onDeployed, onDeleted, onToggled,
 }: {
   app: DeployedApp;
-  // Session-wide "any dist newer than any deploy" flag. Used by the
-  // strip's "+ Deploy new" button — the right question there is
-  // "is there *anything* to publish?", not "is *this* app stale?".
-  freshBuild: boolean;
-  // mtime (epoch seconds) of the freshest dist in this session, or
-  // 0 when there's no build. The pill uses this to compute
-  // `appFreshBuild` — per-app, not session-wide — so a just-deployed
-  // pill shows "✓ Up to date" even when the session still has a
-  // fresh build waiting for the other pills.
-  freshMtime: number;
+  // Per-candidate build state. We look ourselves up in
+  // lastDetected.candidates by deployed_slug and use THAT candidate's
+  // is_fresh — server-computed as `c.mtime > c.last_redeploy_at for
+  // this app`. This is the key fix: a 3-app session where only one
+  // was rebuilt now shows "🔄 Update" on JUST that one pill, not on
+  // all three (which is what the previous session-freshest mtime
+  // comparison did). A pill without a matching candidate simply
+  // shows "✓ Up to date".
+  lastDetected: DetectedDist | null;
   // Live progress for THIS slug (undefined if not currently
   // deploying). Shows up in the pill's "Step N/12 — Building…" chip
   // so the user sees the 10-30s fullstack deploy making progress
@@ -2621,15 +2568,14 @@ function DeployedAppPill({
   const [busy, setBusy] = useState(false);
   const state = app.state ?? "running";
   const isOff = state === "stopped" || state === "error";
-  // Per-app "this build is newer than my last deploy" — drives the
-  // per-pill "🔄 Update" button. The previous version used the
-  // session-wide `freshBuild` flag, which meant that after a single
-  // rebuild, EVERY pill in the strip showed "🔄 Update" — even the
-  // ones the user had just deployed. By comparing freshMtime against
-  // *this app's* last_redeploy_at, only the stale ones show Update.
-  // freshMtime === 0 means "no build yet" → no pill should claim
-  // there's something to push, regardless of last_redeploy_at.
-  const appFreshBuild = freshMtime > 0 && freshMtime > (app.last_redeploy_at ?? 0);
+  // Per-app "this build is newer than my last deploy" — server
+  // stamps this per-candidate as `c.mtime > c.last_redeploy_at`,
+  // so a rebuild of app B doesn't make app A's pill claim it's
+  // stale. Pills without a matching candidate fall back to false
+  // (e.g., when the user just deleted the dist).
+  const appFreshBuild = lastDetected?.candidates.find(
+    (c) => c.deployed_slug === app.slug,
+  )?.is_fresh ?? false;
   // Reset busy when the deploy settles. The parent clears
   // `deployProgress[slug]` for this slug in BOTH the
   // `deploy_complete` and `deploy_failed` WS handlers, so flipping
@@ -2864,7 +2810,16 @@ function DeployModal({
         const d = await sessionApi.detectedDist(sessionId);
         if (cancelled) return;
         setDetected(d);
-        if (d.auto_pick !== null) setProjectDir(d.auto_pick);
+        // Pick the freshest UNBUILT candidate as the default
+        // projectDir. The server's auto_pick is the freshest of
+        // ALL candidates (including already-deployed ones), which
+        // would point at a deployed row and fall outside the
+        // unbuilt filter — leaving the picker showing nothing.
+        // Fall back to d.auto_pick if no unbuilt candidate exists
+        // (the picker handles that case via `noUnbuilt`).
+        const unbuilt = d.candidates.filter((c) => !c.is_deployed);
+        const pick = unbuilt[0]?.project_dir ?? d.auto_pick ?? "";
+        if (pick) setProjectDir(pick);
       } catch (e: any) {
         if (cancelled) return;
         setErr(e?.message ?? "could not detect build");
@@ -2874,6 +2829,28 @@ function DeployModal({
     })();
     return () => { cancelled = true; };
   }, [sessionId]);
+
+  // Filter candidates to UNBUILT sub-apps only. The modal is only
+  // opened from "+ Deploy new" (which is disabled when every
+  // sub-app is already deployed), so an already-deployed candidate
+  // in the dropdown would 409 on submit. Drop them up front and
+  // let the rest of the modal operate on the filtered list as if
+  // it were the only set of candidates.
+  const unbuiltCandidates = useMemo(
+    () => (detected?.candidates ?? []).filter((c) => !c.is_deployed),
+    [detected],
+  );
+  // Defensive guard: the strip disables "+ Deploy new" when
+  // !has_unbuilt_build, so reaching this state from the UI is rare.
+  // But if the modal is opened some other way and ALL detected
+  // candidates are already deployed, show a clear message instead
+  // of a dead empty picker.
+  const noUnbuilt =
+    !detecting
+    && (detected?.candidates?.length ?? 0) > 0
+    && unbuiltCandidates.length === 0;
+  const multiple = unbuiltCandidates.length > 1;
+  const noBuild = !detecting && (detected?.candidates?.length ?? 0) === 0;
 
   // ---- AbortController for the GET /deploy-jobs/{id} poll. We do
   // NOT abort the POST itself on unmount — the deploy should keep
@@ -2980,9 +2957,12 @@ function DeployModal({
     }
   };
 
-  const noBuild = !detecting && detected?.status === "none";
-  const multiple = detected?.status === "multiple";
-  const readyInConfig = !detecting && !noBuild && !!slug;
+  // `noBuild`, `multiple`, `noUnbuilt` are derived up top (right
+  // after the detectedDist fetch) so the picker can filter to
+  // unbuilt-only before computing these. `noUnbuilt` means "we
+  // see builds, but they're all already deployed" — distinct from
+  // `noBuild` ("we see no builds at all").
+  const readyInConfig = !detecting && !noBuild && !noUnbuilt && !!slug;
   const isRunning = phase === "running";
   const isDone = phase === "done";
   const isFailed = phase === "failed";
@@ -3176,6 +3156,11 @@ function DeployModal({
               <span className="inline-block size-3 animate-spin rounded-full border-2 border-muted border-t-transparent" />
               Detecting build…
             </div>
+          ) : noUnbuilt ? (
+            <div className="field mt-1 flex items-center gap-2 font-mono text-tx-sm text-muted">
+              <span aria-hidden>🔒</span>
+              <span>All built sub-apps are already deployed — nothing new to publish.</span>
+            </div>
           ) : multiple ? (
             <>
               <select
@@ -3184,14 +3169,14 @@ function DeployModal({
                 className="field mt-1 font-mono"
                 data-testid="detected-subdir"
               >
-                {detected?.candidates.map((c) => (
+                {unbuiltCandidates.map((c) => (
                   <option key={c.project_dir} value={c.project_dir}>
                     {c.project_dir === "" ? "<session root>" : c.project_dir}
                   </option>
                 ))}
               </select>
               <p className="mt-1 text-tx-xs text-muted">
-                Multiple projects built in this session — pick the one to publish.
+                Multiple unbuilt sub-apps — pick the one to publish.
               </p>
             </>
           ) : (
@@ -3210,6 +3195,12 @@ function DeployModal({
           <div className="rounded border border-danger/30 bg-danger/10 px-3 py-2 text-tx-xs text-danger">
             No built <code className="font-mono">dist/</code> found in this session. Ask the agent to run{" "}
             <code className="font-mono">npm run build</code> and try again.
+          </div>
+        )}
+        {noUnbuilt && (
+          <div className="rounded border border-warn/30 bg-warn/10 px-3 py-2 text-tx-xs text-warn">
+            All built sub-apps are already deployed. To update an existing app,
+            use its <span className="font-mono">🔄 Update</span> pill in the nav strip.
           </div>
         )}
         {err && !noBuild && (

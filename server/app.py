@@ -4742,6 +4742,26 @@ class DistCandidate(BaseModel):
     abs_path: str
     mtime: int                # epoch seconds; useful for "built 3m ago"
     index_size: int           # bytes in dist/index.html
+    # True when a deployed_apps row already exists for THIS sub-app
+    # (matched by source_session_id + project_dir). Drives the
+    # "+ Deploy new" enabled state: a candidate is deployable-new only
+    # when !is_deployed. Lets the modal drop the already-deployed
+    # candidates from its dropdown so the user is never asked to
+    # "deploy" something that's already live (which would 409).
+    is_deployed: bool = False
+    # The slug this sub-app is currently published under, if any. None
+    # for unbuilt sub-apps. Lets the per-pill "🔄 Update" state do an
+    # O(1) candidates-by-slug lookup instead of comparing mtime against
+    # the global freshest — important for multi-app sessions where
+    # only one of N deployed apps has been rebuilt.
+    deployed_slug: str | None = None
+    # True when this candidate's mtime is newer than the matching
+    # deployed app's last_redeploy_at. Drives the per-pill "🔄 Update"
+    # badge: only the genuinely stale pills show Update, even when the
+    # session as a whole has a fresh build waiting for a different
+    # sub-app. False for unbuilt candidates (no last_redeploy_at to
+    # compare against; they're a separate deploy-new flow).
+    is_fresh: bool = False
 
 class DetectedDistResponse(BaseModel):
     candidates: list[DistCandidate]
@@ -4762,6 +4782,14 @@ class DetectedDistResponse(BaseModel):
     # seconds as DistCandidate.mtime. Lets the UI show "built 3m ago"
     # without an extra round-trip.
     fresh_mtime: int = 0
+    # True when at least one candidate is BUILT (mtime > 0) AND
+    # NOT YET DEPLOYED. Drives the "+ Deploy new" button enabled state
+    # in the nav strip. Distinguishes "any fresh build" (fresh_build)
+    # from "an unbuilt sub-app is ready to publish" — the latter is
+    # the only case where "Deploy new" makes sense. When false, the
+    # user is steered toward the per-pill "🔄 Update" for any rebuild
+    # work instead.
+    has_unbuilt_build: bool = False
 
 @app.get(
     "/api/sessions/{session_id}/detected-dist",
@@ -4774,45 +4802,85 @@ def sessions_detected_dist(
     """Scan the session workspace for built `dist/` folders. Used by the
     deploy dialog to pre-fill the Project field, and by the chat
     banner to detect "fresh build" (newer than the latest deploy
-    from this session)."""
+    from this session).
+
+    Per-candidate enrichment: for each detected dist we look up the
+    matching deployed_apps row (by source_session_id + project_dir) and
+    stamp is_deployed / deployed_slug / is_fresh. This is what lets the
+    UI split the deploy surface into two clean intents:
+      - "+ Deploy new" button → enabled only when SOME candidate has a
+        build and is NOT yet deployed (has_unbuilt_build).
+      - Per-pill "🔄 Update" badge → driven by THIS pill's candidate's
+        is_fresh, not the global session-freshest mtime. So in a
+        3-app session where only one was rebuilt, only that one pill
+        shows Update; the others stay "✓ Up to date".
+    """
     _session_or_404(session_id, user)
-    cands = _detect_dist_candidates(session_id)
-    # Compare against the most recent deploy FROM THIS SESSION. A
-    # build is "fresh" if its mtime is newer than the latest
-    # last_redeploy_at for any of this session's apps — or if
-    # there are no deploys yet.
+    raw_cands = _detect_dist_candidates(session_id)
+    # Enrich each candidate with its matching deployed_apps row.
+    # get_deployed_app_for_subapp is NULL-safe on project_dir ("" /
+    # None both match the session-root row).
+    enriched: list[DistCandidate] = []
     last_redeploy = 0
-    try:
-        for row in db.list_deployed_apps_for_session(session_id):
-            ts = int(row.get("last_redeploy_at") or 0)
+    for c in raw_cands:
+        deployed_row = None
+        try:
+            deployed_row = db.get_deployed_app_for_subapp(
+                session_id,
+                c["project_dir"] if c["project_dir"] else None,
+            )
+        except Exception:
+            # DB hiccup → treat as unbuilt rather than crash the
+            # whole endpoint. The "Deploy new" button will then show
+            # as enabled, which is the safer default.
+            deployed_row = None
+        is_deployed = deployed_row is not None
+        deployed_slug = deployed_row["slug"] if deployed_row else None
+        if is_deployed:
+            ts = int(deployed_row.get("last_redeploy_at") or 0)
             if ts > last_redeploy:
                 last_redeploy = ts
-    except Exception:
-        # If the helper isn't available, default to "fresh" so we
-        # never hide a build that's actually there.
-        last_redeploy = 0
+        is_fresh = (
+            is_deployed
+            and c["mtime"] > 0
+            and c["mtime"] > int(deployed_row.get("last_redeploy_at") or 0)
+        )
+        enriched.append(DistCandidate(
+            project_dir=c["project_dir"],
+            abs_path=c["abs_path"],
+            mtime=c["mtime"],
+            index_size=c["index_size"],
+            is_deployed=is_deployed,
+            deployed_slug=deployed_slug,
+            is_fresh=is_fresh,
+        ))
+
     fresh_build = False
     fresh_mtime = 0
-    if cands:
-        fresh_mtime = max(c["mtime"] for c in cands)
+    if enriched:
+        fresh_mtime = max(c.mtime for c in enriched)
         fresh_build = fresh_mtime > last_redeploy
-    if len(cands) == 0:
+    has_unbuilt_build = any(
+        c.mtime > 0 and not c.is_deployed for c in enriched
+    )
+
+    if not enriched:
         return DetectedDistResponse(
             candidates=[], status="none", auto_pick=None,
-            fresh_build=False, fresh_mtime=0,
+            fresh_build=False, fresh_mtime=0, has_unbuilt_build=False,
         )
-    if len(cands) == 1:
+    if len(enriched) == 1:
         return DetectedDistResponse(
-            candidates=[DistCandidate(**c) for c in cands],
-            status="single",
-            auto_pick=cands[0]["project_dir"],
+            candidates=enriched, status="single",
+            auto_pick=enriched[0].project_dir,
             fresh_build=fresh_build, fresh_mtime=fresh_mtime,
+            has_unbuilt_build=has_unbuilt_build,
         )
     return DetectedDistResponse(
-        candidates=[DistCandidate(**c) for c in cands],
-        status="multiple",
-        auto_pick=cands[0]["project_dir"],  # newest as best guess
+        candidates=enriched, status="multiple",
+        auto_pick=enriched[0].project_dir,  # newest as best guess
         fresh_build=fresh_build, fresh_mtime=fresh_mtime,
+        has_unbuilt_build=has_unbuilt_build,
     )
 
 @app.delete("/api/deployed-apps/{slug}")

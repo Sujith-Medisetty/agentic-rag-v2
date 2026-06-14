@@ -248,6 +248,26 @@ export interface DistCandidate {
   abs_path: string;
   mtime: number;          // epoch seconds — used for "built 3m ago"
   index_size: number;     // bytes in dist/index.html
+  // True when a deployed_apps row already exists for THIS sub-app
+  // (matched by source_session_id + project_dir). Drives the
+  // "+ Deploy new" enabled state: only candidates where !is_deployed
+  // count as "needs deploying". The modal also filters these out of
+  // its dropdown so the user is never asked to redeploy something
+  // that's already live (which would 409).
+  is_deployed: boolean;
+  // The slug this sub-app is currently published under (null when
+  // is_deployed is false). Lets the per-pill "🔄 Update" badge do an
+  // O(1) candidates.find(c => c.deployed_slug === app.slug) lookup
+  // and use THIS app's is_fresh — not the global session-freshest
+  // mtime — so in a multi-app session, only the genuinely rebuilt
+  // pill shows Update.
+  deployed_slug: string | null;
+  // True when this candidate's mtime is newer than its matching
+  // deployed app's last_redeploy_at. Drives the per-pill "🔄 Update"
+  // badge. False for unbuilt candidates (no last_redeploy_at to
+  // compare against; their deploy path goes through "+ Deploy new"
+  // instead, not the pill).
+  is_fresh: boolean;
 }
 export interface DetectedDist {
   candidates: DistCandidate[];
@@ -262,6 +282,12 @@ export interface DetectedDist {
   // mtime (epoch seconds) of the freshest candidate, or 0 if none.
   // Lets the UI show "built 3m ago" without re-fetching candidates.
   fresh_mtime: number;
+  // True when at least one candidate is BUILT (mtime > 0) AND
+  // NOT YET DEPLOYED. Drives the "+ Deploy new" button enabled
+  // state in the nav strip. Distinct from fresh_build: that one
+  // also flips true when an already-deployed app was rebuilt (which
+  // is the "🔄 Update" pill's job, not "+ Deploy new"'s).
+  has_unbuilt_build: boolean;
 }
 
 export interface DeployResult {
