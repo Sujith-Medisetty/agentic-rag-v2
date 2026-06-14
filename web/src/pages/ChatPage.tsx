@@ -34,7 +34,7 @@ import { useSessions } from "@/lib/sessionContext";
 import type {
   LiveEvent, TodoItem, AgentRecord, FileChange, GitInfo,
   CommitRecord, ToolEvent, TurnSummary, Turn, SessionTotals,
-  TimelineBlock,
+  TimelineBlock, ContextCompactedNote,
 } from "@/lib/types";
 
 // Chat-visible auto-compact breadcrumb. One per `context_compacted` event
@@ -42,16 +42,11 @@ import type {
 // the message list crosses the auto-compact threshold). Renders as a
 // collapsible system message in the transcript so the user can SEE that
 // older turns got summarised and what the agent now remembers about them.
-type ContextCompactedNote = {
-  id: string;
-  ts: number;
-  removed: number;
-  kept: number;
-  tokensBefore: number;
-  tokensAfter: number;
-  summaryPreview: string;
-  threshold: number;
-};
+// The `ContextCompactedNote` type used by the compact-card state and
+// the live WS handler lives in `@/lib/types` so the same shape can be
+// embedded in `Turn.compactNotes` (for chronological placement inside
+// the turn during which the compact fired). The local handler here
+// imports it under the same name.
 import PlanPanel from "@/components/PlanPanel";
 import TurnCard, { ActiveTurnCard } from "@/components/TurnCard";
 import RunningTotals from "@/components/RunningTotals";
@@ -512,10 +507,12 @@ export default function ChatPage() {
         return;
       }
       case "context_compacted": {
-        // Chat-visible breadcrumb when auto-compaction fires. Renders as
-        // a system message in the transcript so the user can SEE that older
-        // turns got summarised (and what the agent now remembers about them),
-        // rather than compaction being a silent background process.
+        // Chat-visible breadcrumb when auto-compaction fires. Renders
+        // inline in the turn during which it fired (so the user sees
+        // the 📦 card at the moment their chat got summarised, not
+        // stacked at the bottom of the transcript). We also keep a
+        // parent-level list as a fallback for the case where no
+        // turn is active (e.g. a compact that fires between turns).
         const removed = Number(p.removed ?? 0);
         if (removed <= 0) return;
         const note: ContextCompactedNote = {
@@ -528,7 +525,50 @@ export default function ChatPage() {
           summaryPreview: String(p.summary_preview ?? ""),
           threshold: Number(p.threshold ?? 0),
         };
+        let attached = false;
+        setCurrentTurn((curr) => {
+          if (!curr) return curr;
+          attached = true;
+          return { ...curr, compactNotes: [...(curr.compactNotes ?? []), note] };
+        });
+        if (!attached) {
+          // No active turn — append to the last completed turn so the
+          // card still appears at a sensible chronological point.
+          setTurns((prev) => {
+            if (prev.length === 0) return prev;
+            const last = prev[prev.length - 1];
+            return [
+              ...prev.slice(0, -1),
+              { ...last, compactNotes: [...(last.compactNotes ?? []), note] },
+            ];
+          });
+        }
+        // Keep the legacy parent-level list in sync too — it's
+        // displayed (a) as a fallback when the parent-level rerender
+        // is faster than the turn's rerender and (b) for orphan
+        // compactions that somehow don't have a turn to attach to.
         setContextCompactedNotes((prev) => [...prev, note]);
+        // Sync the chip with the post-compact reality. The next
+        // `context_update` event for the next LLM call will land
+        // shortly with the real input_tokens (which is what the
+        // server-side LLM actually saw) and overwrite this — but in
+        // the gap (often 1-3s for a busy model), showing the local
+        // post-compact estimate is the only way the chip can
+        // truthfully say "compact fired → context dropped from X
+        // to Y". tokens_after is the post-compact local estimate
+        // (same number the live chip would have shown if we'd been
+        // able to ship the post-compact prompt instantly).
+        const tokensAfter = Number(p.tokens_after ?? 0);
+        if (tokensAfter > 0) {
+          setContextUsed(tokensAfter);
+        }
+        // Visual "compacting…" pulse on the chip for ~1.2s so the
+        // user sees a visible ack of the compact — settles naturally
+        // when the next context_update lands.
+        setContextCompacting(true);
+        setTimeout(() => {
+          setContextCompacting(false);
+        }, 1200);
         return;
       }
       case "token_update": {
@@ -1303,6 +1343,39 @@ export default function ChatPage() {
             used={contextUsed}
             threshold={contextThreshold}
             compacting={contextCompacting}
+            compactCount={
+              // Total compactions this session: count what's in the
+              // completed turns + the in-flight current turn + any
+              // orphans on the parent-level fallback list. All three
+              // can overlap, so dedupe by note id before counting.
+              (() => {
+                const seen = new Set<string>();
+                const n: ContextCompactedNote[] = [];
+                for (const t of turns) n.push(...(t.compactNotes ?? []));
+                if (currentTurn) n.push(...(currentTurn.compactNotes ?? []));
+                n.push(...contextCompactedNotes);
+                for (const note of n) seen.add(note.id);
+                return seen.size;
+              })()
+            }
+            lastCompactSavedTokens={
+              // Tokens freed by the most recent compaction (just the
+              // last one's delta, not cumulative) — keeps the tooltip
+              // honest and short. Pull from whichever list has the
+              // newest note by ts.
+              (() => {
+                const all: ContextCompactedNote[] = [];
+                for (const t of turns) all.push(...(t.compactNotes ?? []));
+                if (currentTurn) all.push(...(currentTurn.compactNotes ?? []));
+                all.push(...contextCompactedNotes);
+                if (all.length === 0) return 0;
+                let newest: ContextCompactedNote | null = null;
+                for (const note of all) {
+                  if (!newest || note.ts > newest.ts) newest = note;
+                }
+                return newest ? Math.max(0, newest.tokensBefore - newest.tokensAfter) : 0;
+              })()
+            }
           />
           <button
             type="button"
@@ -1419,15 +1492,14 @@ export default function ChatPage() {
           {turns.map((t, i) => (
             <TurnCard key={t.id} turn={t} index={i} />
           ))}
-          {/* Auto-compact breadcrumbs — one per `context_compacted` event
-              the server has emitted this session. Rendered BELOW the
-              turns (and the active turn) so they appear in chronological
-              order, with the most recent compact at the bottom. Each
-              card is collapsible so the user can read the summary
-              preview or fold it away. */}
-          {contextCompactedNotes.map((n) => (
-            <ContextCompactedNoteCard key={n.id} note={n} />
-          ))}
+          {/* Auto-compact cards now render INLINE in the turn during
+              which they fired (see TurnCard + the rebuildTranscript /
+              live WS path that attach the note to the active turn).
+              The parent-level `contextCompactedNotes` list is kept
+              only as a defensive fallback for the case where the
+              event lands in a race window with no current turn —
+              it's intentionally NOT rendered here, so cards don't
+              double up. */}
           {currentTurn && (
             <ActiveTurnCard turn={currentTurn} index={turns.length} />
           )}
@@ -1614,6 +1686,7 @@ function makeTurn(userPrompt: string, ts: number): Turn {
     userPrompt, startedAt: ts,
     assistantText: "", thinkingText: "", isStreaming: true,
     tools: [], fileChanges: [], agents: {}, commits: [],
+    compactNotes: [],
     blocks: [],
     liveInputTokens: 0, liveOutputTokens: 0,
     summary: null, error: null,
@@ -1874,6 +1947,42 @@ function rebuildTranscript(events: LiveEvent[]): {
       case "todo_update":
         plan = Array.isArray(p.items) ? (p.items as TodoItem[]) : [];
         break;
+      case "context_compacted": {
+        // Attach the compact breadcrumb to the turn that was active
+        // when the compact fired. That's the turn the user is reading
+        // when the auto-compact surprise hits, so showing the card
+        // inline (rather than stacked at the bottom of the transcript)
+        // is what makes the "📦" breadcrumb feel like part of the
+        // conversation, not a footnote.
+        //
+        // If no turn is active (rare — the very first event in a
+        // session, or a stale log) we still want the card to appear
+        // SOMEWHERE, so we fall back to the last completed turn. Worst
+        // case: it shows at the bottom, but every turn in normal flow
+        // gets its own in-place card.
+        const removed = Number(p.removed ?? 0);
+        if (removed <= 0) break;
+        const note: ContextCompactedNote = {
+          id: `compact-${ev.ts}-${removed}-${Number(p.kept ?? 0)}`,
+          ts: ev.ts,
+          removed,
+          kept: Number(p.kept ?? 0),
+          tokensBefore: Number(p.tokens_before ?? 0),
+          tokensAfter:  Number(p.tokens_after  ?? 0),
+          summaryPreview: String(p.summary_preview ?? ""),
+          threshold: Number(p.threshold ?? 0),
+        };
+        if (curr) {
+          curr.compactNotes = [...(curr.compactNotes ?? []), note];
+        } else if (completed.length > 0) {
+          const last = completed[completed.length - 1];
+          completed[completed.length - 1] = {
+            ...last,
+            compactNotes: [...(last.compactNotes ?? []), note],
+          };
+        }
+        break;
+      }
     }
   }
   // If the log ended mid-turn, return the in-progress turn as `currentTurn`
@@ -1902,8 +2011,19 @@ function rebuildTranscript(events: LiveEvent[]): {
 // ============================================================================
 
 function ContextChip({
-  used, threshold, compacting,
-}: { used: number; threshold: number; compacting: boolean }) {
+  used, threshold, compacting, compactCount, lastCompactSavedTokens,
+}: {
+  used: number;
+  threshold: number;
+  compacting: boolean;
+  // How many auto-compacts have fired in this session so far. Shows
+  // up in the tooltip ("7 compactions · 0.8M tokens freed cumulative")
+  // and as a subtle "+7" badge next to the percentage so the user
+  // knows the chip is showing a *post*-compact number, not raw
+  // growth.
+  compactCount: number;
+  lastCompactSavedTokens: number;
+}) {
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
   const pctUsed = threshold > 0
@@ -1929,17 +2049,41 @@ function ContextChip({
 
   const label = compacting ? "Compacting…" : `${pctUsed}% used`;
 
+  // Tooltip: full context + compact trail. The user can hover to
+  // confirm "the chip is currently at 153% because the most recent
+  // LLM call had 76k tokens, but we compacted 7 times earlier and
+  // this is the post-compact input — without those compactions
+  // this would be 250k+".
+  const tooltipLines: string[] = [];
+  if (compacting) {
+    tooltipLines.push("Compacting context — summarising older turns to keep the session running");
+  } else {
+    tooltipLines.push(`Context: ${fmt(used)} used. Auto-compact fires at ${fmt(threshold)}.`);
+  }
+  if (compactCount > 0) {
+    tooltipLines.push(
+      `${compactCount} compaction${compactCount === 1 ? "" : "s"} this session`
+      + (lastCompactSavedTokens > 0
+        ? ` · last one freed ${fmt(lastCompactSavedTokens)} tokens`
+        : ""),
+    );
+  }
+
   return (
     <div
       className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border ${borderCls} px-2 py-0.5 font-sans backdrop-blur-sm`}
-      title={
-        compacting
-          ? "Compacting context — summarising older turns to keep the session running"
-          : `Context: ${fmt(used)} used. Auto-compact fires at ${fmt(threshold)}.`
-      }
+      title={tooltipLines.join("\n")}
     >
       <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
       <span className={`text-tx-xs font-medium ${textCls}`}>{label}</span>
+      {compactCount > 0 && !compacting && (
+        <span
+          className="text-tx-xs text-text/50"
+          title={`${compactCount} auto-compact${compactCount === 1 ? "" : "s"} fired this session`}
+        >
+          ·{compactCount}×
+        </span>
+      )}
     </div>
   );
 }

@@ -158,6 +158,23 @@ export interface ToolEvent {
   endedAt?: number;             // set when tool_done lands; used to show duration
 }
 
+// Auto-compact breadcrumb card. One per `context_compacted` event
+// the server emits. Embedded in `Turn.compactNotes` for chronological
+// placement (renders inline in the turn during which the compact
+// fired) and in the parent ChatPage's `contextCompactedNotes` state
+// for the not-yet-attached case (e.g. a compaction that fires between
+// two turns, or the live WS event before the turn has been flushed).
+export interface ContextCompactedNote {
+  id: string;
+  ts: number;
+  removed: number;
+  kept: number;
+  tokensBefore: number;
+  tokensAfter: number;
+  summaryPreview: string;
+  threshold: number;
+}
+
 // Per-turn end-of-turn metrics. Token counts are PER TURN (the frontend
 // sums across turns to display session totals).
 //
@@ -200,6 +217,13 @@ export interface Turn {
   fileChanges: FileChange[];
   agents: Record<string, AgentRecord>;
   commits: CommitRecord[];
+  // Auto-compact breadcrumb cards that fired DURING this turn. Each
+  // one corresponds to a `context_compacted` event whose timestamp
+  // falls inside this turn's `[startedAt, next_turn.startedAt)`. The
+  // TurnCard renders these inline so the user sees the compact trail
+  // at the exact point in the chat where the agent's prompt was
+  // shortened — not stacked at the bottom of the transcript.
+  compactNotes: ContextCompactedNote[];
   blocks: TimelineBlock[];    // chronological view — drives TurnCard rendering
   liveInputTokens: number;
   liveOutputTokens: number;

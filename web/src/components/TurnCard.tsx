@@ -32,6 +32,7 @@
 import { memo, useEffect, useState } from "react";
 import type {
   Turn, ToolEvent, FileChange, AgentRecord, CommitRecord, TimelineBlock, LlmCall,
+  ContextCompactedNote,
 } from "@/lib/types";
 import TurnFooter from "@/components/TurnFooter";
 import Markdown from "@/components/Markdown";
@@ -75,6 +76,15 @@ function TurnCardImpl({ turn, index }: { turn: Turn; index: number }) {
           />
         ))}
 
+        {/* Auto-compact breadcrumb cards. Rendered inline in the
+            turn during which they fired, NOT stacked at the bottom
+            of the transcript, so the user sees the 📦 card at the
+            exact moment their chat was shortened. Each card is
+            collapsible to read the summary preview or fold away. */}
+        {(turn.compactNotes ?? []).map((n) => (
+          <CompactBreadcrumbRow key={n.id} note={n} />
+        ))}
+
         {/* Empty waiting state — shown when the turn is streaming but no
             blocks have arrived yet (first 1-2 seconds, before any event). */}
         {turn.isStreaming && turn.blocks.length === 0 && !turn.error && (
@@ -115,6 +125,62 @@ export default TurnCard;
 // patch) — memo would never skip it anyway since `turn` is a new ref
 // every event, so we use a plain component to make the intent obvious.
 export const ActiveTurnCard = TurnCardImpl;
+
+// ============================================================================
+// CompactBreadcrumbRow — collapsible "📦 auto-compact" card inline in a
+// turn's timeline. Renders at the chronological point where the
+// compaction actually fired, so the user sees the breadcrumb next to
+// the agent's reasoning that triggered it (not stacked at the bottom
+// of the transcript where the user has to scroll to find it).
+// ============================================================================
+
+function CompactBreadcrumbRowImpl({ note }: { note: ContextCompactedNote }) {
+  const [open, setOpen] = useState(false);
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
+  const freed = Math.max(0, note.tokensBefore - note.tokensAfter);
+  return (
+    <div className="my-2 flex justify-start">
+      <div className="max-w-[92%] rounded-md border border-accent/30 bg-accent/[0.04] text-text">
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-tx-xs"
+          title={open ? "Hide auto-compact details" : "Show what was summarised"}
+        >
+          <span className="text-accent">📦</span>
+          <span className="font-medium text-text/90">
+            Auto-compacted context
+          </span>
+          <span className="text-text/60">
+            · summarised {note.removed} older message{note.removed === 1 ? "" : "s"} ({fmt(freed)} tokens freed)
+            · kept {note.kept} recent
+          </span>
+          <span className="ml-auto text-text/50">
+            {open ? "▾" : "▸"}
+          </span>
+        </button>
+        {open && (
+          <div className="border-t border-accent/20 px-3 py-2 text-tx-xs text-text/80">
+            <p className="mb-1.5 text-text/60">
+              Threshold: {fmt(note.threshold || 50_000)} tokens. Before: {fmt(note.tokensBefore)}. After: {fmt(note.tokensAfter)}.
+            </p>
+            {note.summaryPreview ? (
+              <pre className="whitespace-pre-wrap rounded bg-elevated/60 p-2 font-sans text-text/80">
+                {note.summaryPreview}{note.summaryPreview.length >= 280 ? "…" : ""}
+              </pre>
+            ) : (
+              <p className="text-text/50">No preview captured for this compaction.</p>
+            )}
+            <p className="mt-1.5 text-text/50">
+              The full summary is in the conversation as a hidden HumanMessage — the agent can re-read it any time.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+const CompactBreadcrumbRow = memo(CompactBreadcrumbRowImpl);
 
 // ============================================================================
 // TimelineBlockRow — dispatch on block.kind to render the right component.
