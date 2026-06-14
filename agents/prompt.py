@@ -733,6 +733,11 @@ def get_using_tools_section() -> str:
         "`bash` for shell-native operations (build, test, install, search via "
         "`grep`/`rg`/`find` with default excludes, `git` actions not covered "
         "by the `git` tool, anything else genuinely shell-shaped).",
+        " - `read_file` is for FILES only. If you pass a directory, the tool "
+        "returns a directive pointing you at `bash ls <path>` — don't keep "
+        "re-issuing the same path, the server's repetition guard will flag it. "
+        "For workspace discovery, start from the dynamic-state `cwd:` field "
+        "the prompt already gives you; don't guess absolute paths.",
         " - Reach for `WebSearch` (or `WebFetch` for a specific URL) BEFORE "
         "answering any question you can't verify from context — current "
         "time, weather, prices, \"latest\" / \"right now\" queries, a fact "

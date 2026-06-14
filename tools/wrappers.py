@@ -117,6 +117,22 @@ def _safe_tool(tool_name: str):
                 return f"BLOCKED: {perm.reason}"
             try:
                 result = fn(*args, **kwargs)
+                # Repetition guard — server-side detector for stuck loops.
+                # The agent is autonomous (no human in the loop), so we
+                # can't ask the user to break a loop. Instead, when the
+                # SAME (session, tool, args) call fires >THRESHOLD times,
+                # prepend a directive that points at the next-best
+                # action. Cheaper than letting the loop run 9+ times.
+                try:
+                    from tools.sandbox import active_session_id
+                    from tools.repetition_guard import check_and_record
+                    notice = check_and_record(
+                        active_session_id(), tool_name, inp_dict,
+                    )
+                except Exception:
+                    notice = None  # guard must never break the tool
+                if notice:
+                    result = f"{notice}\n\n{result}"
                 _hook_runner.post_tool_use(tool_name, inp_str, str(result)[:200])
                 return result
             except Exception as e:
@@ -263,7 +279,24 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
     - For large files, pass `offset` (1-indexed start line) and `limit` (max lines) to window the read.
     - Line numbers are returned in the output — use them when referencing code back to the user as `path:line`.
     - You MUST have read a file at least once this conversation before calling `edit_file` on it. Reading is also the safest way to confirm an edit landed correctly.
+    - FILES ONLY: passing a directory returns a directive pointing you at `bash ls <path>`. Don't re-issue the same path; the guard will flag it.
     """
+    # Files-only guard: if `path` is a directory, return a directive
+    # (not a thrown exception). An exception is just another tool
+    # result the model will see and possibly retry on the same path.
+    # A directive tells it the NEXT action to take — `bash ls <path>`
+    # — so the loop breaks in one step.
+    try:
+        from pathlib import Path as _P
+        p = _P(path).expanduser()
+        if p.exists() and p.is_dir():
+            return (
+                f"[error] `{path}` is a directory, not a file. "
+                f"Use `bash ls {path}` to list its contents, then "
+                f"`read_file` on a specific file inside it."
+            )
+    except OSError:
+        pass  # fall through; the real impl will raise a clearer error
     result = _read_file_impl(path, offset, limit)
     f = result.file
     header = (
