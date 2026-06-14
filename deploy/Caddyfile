@@ -30,132 +30,100 @@
 # Let's Encrypt rate limits.
 # --------------------------------------------------------------------------
 {
-	on_demand_tls {
-		ask http://127.0.0.1:8765/internal/caddy-ask
-	}
+    on_demand_tls {
+        ask http://127.0.0.1:8765/internal/caddy-ask
+    }
 }
 
 # --------------------------------------------------------------------------
 # Wildcard subdomain — each deployed app gets its own URL:
-#   https://<slug>.ojas.example.com/
+#   https://<slug>.ojas.karmacode.cloud/
 # The wildcard A record (`*.your-domain → VM IP`) at the registrar makes
 # every <something>.<root-domain> resolve here; this block serves the
 # matching files from /opt/ojas-apps/<slug>/.
 #
-# Replace `ojas.example.com` below with your root domain (the same one
+# Replace `ojas.karmacode.cloud` below with your root domain (the same one
 # you used above). install.sh handles the sed.
 # --------------------------------------------------------------------------
-*.ojas.example.com {
-	tls {
-		on_demand
-	}
-	encode gzip
-	header {
-		X-Content-Type-Options "nosniff"
-	}
-	# Strict no-cache everywhere: every response must be re-fetched from
-	# the server on every visit. The user wants zero caching — no
-	# immutable asset bundles, no SPA-shell cache, no anything. Trade-off
-	# is bandwidth: every page load re-downloads the JS bundle and the
-	# HTML shell. We accept that.
-	@any path /assets/* /sw.js
-	header @any Cache-Control "no-store, must-revalidate"
-	@any2 path_regexp ^\/$|\.html$
-	header @any2 Cache-Control "no-store, must-revalidate"
-	# Same for any other path the file_server hits (manifest, icons, etc).
-	header Cache-Control "no-store, must-revalidate"
-	# Per-host static root.
-	#
-	# Two Caddy quirks drove this dance:
-	#   (1) Caddy indexes `{labels}` TLD-FIRST — `{labels.0}` is the
-	#       right-most label (the TLD), not the subdomain. The subdomain
-	#       lives at `{labels.3}` for the 3-level-deep `ojas.<tld>` root.
-	#       (For a 2-level root like `example.com`, use `{labels.2}` —
-	#       install.sh sed adjusts this if needed.)
-	#   (2) Placeholders in Caddy's `root` directive and in `file_server`'s
-	#       `root` config are stored as LITERAL strings — file_server
-	#       does NOT REPL-expand the root at request time. So we can't
-	#       put `{labels.N}` in `root` to get a per-subdomain static dir.
-	#
-	# The workaround is to encode the slug into the REQUEST PATH (which
-	# file_server DOES resolve at request time) via `rewrite`, then
-	# serve from a static base directory. `try_files` provides the SPA
-	# fallback to /<slug>/index.html. The third fallback `/.paused/index.html`
-	# kicks in when the slug's dir has been renamed to `/opt/ojas-apps/.stopped/<slug>/`
-	# by the toggle endpoint in server/app.py (deployed_app_stop), so
-	# paused apps serve a friendly "this app is paused" page instead of 404.
-	#
-	# Fullstack apps (v1.1+) have their static files at
-	# /opt/ojas-apps/<slug>/static/ (not directly under <slug>/). The
-	# try_files chain checks both locations: <slug>/index.html (static)
-	# or <slug>/static/index.html (fullstack). One of them will hit;
-	# the other 404s silently inside `try_files`. The `/api/*` proxy
-	# is added in the per-slug fragment in routes.d/ (see below).
-	handle {
-		rewrite * /{labels.3}{uri}
-		root * /opt/ojas-apps
-		try_files {path} /{labels.3}/index.html /{labels.3}/static/index.html /.paused/index.html
-		file_server
-	}
-	# Per-slug fragments for FULLSTACK apps are imported at the SERVER
-	# level (below) so they become separate site blocks that override
-	# this wildcard. Static apps don't have a fragment, so the
-	# wildcard block above handles them.
+*.ojas.karmacode.cloud {
+    tls {
+        on_demand
+    }
+    encode gzip
+    # {labels.0} is the leftmost label (the subdomain slug).
+    root * /opt/ojas-apps/{labels.0}
+    try_files {path} /index.html
+    file_server
+    header {
+        X-Content-Type-Options "nosniff"
+    }
+    @hashed path /assets/*
+    header @hashed Cache-Control "no-store, must-revalidate"
+    @sw path /sw.js
+    header @sw Cache-Control "no-store, must-revalidate"
+    @html path_regexp ^\/$|\.html$
+    header @html Cache-Control "no-store, must-revalidate"
+    # Catch-all for everything else (manifest, icons, favicon, etc).
+    header Cache-Control "no-store, must-revalidate"
 }
 
-# Per-slug site blocks for fullstack apps. Imported at server level
-# (NOT inside the wildcard site block) so each one becomes its own
-# site block that takes precedence over `*.ojas.example.com` for
-# matching hostnames. server/app.py writes/refreshes these on every
-# fullstack deploy + toggle.
-import /etc/caddy/routes.d/*.caddy
+ojas.karmacode.cloud {
+    # The frontend's built static files. The install script copies them here.
+    root * /opt/ojas/web/dist
+    encode gzip
 
-ojas.example.com {
-	# The frontend's built static files. The install script copies them here.
-	root * /opt/ojas/web/dist
-	encode gzip
+    # API + WebSocket — proxy everything under /api/ to FastAPI. The
+    # WebSocket upgrade headers are handled automatically by Caddy's
+    # reverse_proxy directive.
+    @api path /api/* /api
+    handle @api {
+        reverse_proxy 127.0.0.1:8765
+    }
 
-	# API + WebSocket — proxy everything under /api/ to FastAPI. The
-	# WebSocket upgrade headers are handled automatically by Caddy's
-	# reverse_proxy directive.
-	@api path /api/* /api
-	handle @api {
-		reverse_proxy 127.0.0.1:8765
-	}
+    # Per-session preview serving — proxied to FastAPI.
+    handle /preview/* {
+        reverse_proxy 127.0.0.1:8765
+    }
 
-	# (Per-session /preview/* removed — superseded by the Deploy button
-	# which produces stable subdomain URLs.)
+    # Deployed apps — persistent installable PWAs at /apps/<slug>/.
+    # Proxied to FastAPI which static-serves the dist from
+    # /opt/ojas-apps/<slug>/ with SPA fallback + path-traversal defence.
+    handle /apps/* {
+        reverse_proxy 127.0.0.1:8765
+    }
 
-	# Deployed apps — persistent installable PWAs at /apps/<slug>/.
-	# Proxied to FastAPI which static-serves the dist from
-	# /opt/ojas-apps/<slug>/ with SPA fallback + path-traversal defence.
-	handle /apps/* {
-		reverse_proxy 127.0.0.1:8765
-	}
+    # SPA fallback — every non-file route returns index.html so React
+    # Router can take over client-side. file_server serves the asset if
+    # it exists; try_files falls back to index.html for routes like /s/xyz.
+    handle {
+        try_files {path} /index.html
+        file_server
+    }
 
-	# SPA fallback — every non-file route returns index.html so React
-	# Router can take over client-side. file_server serves the asset if
-	# it exists; try_files falls back to index.html for routes like /s/xyz.
-	handle {
-		try_files {path} /index.html
-		file_server
-	}
-
-	# Sensible defaults. Adjust if you want stricter CSP / etc.
-	header {
-		# HSTS — once a browser sees this, it sticks with HTTPS forever.
-		# Comment out if you're still testing on http://.
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
-		X-Content-Type-Options "nosniff"
-		Referrer-Policy "strict-origin-when-cross-origin"
-	}
-	# Strict no-cache everywhere (the FastAPI middleware also enforces
-	# this on /api/* + /apps/* — but Caddy serves the static dist
-	# directly, so we need the same policy here for /assets/*, the
-	# SPA shell, sw.js, and the manifest).
-	@cached path /assets/* /sw.js
-	header @cached Cache-Control "no-store, must-revalidate"
-	@html2 path_regexp ^\/$|\.html$
-	header @html2 Cache-Control "no-store, must-revalidate"
-	header Cache-Control "no-store, must-revalidate"
+    # Sensible defaults. Adjust if you want stricter CSP / etc.
+    header {
+        # HSTS — once a browser sees this, it sticks with HTTPS forever.
+        # Comment out if you're still testing on http://.
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    # Hashed asset bundles live under /assets/ — safe to cache forever.
+    # Scoped to /assets/* so sw.js (no hash, must be checked every visit) is
+    # NOT matched. A cached sw.js would prevent browsers detecting SW updates.
+    @hashed path /assets/*
+    header @hashed Cache-Control "no-store, must-revalidate"
+    # Service worker — must never be cached so browsers check it on every load.
+    @sw path /sw.js
+    header @sw Cache-Control "no-store, must-revalidate"
+    # API responses must never be cached — browsers (esp. Safari) will serve
+    # stale session/event data if Cache-Control is missing or permissive.
+    @api_resp path /api/*
+    header @api_resp Cache-Control "no-store, must-revalidate"
+    # HTML and the SPA root (/) — always revalidate so index.html updates
+    # propagate immediately. path_regexp matches "/" exactly and "*.html".
+    @html path_regexp ^\/$|\.html$
+    header @html Cache-Control "no-store, must-revalidate"
+    # Catch-all for everything else (manifest, icons, favicon, etc).
+    header Cache-Control "no-store, must-revalidate"
 }
