@@ -975,26 +975,15 @@ def node_agent(state: RunnerState) -> dict:
     # agent's intent stays intact. Cheap O(n) pass; no need to cache it.
     history = _truncate_live_history(history)
 
-    # Publish the current context-used % so the UI's progress bar stays
-    # accurate even on turns where no compaction happened.
-    try:
-        from agents.reporter import get_reporter
-        used = _estimate_msg_tokens(history)
-        warn_threshold = int(CONTEXT_WINDOW_TOKENS * 0.25)  # 50K of 200K
-        # Threshold (50K default) is what the chip shows "X% to compact" against.
-        # The 200K bar is only kept for the warning tier — the user-facing
-        # percent on the chip is now `used / threshold`.
-        from memory.checkpointer import _auto_compact_threshold
-        compact_threshold = int(_auto_compact_threshold())
-        get_reporter().context_update(
-            used_tokens=used,
-            budget_tokens=CONTEXT_WINDOW_TOKENS,
-            warning=used >= warn_threshold,
-            compacting=False,
-            threshold=compact_threshold,
-        )
-    except Exception:
-        pass
+    # NOTE: we no longer publish a pre-LLM `context_update` here. The
+    # local estimate (`_estimate_msg_tokens(history)`) drifts from the
+    # real `input_tokens` Anthropic reports (no system prompt in the
+    # local count, `len//4` rounding error, etc.) — publishing both
+    # made the chip bounce between two different numbers within a
+    # single turn. The post-LLM publish below (using the provider's
+    # authoritative `input_tokens` from `usage_metadata`) is the only
+    # source of truth. The chip stays at its last real value during
+    # the API call, which is fine.
 
     # Build the messages list: [static SystemMessage, dynamic SystemMessage,
     # ...history]. Two SystemMessages in a row is the cleanest way to expose
