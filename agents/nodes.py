@@ -1007,20 +1007,32 @@ def node_agent(state: RunnerState) -> dict:
     # turn. The pre-LLM estimate we sent above is local and may drift from
     # the provider's count (especially after masking/stripping the
     # post-mask message size no longer reflects the original token weight).
-    # Using the provider number makes the chip monotonic within a session:
-    # it ticks UP turn over turn, and drops only when auto-compact fires.
+    # Publish the AUTHORITATIVE context-used value from the LLM response.
+    # The total tokens the model actually saw this turn is:
+    #   input_tokens  (the new, uncached input)
+    # + cache_creation_input_tokens  (tokens just written to cache)
+    # + cache_read_input_tokens  (tokens served from cache, often the
+    #                              entire static system prompt + early
+    #                              history — a large chunk on mid-session
+    #                              turns that we'd otherwise miss)
+    # `input_tokens` alone undercounts dramatically. Use the sum so the
+    # chip matches the real context window the model processed. Result
+    # is monotonic within a session: ticks UP turn over turn, drops only
+    # when auto-compact fires.
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold
         _usage = getattr(ai, "usage_metadata", None) or {}
-        _real_input = int(_usage.get("input_tokens", 0) or 0)
-        if _real_input > 0:
+        _input = int(_usage.get("input_tokens", 0) or 0)
+        if _input > 0:
+            _cc, _cr = _extract_cache_fields(_usage)
+            _total = _input + _cc + _cr
             _compact_threshold = int(_auto_compact_threshold())
             _warn_threshold = int(CONTEXT_WINDOW_TOKENS * 0.25)  # 50K of 200K
             get_reporter().context_update(
-                used_tokens=_real_input,
+                used_tokens=_total,
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
-                warning=_real_input >= _warn_threshold,
+                warning=_total >= _warn_threshold,
                 compacting=False,
                 threshold=_compact_threshold,
             )
