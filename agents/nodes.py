@@ -1049,24 +1049,48 @@ def node_agent(state: RunnerState) -> dict:
     # genuinely under the auto-compact ceiling should show a
     # calm chip, not a screaming red one.)
     # The chip shows the TOTAL prompt size the model was given
-    # (input + cache_read + cache_creation). This matches the
-    # number the user sees in the LLM call stats ("In 78k")
-    # and the auto-compact trigger uses the same number, so
-    # the chip and the trigger stay in lockstep. The cache
-    # fields are surfaced in the tooltip so the user can see
-    # how much of that 78k is genuinely new content vs
-    # cache-served prefix.
+    # — same number the user sees in the LLM call stats ("In 78k").
+    # The auto-compact trigger uses the same number, so chip and
+    # trigger stay in lockstep. The cache fields are surfaced in
+    # the tooltip so the user can see how much of that 78k is
+    # genuinely new content vs cache-served prefix.
+    #
+    # Provider semantics (verified live against MiniMax M3):
+    #   `usage.input_tokens` is the TOTAL prompt — uncached +
+    #   cache_read + cache_creation combined. The cache fields
+    #   (`input_token_details.cache_read` /
+    #   `input_token_details.cache_creation`) are SUBSETS of
+    #   `input_tokens`, NOT separate additions. We must NOT
+    #   add them on top — that would double-count (e.g. 78k
+    #   total + 77k cache = 155k, then chip shows 311% of 50k
+    #   threshold for a turn whose actual prompt was 78k).
+    #
+    # The same shape is used by OpenAI standard (`prompt_tokens`,
+    # `prompt_tokens_details.cached_tokens`). On Anthropic
+    # native, `input_tokens` is the UNCACHED portion only and
+    # cache fields are reported separately as
+    # `cache_read_input_tokens` / `cache_creation_input_tokens`.
+    # We don't have a runtime way to know which provider we're
+    # talking to; the heuristic is "if cache fields are present
+    # AND they don't exceed `input_tokens`, the provider is
+    # reporting the total in `input_tokens`". (Anthropic's
+    # cache fields can exceed `input_tokens` because the
+    # report is structured differently — but for OpenAI /
+    # MiniMax, the cache fields are always < input_tokens.)
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold, record_llm_input_tokens
         _usage = getattr(ai, "usage_metadata", None) or {}
-        _input_only = int(_usage.get("input_tokens", 0) or 0)
+        _input_total = int(_usage.get("input_tokens", 0) or 0)
         _cache_creation, _cache_read = _extract_cache_fields(_usage)
-        # Total prompt = input + cache_read + cache_creation.
-        # If cache fields are present, we ADD them; if not, the
-        # provider is reporting the total in `input_tokens` and
-        # there's nothing to add.
-        _input_total = _input_only + _cache_read + _cache_creation
+        # Sanity clamp: if the cache fields exceed `input_tokens`,
+        # they're probably from a different reporting shape and
+        # would double-count. Cap them at `input_tokens` so the
+        # breakdown in the tooltip stays sensible.
+        if _cache_read > _input_total:
+            _cache_read = _input_total
+        if _cache_creation > _input_total:
+            _cache_creation = _input_total
         if _input_total > 0:
             get_reporter().context_update(
                 used_tokens=_input_total,
