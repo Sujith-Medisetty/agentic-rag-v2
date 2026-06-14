@@ -626,7 +626,7 @@ export default function ChatPage() {
         //   …
         // We keep the parsing tolerant — the marker may evolve. If any
         // field is missing we still surface "truncated" but with zeros.
-        const truncation = parseBashTruncationMarker(preview);
+        const bashOutput = parseBashOutputMarker(preview);
         setCurrentTurn((curr) => {
           if (!curr) return curr;
           const patchToolList = (list: ToolEvent[]) => {
@@ -638,7 +638,10 @@ export default function ChatPage() {
                   status: isError ? "error" : "done",
                   preview,
                   previewTruncated,
-                  truncation: truncation ?? next[i].truncation,
+                  // Only set bashOutput on bash calls (parser returns
+                  // null for non-bash previews), so the UI's status
+                  // line only appears for bash tool results.
+                  bashOutput: bashOutput ?? next[i].bashOutput,
                   endedAt: ev.ts,
                 };
                 break;
@@ -1628,7 +1631,7 @@ function rebuildTranscript(events: LiveEvent[]): {
         if (!curr) break;
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
         const list = (aid && curr.agents[aid]) ? curr.agents[aid].tools : curr.tools;
-        const _trunc = parseBashTruncationMarker(
+        const _bashOutput = parseBashOutputMarker(
           typeof p.preview === "string" ? p.preview : undefined,
         );
         for (let i = list.length - 1; i >= 0; i--) {
@@ -1638,7 +1641,7 @@ function rebuildTranscript(events: LiveEvent[]): {
               status: p.error ? "error" : "done",
               preview: typeof p.preview === "string" ? p.preview : undefined,
               previewTruncated: !!p.preview_truncated,
-              truncation: _trunc ?? list[i].truncation,
+              bashOutput: _bashOutput ?? list[i].bashOutput,
               endedAt: ev.ts,
             };
             break;
@@ -2014,31 +2017,40 @@ function formatCostTiny(c: number): string {
   return c < 0.01 ? `$${c.toFixed(4)}` : `$${c.toFixed(c < 1 ? 3 : 2)}`;
 }
 
-// Parse the smart-truncation marker the bash tool embeds in its preview
-// text. The format is set in tools/wrappers.py: see _smart_truncate_bash_output.
-// Returns null when the preview doesn't contain the marker (i.e. the bash
-// output was either fully passed through or the tool isn't bash). Keep
-// this tolerant: the marker format may evolve, so missing fields should
-// degrade to "truncated but numbers unknown" rather than throwing.
-function parseBashTruncationMarker(
+// Parse the bash-output status marker the bash tool always appends to
+// its preview. Two formats, both set in tools/wrappers.py: see
+// _smart_truncate_bash_output. The marker is always present on bash
+// calls so the chat UI can show a single status line for every
+// invocation, not just the truncated ones.
+//
+//   passed_through:  [bash-output: total=5234, cap=10000, status=passed_through]
+//   truncated:       [bash-output: total=25939, cap=10000, status=truncated,
+//                                 kept_first=2800, kept_last=6200, dropped=16939,
+//                                 verdict=FAILURE, spill=/tmp/ojas-bash/...log]
+//
+// Returns null when the preview doesn't contain a marker (the tool
+// isn't bash, or the preview hasn't arrived yet).
+function parseBashOutputMarker(
   preview: string | undefined,
-): ToolEvent["truncation"] | null {
+): ToolEvent["bashOutput"] | null {
   if (!preview) return null;
-  // The marker is the last meaningful block in the preview. Find the
-  // structured `# truncation: ...` line and parse the key=value pairs.
-  const m = preview.match(/# truncation: kept_first=(\d+), kept_last=(\d+), dropped=(\d+), total=(\d+)/);
+  const m = preview.match(
+    /\[bash-output:\s+total=(\d+),\s+cap=(\d+),\s+status=(passed_through|truncated)(?:,\s+kept_first=(\d+))?(?:,\s+kept_last=(\d+))?(?:,\s+dropped=(\d+))?(?:,\s+verdict=(SUCCESS|FAILURE))?(?:,\s+spill=([^\]\s]+))?\s*\]/,
+  );
   if (!m) return null;
-  const keptFirst = parseInt(m[1], 10);
-  const keptLast = parseInt(m[2], 10);
-  const dropped = parseInt(m[3], 10);
-  const total = parseInt(m[4], 10);
-  // Verdict: SUCCESS or FAILURE
-  const verdictMatch = preview.match(/this was a (SUCCESS|FAILURE)/);
-  const verdict: "SUCCESS" | "FAILURE" = verdictMatch?.[1] === "FAILURE" ? "FAILURE" : "SUCCESS";
-  // Spill path: "Full output saved to `/path`."
-  const pathMatch = preview.match(/Full output saved to `([^`]+)`/);
-  const spillPath = pathMatch?.[1] ?? null;
-  return { keptFirst, keptLast, dropped, total, spillPath, verdict };
+  const total = parseInt(m[1], 10);
+  const cap = parseInt(m[2], 10);
+  const status = m[3] as "passed_through" | "truncated";
+  if (status === "passed_through") {
+    return { total, cap, status };
+  }
+  // truncated — optional fields default to 0 / null
+  const keptFirst = m[4] ? parseInt(m[4], 10) : 0;
+  const keptLast = m[5] ? parseInt(m[5], 10) : 0;
+  const dropped = m[6] ? parseInt(m[6], 10) : 0;
+  const verdict = (m[7] === "FAILURE" ? "FAILURE" : "SUCCESS") as "SUCCESS" | "FAILURE";
+  const spillPath = m[8] && m[8] !== "null" ? m[8] : null;
+  return { total, cap, status, keptFirst, keptLast, dropped, verdict, spillPath };
 }
 
 

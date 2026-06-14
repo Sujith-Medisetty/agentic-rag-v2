@@ -767,7 +767,22 @@ def _smart_truncate_bash_output(
     if max_chars is None:
         max_chars = _bash_inline_max_chars()
     if not out or len(out) <= max_chars:
-        return out
+        # Output fits in the inline cap. Emit a small status line so the
+        # chat UI can show "X chars / Y cap, sent in full" for every
+        # bash call, not just the truncated ones. Without this, the UI
+        # would silently pass small commands through with no indicator
+        # of what size was sent — the user would have to guess whether
+        # the bash output was complete or not.
+        total_chars = len(out)
+        cap = max_chars
+        status_marker = (
+            f"\n\n[bash-output: total={total_chars}, cap={cap}, status=passed_through]\n"
+        )
+        # Append at the end so the LLM still gets a clean output. The
+        # UI parses this line for the status display; the LLM can
+        # safely ignore the trailing bracket (it doesn't trigger
+        # any new behaviour).
+        return out + status_marker
 
     is_failure = bool(return_code_interp) and return_code_interp.startswith("exit_code:")
     # Reserve ~5% of the budget for the marker so the LLM always gets
@@ -804,43 +819,43 @@ def _smart_truncate_bash_output(
     # doesn't see an error in the inline preview.
     #
     # The marker also carries structured numbers (kept_first / kept_last /
-    # dropped / total) that the chat UI parses to render a clear
-    # "Output was truncated: first N + last M of T total chars" notice
-    # under the bash tool card. Format is stable: grep the marker text
-    # for `kept_first=X, kept_last=Y, dropped=Z, total=T` if you need
-    # to extract it programmatically.
+    # dropped / total) that the chat UI parses to render a single
+    # status line under the bash tool card. Format is stable: the UI
+    # greps for `[bash-output: total=T, cap=C, status=truncated,
+    # kept_first=H, kept_last=L, dropped=D, verdict=V, spill=P]`.
     verdict = "FAILURE" if is_failure else "SUCCESS"
     total_chars = len(out)
-    lines: list[str] = [
-        f"\n\n[…truncated {dropped:,} chars; this was a {verdict}.",
-        f"# truncation: kept_first={head_budget}, kept_last={tail_budget}, dropped={dropped}, total={total_chars}",
-    ]
+    marker = (
+        f"\n\n[…truncated {dropped:,} chars; this was a {verdict}."
+        f"\n[bash-output: total={total_chars}, cap={max_chars}, status=truncated, "
+        f"kept_first={head_budget}, kept_last={tail_budget}, dropped={dropped}, "
+        f"verdict={verdict}, spill={spill_path or 'null'}]"
+    )
     if spill_path:
-        lines.append(
-            f"Full output saved to `{spill_path}`."
+        marker += (
+            f"\nFull output saved to `{spill_path}`."
         )
         if is_failure:
             # Specific recipe for the footgun case: the error might be
             # in the middle, not in the tail. Don't trust the inline
             # preview alone.
-            lines.append(
-                "If you don't see the error here, it may be in the "
-                "truncated middle — scan the spill with: "
+            marker += (
+                f"\nIf you don't see the error here, it may be in the "
+                f"truncated middle — scan the spill with: "
                 f"`grep -E 'error|Error|ERROR|ENOENT|EACCES|TS[0-9]+' {spill_path}`."
             )
         else:
-            lines.append(
-                "To see a specific middle section, run e.g. "
+            marker += (
+                f"\nTo see a specific middle section, run e.g. "
                 f"`sed -n '5000,5500p' {spill_path}` for a small slice."
             )
     else:
-        lines.append(
-            "Re-run with a tighter filter (e.g. `… 2>&1 | tail -200`, "
-            "`… 2>&1 | grep -E 'error|Error|ERROR'`) to see the missing "
-            "section inline."
+        marker += (
+            f"\nRe-run with a tighter filter (e.g. `… 2>&1 | tail -200`, "
+            f"`… 2>&1 | grep -E 'error|Error|ERROR'`) to see the missing "
+            f"section inline."
         )
-    lines.append("…]\n\n")
-    marker = "\n".join(lines)
+    marker += "\n…]\n\n"
 
     return head + marker + tail
 # ============================================================================

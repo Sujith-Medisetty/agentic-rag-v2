@@ -137,18 +137,21 @@ export interface ToolEvent {
   target?: string;
   preview?: string;
   previewTruncated?: boolean;   // true when the backend capped the preview (rare; outputs > ~100KB)
-  // Smart bash output truncation metadata. Present when the bash tool
-  // truncated its output head+tail and spilled the full content to a
-  // temp file. The UI renders a "Output was truncated: first N + last
-  // M of T total" notice from these fields; the spillPath is a click-to-
-  // copy server-side path the user can `read_file` or `cat` themselves.
-  truncation?: {
-    keptFirst: number;          // chars from the head preserved inline
-    keptLast: number;           // chars from the tail preserved inline
-    dropped: number;            // chars dropped from the middle
-    total: number;              // total original output size
-    spillPath: string | null;   // absolute path to the full output, or null if spill failed
-    verdict: "SUCCESS" | "FAILURE";
+  // Smart bash output size + truncation metadata. Set on EVERY bash
+  // call (not just truncated ones) so the chat UI can show a single
+  // status line for every bash call indicating total size, the cap,
+  // and whether the output was sent in full or trimmed. When trimmed,
+  // keptFirst / keptLast / dropped are populated and spillPath points
+  // at the full output on disk.
+  bashOutput?: {
+    total: number;              // total original output size in chars
+    cap: number;                // OJAS_BASH_MAX_OUTPUT_CHARS at call time
+    status: "passed_through" | "truncated";
+    keptFirst?: number;         // only set when status=truncated
+    keptLast?: number;          // only set when status=truncated
+    dropped?: number;           // only set when status=truncated
+    verdict?: "SUCCESS" | "FAILURE";  // only set when status=truncated
+    spillPath?: string | null;  // only set when status=truncated
   };
   status: "running" | "done" | "error";
   startedAt: number;
