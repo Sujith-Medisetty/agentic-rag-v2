@@ -779,11 +779,25 @@ def _auto_compact_threshold_value() -> int:
 
 
 def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Return a new list with oversized ToolMessage bodies replaced by a
-    one-line pointer. Preserves the tool CALL (on the preceding AIMessage)
-    verbatim — the agent's intent is what matters, not the response body.
+    """Return a new list with oversized ToolMessage bodies AND oversized
+    AIMessage tool_call arguments replaced by short stubs.
 
-    Cheap to run on every turn (O(n) over a list of ~80 messages); no
+    Both directions matter:
+      - ToolMessage bodies: a single `Read` of a 30k-token log file
+        would otherwise fill most of the live window with stale content.
+        The agent can re-`Read` if it needs the fresh content. We keep
+        the tool CALL (path + args) verbatim, since that's the agent's
+        intent, but replace the oversized result body with a one-line
+        pointer.
+      - AIMessage tool_call args: `edit_file(path=..., new_string=...)`
+        and `write_file(path=..., content=...)` embed the new file body
+        IN the tool call's argument. For a typical build session with
+        30+ edits, each one carries a 1-3KB `new_string` — the recent
+        window alone is 30-90K tokens. Truncating these args keeps the
+        recent window small while preserving the agent's intent
+        (file path, edit description) for the next turn to reference.
+
+    Cheap to run on every turn (O(n) over a list of ~30 messages); no
     reason to cache it. Uses `model_copy(update=...)` (LangChain
     `BaseMessage` has `model_copy` since langchain-core>=0.1) so the
     checkpoint history isn't mutated in place — the on-disk record
@@ -791,24 +805,93 @@ def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
     view.
     """
     out: list[BaseMessage] = []
-    n_truncated = 0
+    n_truncated_tool = 0
+    n_truncated_call = 0
     for m in messages:
         if isinstance(m, ToolMessage):
             new_content = _truncate_tool_result(m.content)
             if new_content is not m.content:
-                n_truncated += 1
+                n_truncated_tool += 1
                 out.append(m.model_copy(update={"content": new_content}))
+            else:
+                out.append(m)
+        elif isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            new_calls, n = _truncate_tool_call_args(m.tool_calls or [])
+            if n:
+                n_truncated_call += n
+                out.append(m.model_copy(update={"tool_calls": new_calls}))
             else:
                 out.append(m)
         else:
             out.append(m)
-    if n_truncated:
+    if n_truncated_tool or n_truncated_call:
         import logging
         logging.getLogger(__name__).info(
-            "[history-trim] truncated %d oversized tool result(s) for the live window",
-            n_truncated,
+            "[history-trim] truncated %d tool result(s) + %d tool call arg(s) "
+            "for the live window",
+            n_truncated_tool, n_truncated_call,
         )
     return out
+
+
+# Args that, when present in a tool call, frequently carry multi-KB strings
+# (the new file body for an edit, a long shell command, etc.). Truncating
+# just these — rather than the entire args dict — preserves the agent's
+# intent (which file, which function) while shaving the heavy strings.
+_TOOL_CALL_LARGE_ARG_KEYS = (
+    "new_string",   # edit_file: the new file body
+    "old_string",   # edit_file: also large sometimes
+    "content",      # write_file: the entire file body
+    "command",      # bash: long shell commands / heredocs
+)
+
+
+def _truncate_tool_call_args(tool_calls: list) -> tuple[list, int]:
+    """Walk a list of tool call dicts and replace large string arg values
+    with a one-line stub. Returns `(new_calls, n_truncated)`.
+
+    Each tool call is a dict like `{"id": "...", "name": "edit_file",
+    "args": {"path": "...", "new_string": "..."}}`. Only the well-known
+    heavy keys are touched; everything else (path, query, etc.) passes
+    through verbatim so the LLM can still see what the agent was doing.
+
+    The threshold is the same `TOOL_RESULT_TRUNCATE_AT_CHARS` from
+    checkpointer — a 800-char stub plus a one-line notice. The original
+    full text is NOT recoverable (we don't keep it elsewhere); if the
+    next turn needs the verbatim file body, the agent re-invokes the
+    tool (read_file / cat) to get the fresh content.
+    """
+    limit = 800
+    if limit <= 0:
+        return tool_calls, 0
+    out: list = []
+    n = 0
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        args = tc.get("args")
+        if not isinstance(args, dict):
+            out.append(tc)
+            continue
+        changed = False
+        new_args = dict(args)
+        for key in _TOOL_CALL_LARGE_ARG_KEYS:
+            val = new_args.get(key)
+            if isinstance(val, str) and len(val) > limit:
+                head = val[:limit].replace("\n", " ⏎ ")
+                new_args[key] = (
+                    f"[arg truncated: {len(val):,} chars "
+                    f"(~{len(val) // 4:,} tokens); first {limit} chars: "
+                    f"{head!r}… re-invoke the tool to see the full body]"
+                )
+                changed = True
+                n += 1
+        if changed:
+            out.append({**tc, "args": new_args})
+        else:
+            out.append(tc)
+    return out, n
 
 
 # How many of the most recent AIMessages to keep their reasoning_content /
@@ -932,7 +1015,15 @@ def node_agent(state: RunnerState) -> dict:
     # Repair any orphaned tool_calls left by a previously cancelled/killed turn
     # BEFORE we send the message history to the LLM. Without this, MiniMax /
     # OpenAI-compatible providers reject the conversation with a 400.
-    raw_history = list(state.get("messages", []))
+    #
+    # Source of the LLM input: prefer `live_messages` (the per-turn working
+    # set that the previous turn wrote — post-compact, post-mask, post-trim)
+    # over `messages` (the append-only accumulator). On the very first turn
+    # of a session, `live_messages` is unset, so we fall back to the full
+    # accumulator. The pre-compact state of `messages` is also kept around
+    # for replays / debugging — it's not a duplicate cost because the LLM
+    # only ever reads from `live_messages`.
+    raw_history = list(state.get("live_messages") or state.get("messages", []))
     history = _repair_orphan_tool_calls(raw_history)
 
     # Auto-compact BEFORE the LLM call, not after. The old `put()`-time check
@@ -1116,15 +1207,22 @@ def node_agent(state: RunnerState) -> dict:
     except Exception:
         pass
 
-    # If we had to repair, surface the repaired messages back into LangGraph
-    # state so subsequent turns / checkpoints see the cleaned history. Using
-    # RemoveMessage + re-add would be cleaner, but LangGraph's default `add`
-    # reducer on `messages` appends — so the simplest fix is to overwrite via
-    # the same list we used for the call. For now we just record `ai`; the
-    # orphans remain in checkpoint but the repair runs again next turn (cheap
-    # and idempotent).
+    # Persist the post-compact + post-mask + post-strip + post-trim history
+    # as the LLM input for the NEXT turn. Two channels:
+    #   - `messages` (Annotated[add_messages]) — append the new AI message
+    #     to the audit log. Older turns stay here for replays / debugging.
+    #     The accumulator grows unboundedly; we don't read from it for
+    #     LLM input.
+    #   - `live_messages` (default reducer, no Annotated) — REPLACE with
+    #     the compacted working set + new AI message. The next turn reads
+    #     from here, so the LLM only ever sees the bounded (summary +
+    #     recent tail) list, not the full uncompacted history.
+    # Together: the full history is preserved in `messages`, the LLM sees
+    # a compact view in `live_messages`, and the per-turn cost stays
+    # bounded by the auto-compact threshold.
     return {
         "messages": [ai],
+        "live_messages": list(history) + [ai],
         "iterations": iterations,
         "system_prompt_pair": [static_base, dynamic_suffix],
     }
@@ -1165,4 +1263,19 @@ def node_tools(state: RunnerState) -> dict:
         )
         reporter.tool_done(name, content or "(no output)", error=is_error)
 
+    # Mirror the tool results into `live_messages` so the next iteration's
+    # LLM call sees them. `messages` already gets them via add_messages
+    # (the ToolNode return value flows through the reducer), but the LLM
+    # reads from `live_messages` (the post-compact working set), not
+    # `messages` (the unbounded audit log). Without this mirror, the
+    # next node_agent call would have an AIMessage with tool_calls but
+    # no matching ToolMessages in live_messages — and the conversation
+    # would re-trigger the orphan-repair path on every iteration.
+    new_tool_messages = list(result.get("messages", []))
+    if new_tool_messages:
+        existing = list(state.get("live_messages") or state.get("messages", []))
+        return {
+            **result,
+            "live_messages": existing + new_tool_messages,
+        }
     return result

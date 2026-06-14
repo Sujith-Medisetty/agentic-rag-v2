@@ -74,11 +74,25 @@ CONTEXT_WINDOW_TOKENS = 200_000  # what the UI's 100% fill represents
 
 CHARS_PER_TOKEN = 4
 # How many of the most-recent messages to keep VERBATIM when compacting.
-# Was 4 (≈1 turn) — that forced constant re-derivation on long sessions.
-# 80 ≈7 turns is the sweet spot: the agent can see its recent reasoning
-# + tool calls + the file edits from the last few iterations without
-# either re-reading them or watching them get summarised away mid-thought.
-PRESERVE_RECENT = 80
+#
+# Tuning history:
+#   - 4 (≈1 turn) — too small. The agent would re-derive context on every
+#     few tool calls and lose the thread of what it was mid-edit on.
+#   - 80 (≈7 turns) — too large. Each edit_file tool_call embeds the
+#     full `new_string` argument (often 1-3KB), so 80 messages could
+#     easily weigh 80K+ tokens — bigger than the 80K threshold. The
+#     compact fired but the post-compact recent-window was still over
+#     the threshold, so the LLM call stayed at ~97K and the chip never
+#     moved off 100%.
+#   - 30 (≈2-3 turns) — sweet spot. Two-to-three full agent iterations
+#     is enough for the agent to see its current reasoning chain and
+#     the most recent tool calls + results without losing the thread.
+#     At ~500-1000 tokens / message (post-mask, post-strip), 30
+#     messages is ~15-30K — well under the 80K threshold, so a
+#     post-compact LLM call lands at ~25-40K and the chip drops from
+#     100% to ~30-50%. The next turn's growth brings it back up the
+#     curve naturally, and the next compact cycle catches it.
+PRESERVE_RECENT = 30
 PRESERVE_RECENT_ENV_VAR = "OJAS_PRESERVE_RECENT"
 
 # --- Tool-result truncation ---
