@@ -2997,6 +2997,16 @@ function DeployStrip({
         <DeployModal
           sessionId={sessionId}
           defaultName={sessionName}
+          // Pass the live list of already-deployed slugs so the
+          // modal can do a CLIENT-SIDE collision check as the user
+          // types — surfacing "this name is already taken" in the
+          // slug field BEFORE the user clicks Deploy. Without this
+          // the user only finds out the slug is taken when the
+          // server returns 409, and the server (in some code
+          // paths) used to silently overwrite the existing app —
+          // clobbering their previous deploy with the new one. The
+          // server's 409 path is still kept as a defense in depth.
+          existingSlugs={new Set(apps.map((a) => a.slug))}
           onClose={() => setShowModal(false)}
           onDeployed={(result) => {
             onDeployed(result.app);
@@ -3257,10 +3267,18 @@ function DeployedAppPill({
 }
 
 function DeployModal({
-  sessionId, defaultName, onClose, onDeployed,
+  sessionId, defaultName, existingSlugs, onClose, onDeployed,
 }: {
   sessionId: string;
   defaultName: string;
+  // Set of slugs already in use by ANY deployed app. Used to do a
+  // live client-side collision check as the user types — show
+  // "this name is already taken" in the slug field, disable
+  // submit, and prevent the silent overwrite that used to happen
+  // when a user typed an existing name. The server's 409 path is
+  // kept as a defense in depth (the set may be stale if another
+  // tab just deployed an app with the same name).
+  existingSlugs?: Set<string>;
   onClose: () => void;
   // The DeployResult from the OLD sync endpoint shape — ChatPage uses
   // .app to splice the new app into the deployedApps array. We pass
@@ -3398,6 +3416,17 @@ function DeployModal({
     e.preventDefault();
     setErr(null);
     setSlugError(null);
+    // Defense-in-depth: don't even attempt the POST if the live
+    // collision check has flagged the slug. The submit button is
+    // already disabled when this is true, but a fast typist could
+    // press Enter between renders — block it here too. The server
+    // would 409 anyway, but not every code path on the server
+    // used to reject the write (see the silent-overwrite bug this
+    // PR is preventing), so client-side is the safer layer.
+    if (slugTaken) {
+      setSlugError(liveSlugError);
+      return;
+    }
     // Submit the deploy. The POST returns 202 + a job_id immediately.
     // We do NOT pass our own AbortSignal here — we want the deploy
     // to keep running server-side even if the user closes the modal
@@ -3446,7 +3475,39 @@ function DeployModal({
   // unbuilt-only before computing these. `noUnbuilt` means "we
   // see builds, but they're all already deployed" — distinct from
   // `noBuild` ("we see no builds at all").
-  const readyInConfig = !detecting && !noBuild && !noUnbuilt && !!slug;
+  //
+  // Live slug-collision check. The user reported that typing a
+  // slug that matches an existing app used to silently OVERWRITE
+  // the existing deploy (clobbering their prior app). We now
+  // surface the collision in the slug input itself as the user
+  // types: red border, error text, Deploy button disabled. The
+  // check uses the SAME `slugifyName` normalization the server
+  // runs on submit, so a typed "My Cool App" is checked as
+  // "my-cool-app" — the form's final shape, not the mid-type
+  // string. Empty slug = no collision (just missing input, which
+  // the `required` attr + submit button's `readyInConfig` gate
+  // already handle). The server's 409 path is still kept as a
+  // defense in depth — `existingSlugs` is a snapshot from when
+  // the modal opened and could miss a deploy that landed in
+  // another tab.
+  const normalizedSlug = slugifyName(slug);
+  const slugTaken = !!existingSlugs
+    && normalizedSlug.length > 0
+    && existingSlugs.has(normalizedSlug);
+  // The user-facing message: name the existing slug, not just
+  // "taken", so the user can recognise WHICH app it is and go
+  // rename it / pick a different name. (We only have the slug,
+  // not the app's display name, in the existing-slug set —
+  // that's fine, the URL is what they'd care about.)
+  const liveSlugError = slugTaken
+    ? `“${normalizedSlug}” is already deployed. Pick a different slug, or take down the existing app from the Admin page.`
+    : null;
+
+  const readyInConfig = !detecting
+    && !noBuild
+    && !noUnbuilt
+    && !!slug
+    && !slugTaken;  // collision blocks submit
   const isRunning = phase === "running";
   const isDone = phase === "done";
   const isFailed = phase === "failed";
@@ -3612,8 +3673,8 @@ function DeployModal({
               // before they hit Deploy.
               setSlug(slugifyName(e.target.value));
             }}
-            aria-invalid={!!slugError}
-            className={`field mt-1 font-mono ${slugError ? "border-danger/60" : ""}`}
+            aria-invalid={!!(slugError || liveSlugError)}
+            className={`field mt-1 font-mono ${(slugError || liveSlugError) ? "border-danger/60" : ""}`}
             placeholder="weather-app" required autoFocus
           />
           <span className="mt-1 block text-tx-xs text-subtle">
@@ -3622,9 +3683,19 @@ function DeployModal({
               · only <span className="font-mono">a-z 0-9 - _</span> allowed, auto-normalized on submit
             </span>
           </span>
-          {slugError && (
+          {/* Slug error surface. Two sources merged into one display:
+              (a) `liveSlugError` — derived from the typed slug vs.
+                  the existing-apps snapshot. Fires AS THE USER TYPES,
+                  so the collision is caught before they hit Deploy.
+              (b) `slugError` — set by the submit handler when the
+                  server returns 409 (defense in depth: the snapshot
+                  is a point-in-time read and could miss a deploy
+                  from another tab/window).
+              Live takes precedence when both are set; the server
+              409 is the "I just let the user submit anyway" path. */}
+          {(liveSlugError || slugError) && (
             <span className="mt-1 block text-tx-xs text-danger" role="alert">
-              {slugError}
+              {liveSlugError || slugError}
             </span>
           )}
         </label>
@@ -3694,7 +3765,19 @@ function DeployModal({
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button type="button" onClick={onClose} className="btn-ghost">Cancel</button>
-          <button type="submit" disabled={!readyInConfig} className="btn-primary">
+          <button
+            type="submit"
+            disabled={!readyInConfig}
+            // Tooltip explains WHY the button is disabled — important
+            // when it's the slug collision (the only disabled-state
+            // that isn't obvious from the field above the button).
+            // The other disabled-states (detecting, no build) DO have
+            // visible UI in the picker area, so the title isn't
+            // needed for them — but a unified message is simpler
+            // and `noOpMessage` already names the most common case.
+            title={slugTaken ? "Slug is already taken" : (!readyInConfig ? "Pick a build to deploy" : undefined)}
+            className="btn-primary"
+          >
             Deploy
           </button>
         </div>
