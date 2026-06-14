@@ -1518,14 +1518,33 @@ export default function ChatPage() {
           {turns.map((t, i) => (
             <TurnCard key={t.id} turn={t} index={i} />
           ))}
-          {/* Auto-compact cards now render INLINE in the turn during
-              which they fired (see TurnCard + the rebuildTranscript /
-              live WS path that attach the note to the active turn).
-              The parent-level `contextCompactedNotes` list is kept
-              only as a defensive fallback for the case where the
-              event lands in a race window with no current turn —
-              it's intentionally NOT rendered here, so cards don't
-              double up. */}
+          {/* Auto-compact cards. Inline (inside the turn during
+              which they fired) is the primary render path. As a
+              defensive fallback for cases where the per-turn
+              attach didn't make it (e.g. WS reconnect race, or
+              rebuildTranscript miscounted for a long session),
+              we ALSO render any orphans on the parent-level
+              `contextCompactedNotes` list that aren't already
+              attached to a turn. Dedupe by note id so the two
+              paths don't double-render. */}
+          {(() => {
+            const seen = new Set<string>();
+            for (const t of turns) {
+              for (const n of t.compactNotes ?? []) seen.add(n.id);
+            }
+            if (currentTurn) {
+              for (const n of currentTurn.compactNotes ?? []) seen.add(n.id);
+            }
+            const orphans = contextCompactedNotes.filter((n) => !seen.has(n.id));
+            if (orphans.length === 0) return null;
+            return (
+              <div className="space-y-2">
+                {orphans.map((n) => (
+                  <ContextCompactedNoteCard key={n.id} note={n} />
+                ))}
+              </div>
+            );
+          })()}
           {currentTurn && (
             <ActiveTurnCard turn={currentTurn} index={turns.length} />
           )}
