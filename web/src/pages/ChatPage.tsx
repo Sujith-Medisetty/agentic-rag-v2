@@ -2093,21 +2093,26 @@ function ContextChip({
   if (compacting) {
     tooltipLines.push("Compacting context — summarising older turns to keep the session running");
   } else {
+    // The chip label uses `used` as-is (the TOTAL prompt size =
+    // input + cache_read + cache_creation), because that's what
+    // the user thinks of as "how full is my context". The
+    // tooltip below unpacks that into new vs cached so the user
+    // can see whether the high number is genuine pressure or
+    // just static prefix re-served from cache.
+    const newTokens = Math.max(0, used - cacheRead - cacheCreation);
     tooltipLines.push(
-      `Context: ${fmt(used)} new (uncached + writes). `
+      `Context: ${fmt(used)} total (model's prompt this turn). `
       + `Auto-compact fires at ${fmt(threshold)}.`
     );
-  }
-  if (cacheRead > 0 || cacheCreation > 0) {
-    const parts: string[] = [];
-    parts.push(`${fmt(cacheRead)} cache hits`);
-    if (cacheCreation > 0) parts.push(`${fmt(cacheCreation)} cache writes`);
-    const total = cacheRead + cacheCreation;
-    if (total > 0) {
-      const hitRate = Math.round((cacheRead / total) * 100);
-      parts.push(`(${hitRate}% cache hit rate)`);
+    if (newTokens > 0 || cacheRead > 0) {
+      const total = cacheRead + cacheCreation;
+      const hitRate = total > 0 ? Math.round((cacheRead / total) * 100) : 0;
+      tooltipLines.push(
+        `${fmt(newTokens)} new · ${fmt(cacheRead)} cache hits`
+        + (cacheCreation > 0 ? ` · ${fmt(cacheCreation)} cache writes` : "")
+        + (hitRate > 0 ? ` (${hitRate}% cache hit rate)` : "")
+      );
     }
-    tooltipLines.push(parts.join(" · "));
   }
   if (compactCount > 0) {
     tooltipLines.push(

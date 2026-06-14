@@ -1011,67 +1011,70 @@ def node_agent(state: RunnerState) -> dict:
     ai = _stream_model_call(llm, messages)
     _run_budget.record(ai)
 
-    # Publish the context-used value to the chip. We use the LLM-reported
-    # `input_tokens` MINUS cache_read MINUS cache_creation, so the chip
-    # shows the *new tokens* the model actually has to process this turn.
-    # Different providers report the total prompt size with different
-    # semantics:
+    # Publish the context-used value to the chip. We publish BOTH:
+    #   - the TOTAL prompt size the model just reasoned over
+    #     (input + cache_read + cache_creation) — this is what
+    #     the user thinks of as "how full is my context", and
+    #     it's the number the chip label shows. Without the
+    #     cache split, a long session running at 95% cache hit
+    #     rate would show the static system prompt's worth of
+    #     tokens forever, even though the user added almost
+    #     nothing new.
+    #   - the breakdown (X new, Y cached) in the tooltip so the
+    #     user can see WHY a high number is or isn't concerning.
     #
-    #   - Anthropic native: `input_tokens` is the UNCACHED portion only;
-    #     `cache_read_input_tokens` and `cache_creation_input_tokens`
-    #     are reported separately.
-    #   - OpenAI standard + MiniMax-M3 (as ChatOpenAI): `input_tokens`
-    #     is the TOTAL prompt (uncached + cache_read + cache_creation
-    #     combined). The cache fields live in `input_token_details.
-    #     cache_read` / `cache_creation` (or `prompt_tokens_details.
-    #     cached_tokens` for vanilla OpenAI).
+    # Different providers report the total prompt size with
+    # different semantics:
+    #   - Anthropic native: `input_tokens` is the UNCACHED portion
+    #     only; `cache_read_input_tokens` /
+    #     `cache_creation_input_tokens` are reported separately.
+    #     Total = input_tokens + cache_read + cache_creation.
+    #   - OpenAI standard + MiniMax-M3 (as ChatOpenAI):
+    #     `input_tokens` is the TOTAL prompt (uncached +
+    #     cache_read + cache_creation combined). The cache fields
+    #     live in `input_token_details.cache_read` /
+    #     `cache_creation` (or `prompt_tokens_details.cached_tokens`
+    #     for vanilla OpenAI).
     #
-    # We can't know which shape the current provider returns without
-    # inspecting both the input_tokens number AND the cache fields.
-    # Pragmatic fix: subtract cache_read + cache_creation when they're
-    # present and non-zero. If a provider reports `input_tokens` as
-    # uncached-only (Anthropic shape), subtracting the cache fields
-    # would under-count; we therefore ONLY subtract when the cache
-    # fields are POSITIVE — which is a strong signal the provider is
-    # reporting the total in `input_tokens` (no point reporting a
-    # `cache_read` field if `input_tokens` is already net-of-cache).
+    # We compute the total by ADDING the cache fields when they're
+    # present, OR using `input_tokens` as-is if the provider
+    # doesn't surface them (Anthropic shape, where the total ==
+    # input_tokens because cache fields would be reported
+    # separately).
     #
-    # Without this, the chip inflates by the static system prompt on
-    # every turn (a casual "hi" chat reads as 76k because the
-    # system prompt + 9 prior turns of history are all served from
-    # cache, and the provider's total-prompt number counts them
-    # again). With this, the chip honestly shows the *new* tokens
-    # the model had to think about this turn.
+    # The auto-compact trigger uses the NEW (uncached) number —
+    # compaction only affects future calls, so the trigger should
+    # fire on new content, not the static cache-served prefix.
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold, record_llm_input_tokens
         _usage = getattr(ai, "usage_metadata", None) or {}
-        _input_total = int(_usage.get("input_tokens", 0) or 0)
-        # Compute the actual NEW tokens billed this turn. If the
-        # provider didn't surface cache fields, _input_total is
-        # already the new tokens (Anthropic shape) and we use it as-is.
+        _input_only = int(_usage.get("input_tokens", 0) or 0)
         _cache_creation, _cache_read = _extract_cache_fields(_usage)
-        if _cache_read > 0 or _cache_creation > 0:
-            _input_new = max(0, _input_total - _cache_read - _cache_creation)
-        else:
-            _input_new = _input_total
-        if _input_new > 0:
+        # Total prompt = input + cache_read + cache_creation.
+        # If cache fields are present, we ADD them; if not, the
+        # provider is reporting the total in `input_tokens` and
+        # there's nothing to add. Either way, the chip label
+        # shows the model's actual "context burden" this turn.
+        _input_total = _input_only + _cache_read + _cache_creation
+        if _input_total > 0:
             get_reporter().context_update(
-                used_tokens=_input_new,
+                used_tokens=_input_total,
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
                 compacting=False,
                 threshold=int(_auto_compact_threshold()),
                 cache_read=_cache_read,
                 cache_creation=_cache_creation,
             )
-            # Stash for maybe_compact() to use as the primary trigger
-            # on the next turn. We use the NEW-token number here too
-            # so the chip and the trigger stay in lockstep — when the
-            # chip goes red (>=100% of threshold), auto-compact will
-            # fire on the next turn. Before this fix, the trigger
-            # used the inflated total and fired constantly on a
-            # 5-message session because the system prompt alone
-            # "looked like" 25k tokens.
+            # Auto-compact trigger: use the NEW (uncached + writes)
+            # number, NOT the cache-inflated total. Compaction
+            # shrinks the message list, which only affects the new
+            # tokens on the next call — the cached prefix keeps
+            # hitting cache regardless. Triggering compaction on
+            # a 95%-cache-hit session is a false positive: the
+            # underlying message list is small, the model just
+            # re-reads the same prefix every turn.
+            _input_new = max(0, _input_only)
             record_llm_input_tokens(_input_new)
     except Exception:
         pass
