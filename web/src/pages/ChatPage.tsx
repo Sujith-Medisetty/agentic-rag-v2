@@ -1760,13 +1760,14 @@ function rebuildTranscript(events: LiveEvent[]): {
 //   60-89%      → warn (orange)
 //   90%+        → danger (red)
 //   compacting  → pulsing accent dot, label reads "Compacting…"
-// Hidden until the server sends at least one context_update event.
+// Always visible so the user has a stable reference for "how full is
+// this session". On a fresh session with no LLM call yet it shows
+// "0% used" against the threshold.
 // ============================================================================
 
 function ContextChip({
   used, threshold, compacting,
 }: { used: number; threshold: number; compacting: boolean }) {
-  if (!used && !compacting) return null;
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
   const pctUsed = threshold > 0

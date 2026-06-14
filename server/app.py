@@ -2636,21 +2636,20 @@ async def stream(websocket: WebSocket, session_id: str):
     # comes from the last real `input_tokens` we persisted in this session's
     # row — same number the user saw mid-task, so the chip doesn't snap to
     # a different value on page load. A fresh session with no LLM call yet
-    # has no persisted value; we just skip the publish and the chip stays
-    # hidden until the first LLM response.
+    # has no persisted value; we publish 0 so the chip still appears with
+    # "0% used" rather than flashing in after the first turn.
     try:
         from memory.checkpointer import (
             _auto_compact_threshold, CONTEXT_WINDOW_TOKENS,
         )
         persisted = db.get_session(session_id)
-        if persisted and persisted.get("last_context_used"):
-            used = int(persisted["last_context_used"])
-            bus.publish("context_update", {
-                "used_tokens":  used,
-                "budget_tokens": CONTEXT_WINDOW_TOKENS,
-                "compacting": False,
-                "threshold": int(_auto_compact_threshold()),
-            })
+        used = int((persisted or {}).get("last_context_used") or 0)
+        bus.publish("context_update", {
+            "used_tokens":  used,
+            "budget_tokens": CONTEXT_WINDOW_TOKENS,
+            "compacting": False,
+            "threshold": int(_auto_compact_threshold()),
+        })
     except Exception:
         # Don't let an initial-context hiccup break the WS upgrade
         pass
