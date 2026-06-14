@@ -2215,17 +2215,13 @@ function rebuildTranscript(events: LiveEvent[]): {
 }
 
 // ============================================================================
-// ContextChip — compact "X% used" pill in the chat header. Shows the % of
-// the auto-compact threshold (50K default) that's currently filled. The
-// number ticks UP as the context grows, and 100% is the moment
-// auto-compaction fires. Color tiers at a glance:
-//   < 60%       → calm
-//   60-89%      → warn (orange)
-//   90%+        → danger (red)
-//   compacting  → pulsing accent dot, label reads "Compacting…"
-// Always visible so the user has a stable reference for "how full is
-// this session". On a fresh session with no LLM call yet it shows
-// "0% used" against the threshold.
+// ContextChip — "X% used" pill in the chat header. The % is the TOTAL
+// prompt the LLM received this turn divided by the auto-compact
+// threshold. 100% = next LLM call will trigger auto-compact (the pre-LLM
+// hook summarises old turns before model.invoke, then the chip drops to
+// the post-compact total). Color tiers: <60 calm, 60-89 warn, 90+ danger,
+// compacting shows a pulsing accent dot. Click the chip for the breakdown
+// (new vs cache hits, cumulative compaction count, last save).
 // ============================================================================
 
 function ContextChip({
@@ -2235,83 +2231,39 @@ function ContextChip({
   used: number;
   threshold: number;
   compacting: boolean;
-  // How many auto-compacts have fired in this session so far. Shows
-  // up in the tooltip ("7 compactions · 0.8M tokens freed cumulative")
-  // and as a subtle "+7" badge next to the percentage so the user
-  // knows the chip is showing a *post*-compact number, not raw
-  // growth.
   compactCount: number;
   lastCompactSavedTokens: number;
-  // Most recent prompt-cache split. The chip's tooltip surfaces
-  // these as "X new · Y cache hits" so the user can see whether
-  // a high % used is genuine context pressure (lots of new
-  // tokens) or just the static system prompt being re-served
-  // from cache (lots of cache hits, almost no new tokens).
-  // 0 / 0 when the provider doesn't surface cache fields.
+  // Most recent prompt-cache split — surfaced in the popover so the
+  // user can tell whether a high chip is genuine new content or
+  // just the static system prompt being re-served from cache.
   cacheRead: number;
   cacheCreation: number;
 }) {
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
-  // Popover state. The chip is a click-toggle target — clicking
-  // it (or tapping it on mobile) opens a detailed popover with
-  // the same info the old `title=` hover-tooltip showed, but
-  // readable and dismissable on touch devices. The browser's
-  // native `title` only works on hover and is invisible on
-  // mobile, so we replace it with a real popover. Clicking the
-  // chip again toggles the popover closed; clicking outside
-  // closes it; Esc closes it. Hover-to-open on desktop is
-  // deliberately NOT added back — it would conflict with the
-  // click toggle (hover-then-mouseout would close what hover
-  // just opened on devices that have a mouse) and the click
-  // model is the one that works on touch.
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
-  // Separate ref on the BUTTON (not the wrapper) so we can read
-  // the chip's actual screen position for fixed-positioning the
-  // popover. The popover is rendered with `position: fixed` to
-  // escape the chat header's stacking context (the header uses
-  // `backdrop-blur-xl` which forces a new stacking context —
-  // inside that context z-50 works, but the PlanPanel below the
-  // header is a sibling that draws on top of any `absolute`
-  // overflow from the header). fixed positioning breaks out of
-  // ALL stacking contexts and anchors to the viewport, so the
-  // popover is guaranteed to render above the PlanPanel.
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const [popPos, setPopPos] = useState<{ top: number; right: number } | null>(null);
 
-  // Click-outside-to-close + reposition on scroll/resize while open.
-  // Mouse and touch are bound separately because TS infers the
-  // event type from the listener name — MouseEvent and TouchEvent
-  // don't share a base class with the fields we need.
+  // Click-outside + Esc-to-close + re-anchor on scroll/resize while open.
   useEffect(() => {
     if (!open) return;
     const computePos = () => {
       if (!buttonRef.current) return;
       const r = buttonRef.current.getBoundingClientRect();
-      // Place popover's right edge at the chip's right edge, just
-      // below the chip. Right-alignment matches the original
-      // `right-0` behaviour. If the page is scrolled, the chip
-      // moves with the header (the header is sticky) and the
-      // popover follows it — getBoundingClientRect already
-      // accounts for the current scroll offset.
       setPopPos({ top: r.bottom + 6, right: window.innerWidth - r.right });
     };
-    computePos();
     const onDoc = (e: Event) => {
       if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
         setOpen(false);
       }
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    computePos();
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("touchstart", onDoc);
     document.addEventListener("keydown", onKey);
-    // Re-anchor on scroll/resize so the popover tracks the chip
-    // if the user scrolls while it's open. Without this the
-    // popover would float in space as the sticky header moves.
     window.addEventListener("scroll", computePos, true);
     window.addEventListener("resize", computePos);
     return () => {
@@ -2323,51 +2275,29 @@ function ContextChip({
     };
   }, [open]);
 
-  // Cap the displayed percentage at 100% — the chip is a
-  // "till the next auto-compact" gauge, not a "how many times
-  // over" indicator. Once `used >= threshold`, auto-compact
-  // fires (or is about to fire on the next turn) and the chip
-  // should show 100% — screaming 156% / 311% for a session
-  // whose LLM is just receiving a large prompt is misleading
-  // because the user has no way to act on the overage. The
-  // tooltip below carries the raw number for triage.
+  // Clamp to 100% — the chip is a "till the next auto-compact" gauge,
+  // not a "how many times over" counter.
   const pctUsed = threshold > 0
     ? Math.max(0, Math.min(100, Math.round((used / threshold) * 100)))
     : 0;
 
-  let dotCls = "bg-accent/40";
-  let textCls = "text-text";
-  let borderCls = "border-border/60 bg-elevated/60";
-  if (compacting) {
-    dotCls = "bg-accent animate-pulse-soft";
-    textCls = "text-accent";
-    borderCls = "border-accent/40 bg-accent/[0.06]";
-  } else if (pctUsed >= 90) {
-    dotCls = "bg-danger/80";
-    textCls = "text-danger";
-    borderCls = "border-danger/40 bg-danger/[0.06]";
-  } else if (pctUsed >= 60) {
-    dotCls = "bg-warn/80";
-    textCls = "text-warn";
-    borderCls = "border-warn/40 bg-warn/[0.05]";
-  }
-
+  // Color tier: compacting > danger > warn > calm.
+  const tier = compacting ? "accent"
+    : pctUsed >= 90 ? "danger"
+    : pctUsed >= 60 ? "warn"
+    : "calm";
+  const tierCls = {
+    calm:   { dot: "bg-accent/40",            text: "text-text",     border: "border-border/60 bg-elevated/60" },
+    warn:   { dot: "bg-warn/80",              text: "text-warn",     border: "border-warn/40 bg-warn/[0.05]" },
+    danger: { dot: "bg-danger/80",            text: "text-danger",   border: "border-danger/40 bg-danger/[0.06]" },
+    accent: { dot: "bg-accent animate-pulse-soft", text: "text-accent", border: "border-accent/40 bg-accent/[0.06]" },
+  }[tier];
   const label = compacting ? "Compacting…" : `${pctUsed}% used`;
 
-  // Popover body: full context + compact trail + cache split.
-  // The chip's "% used" label is computed against `used` (the
-  // NEW tokens — what the model has to actually think about
-  // this turn, net of cache). The popover unpacks the breakdown
-  // so the user can see "X new (this is the chip), Y cached
-  // (served from prefix, much cheaper), Z total prompt (the
-  // model was given Z tokens of context this turn)". The
-  // breakdown matters for users who want to know "why is the
-  // chip calm while the model call was big" — answer: most
-  // of it was cached.
-  const totalPrompt = used + cacheRead + cacheCreation;
-  const hitRate = totalPrompt > 0
-    ? Math.round((cacheRead / Math.max(1, totalPrompt)) * 100)
-    : 0;
+  // "New" is what's left of the total after subtracting cache fields.
+  // Avoids re-deriving `used - cacheRead - cacheCreation` inline twice.
+  const newTokens = Math.max(0, used - cacheRead - cacheCreation);
+  const hitRate = used > 0 ? Math.round((cacheRead / used) * 100) : 0;
 
   return (
     <div ref={wrapperRef} className="relative inline-flex shrink-0">
@@ -2377,53 +2307,35 @@ function ContextChip({
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         aria-haspopup="dialog"
-        className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border ${borderCls} px-2 py-0.5 font-sans backdrop-blur-sm transition hover:border-text/30`}
+        className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border ${tierCls.border} px-2 py-0.5 font-sans backdrop-blur-sm transition hover:border-text/30`}
         title="Click for context details"
       >
-        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
-        <span className={`text-tx-xs font-medium ${textCls}`}>{label}</span>
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tierCls.dot}`} />
+        <span className={`text-tx-xs font-medium ${tierCls.text}`}>{label}</span>
         {compactCount > 0 && !compacting && (
-          <span className="text-tx-xs text-text/50">
-            ·{compactCount}×
-          </span>
+          <span className="text-tx-xs text-text/50">·{compactCount}×</span>
         )}
       </button>
 
+      {/* Portal to <body> so the popover escapes the chat header's
+          backdrop-blur stacking context (the PlanPanel is a sibling
+          stacking context that paints over any absolute/fixed
+          overflow from the header otherwise). z-[60] is the highest
+          in the app — above help overlay z-30, deploy modal z-30,
+          name-conflict modal z-40. */}
       {open && createPortal(
         <div
           role="dialog"
           aria-label="Context usage details"
-          // RENDERED INTO document.body VIA PORTAL. This is the
-          // critical part: even with `position: fixed` and `z-[60]`,
-          // the popover is still DOM-descended from the chat
-          // header, which has `backdrop-blur-xl` (chrome-bar) and
-          // therefore creates its own CSS stacking context. Inside
-          // that context, z-60 is the top — but the PlanPanel
-          // (rendered as the header's next sibling, with its own
-          // `backdrop-blur-md` stacking context) paints ON TOP of
-          // the header's stacking context in document order. The
-          // browser paints the header's contents as one unit, then
-          // the PlanPanel's contents as the next unit — regardless
-          // of any z-index inside the header.
-          //
-          // createPortal escapes this: the popover DOM node lives
-          // directly under <body>, so it participates in the
-          // root stacking context. z-[60] is now globally top-of-
-          // stack, above the PlanPanel AND any other chrome
-          // (help overlay z-30, deploy modal z-30, name-conflict
-          // modal z-40). The popover is anchored via viewport
-          // coordinates from getBoundingClientRect() — independent
-          // of where in the DOM it actually renders.
           style={
             popPos
               ? { position: "fixed", top: popPos.top, right: popPos.right }
               : { position: "fixed", top: -9999, right: -9999, visibility: "hidden" as const }
           }
           className="z-[60] w-72 rounded-md border border-border bg-elevated/95 p-3 text-tx-xs text-text shadow-lift backdrop-blur-md"
-          // Stop the popover itself from registering a mousedown that
-          // the document-level click-outside listener would otherwise
-          // treat as "outside" and close. Clicks INSIDE the popover
-          // (e.g. selecting text) shouldn't dismiss it.
+          // Stop mousedown/touchstart from reaching the document
+          // click-outside listener (otherwise text selection inside
+          // the popover would dismiss it).
           onMouseDown={(e) => e.stopPropagation()}
           onTouchStart={(e) => e.stopPropagation()}
         >
@@ -2434,23 +2346,13 @@ function ContextChip({
             </p>
           ) : (
             <>
-              {/* Lead with the TOTAL prompt (what the chip measures
-                  + matches the per-turn "In 37k" stat the user sees
-                  in the chat footer), not the new-only portion. The
-                  chip's % is `used / threshold` where `used` IS the
-                  total prompt — and auto-compact triggers on the
-                  same number, so they're in lockstep. When the
-                  percentage hits 100%, the next LLM call sees the
-                  pre-compact prompt get summarised down BEFORE the
-                  model is invoked, then the chip drops to whatever
-                  the post-compact total is. */}
               <p className="mb-1.5 text-text/90">
                 <span className="font-medium">{fmt(used)}</span> total prompt this turn.
                 {" "}Auto-compact fires at <span className="font-medium">{fmt(threshold)}</span> (resets to 0% on the next call).
               </p>
               {(cacheRead > 0 || cacheCreation > 0) && (
                 <p className="mb-1.5 text-text/70">
-                  Breakdown: <span className="font-medium">{fmt(Math.max(0, used - cacheRead - cacheCreation))}</span> new
+                  Breakdown: <span className="font-medium">{fmt(newTokens)}</span> new
                   {cacheRead > 0 && <> · <span className="font-medium">{fmt(cacheRead)}</span> cache hits</>}
                   {cacheCreation > 0 && <> · <span className="font-medium">{fmt(cacheCreation)}</span> cache writes</>}
                   {hitRate > 0 && <> · <span className="font-medium">{hitRate}%</span> hit rate</>}
@@ -2467,9 +2369,6 @@ function ContextChip({
               )}
             </p>
           )}
-          <p className="mt-2 border-t border-border/40 pt-1.5 text-tx-[10px] text-text/40">
-            Click the chip again or press Esc to close.
-          </p>
         </div>,
         document.body,
       )}
