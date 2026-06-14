@@ -3596,11 +3596,19 @@ def _reload_caddy() -> None:
 
 
 def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
-    """Re-emit per-slug Caddy fragments for FULLSTACK apps. Static apps
-    don't need a fragment (the wildcard block handles them). Each
-    fragment declares a more-specific site block that Caddy matches
-    BEFORE the `*.ojas.karmacode.cloud` wildcard, declaring the
-    `/api/*` reverse_proxy to the per-app backend port.
+    """Re-emit per-slug Caddy fragments for EVERY running app (static
+    OR fullstack). The wildcard `*.ojas.karmacode.cloud` block in the
+    main Caddyfile does serve static apps, but only from
+    `/opt/ojas-apps/{labels.0}/` — and since fullstack apps keep their
+    static assets under `static/` (not the slug root), the wildcard
+    is incomplete on its own. Every running app gets a per-slug
+    fragment so Caddy can match the most-specific site block.
+
+    Static apps get a fragment rooted at `/opt/ojas-apps/<slug>/` with
+    SPA fallback and no `/api/*` reverse_proxy (no backend to talk
+    to). Fullstack apps get a fragment rooted at
+    `/opt/ojas-apps/<slug>/static` with the `/api/*` reverse_proxy
+    pointed at their per-app port.
 
     This function is idempotent: it writes every fragment fresh, so
     a port change or service_name change propagates without manual
@@ -3608,23 +3616,29 @@ def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
     included from the main Caddyfile via `import`."""
     OJAS_CADDY_ROUTES_DIR.mkdir(parents=True, exist_ok=True)
     apps_root = _resolve_apps_root_domain() or _resolve_public_domain() or "ojas.example.com"
+    # Fetch ALL deployed apps regardless of port/service_name so static
+    # apps (which have NULL for both) get a fragment too. The previous
+    # version filtered on `port IS NOT NULL AND service_name IS NOT
+    # NULL`, which excluded static apps and left them stuck on the
+    # in-flight "Deploying..." placeholder forever.
     with db._connect() as cx:   # noqa: SLF001
         if owner_user_id is None:
             rows = cx.execute(
                 "SELECT slug, port, service_name, state "
-                "FROM deployed_apps "
-                "WHERE port IS NOT NULL AND service_name IS NOT NULL"
+                "FROM deployed_apps"
             ).fetchall()
         else:
             rows = cx.execute(
                 "SELECT slug, port, service_name, state "
                 "FROM deployed_apps "
-                "WHERE port IS NOT NULL AND service_name IS NOT NULL "
-                "AND (owner_user_id = ? OR owner_user_id IS NULL)",
+                "WHERE (owner_user_id = ? OR owner_user_id IS NULL)",
                 (owner_user_id,),
             ).fetchall()
-    live_slugs = {r["slug"] for r in rows}
-    # Wipe stale fragments (deleted apps, no longer fullstack)
+    # Live slugs are the running ones; stopped ones get their
+    # fragment wiped so the user-facing URL falls through to the
+    # wildcard block (which serves the .paused/ shared page).
+    live_slugs = {r["slug"] for r in rows if r.get("state") == "running"}
+    # Wipe stale fragments (deleted apps, paused apps)
     for f in OJAS_CADDY_ROUTES_DIR.glob("*.caddy"):
         if f.stem not in live_slugs:
             try:
@@ -3633,24 +3647,26 @@ def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
                 pass
     for r in rows:
         r = dict(r)
-        target = OJAS_CADDY_ROUTES_DIR / f"{r['slug']}.caddy"
-        if r.get("state") == "stopped":
-            # Paused: serve the shared paused page (the wildcard block
-            # already does this for /<slug>/, so we don't need a fragment
-            # -- the wildcard will handle it via the /.paused/ fallback).
-            try:
-                target.unlink()
-            except OSError:
-                pass
+        if r.get("state") != "running":
+            # Paused or starting: no per-slug fragment. The wildcard
+            # block + /.paused/ + .paused/ in try_files chain handles
+            # paused apps.
             continue
-        # Live + fullstack: per-slug site block with /api/* reverse proxy
-        port = r["port"]
-        # NOTE: in Caddyfile syntax, the opening `{` of a site block
-        # MUST be on the SAME LINE as the site address. Putting it on
-        # the next line (as is common in Caddy JSON configs) is a
-        # syntax error in the Caddyfile parser. Hence the awkward
-        # formatting below.
-        target.write_text(f"""# Auto-generated for {r['slug']} (fullstack, state=running).
+        target = OJAS_CADDY_ROUTES_DIR / f"{r['slug']}.caddy"
+        port = r.get("port")
+        # Determine the shape: fullstack (has port+service_name) or
+        # static (neither). Each shape has its own fragment.
+        if port and r.get("service_name"):
+            # FULLSTACK: per-slug site block with /api/* reverse proxy
+            # NOTE: in Caddyfile syntax, the opening `{` of a site block
+            # MUST be on the SAME LINE as the site address. Putting it
+            # on the next line (as is common in Caddy JSON configs) is
+            # a syntax error in the Caddyfile parser. Hence the
+            # awkward formatting below. ALSO: the Caddyfile parser
+            # requires directives INSIDE a block to be on their own
+            # line, so the inner `tls { on_demand }` is multi-line, not
+            # the more common one-liner.
+            target.write_text(f"""# Auto-generated for {r['slug']} (fullstack, state=running).
 # Do not edit by hand. Regenerated by server/app.py:_regenerate_caddy_routes_for_user.
 #
 # The per-site `tls {{ on_demand }}` block is REQUIRED for new subdomains.
@@ -3705,6 +3721,36 @@ def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
     header @sw Cache-Control "no-store"
     @html path_regexp ^\\/$|\\.html$
     header @html Cache-Control "no-cache"
+}}
+""")
+        else:
+            # STATIC: per-slug site block with SPA fallback only. No
+            # `/api/*` reverse_proxy because there's no backend. The
+            # wildcard block's `{labels.0}` root would also work for
+            # static apps, but a per-slug fragment ensures Caddy
+            # matches THIS site block first (most-specific wins) and
+            # also gives us a single place to add custom headers /
+            # cache rules per app if we want to later.
+            target.write_text(f"""# Auto-generated for {r['slug']} (static, state=running).
+# Do not edit by hand. Regenerated by server/app.py:_regenerate_caddy_routes_for_user.
+{r['slug']}.{apps_root} {{
+    tls {{
+        on_demand
+    }}
+    encode gzip
+    root * /opt/ojas-apps/{r['slug']}
+    try_files {{path}} /index.html
+    file_server
+    header {{
+        X-Content-Type-Options "nosniff"
+    }}
+    @hashed path /assets/*
+    header @hashed Cache-Control "no-store, must-revalidate"
+    @sw path /sw.js
+    header @sw Cache-Control "no-store, must-revalidate"
+    @html path_regexp ^\\/$|\\.html$
+    header @html Cache-Control "no-store, must-revalidate"
+    header Cache-Control "no-store, must-revalidate"
 }}
 """)
     # Reload Caddy so it picks up the new fragment on its next request
@@ -4337,23 +4383,33 @@ async def _run_deploy_job(
         )
         _set_step(8, "done")
 
-        if is_fullstack and service_name and port:
-            # 9. caddy_regen — overwrite the eager placeholder with the
-            #    real /api/* reverse_proxy fragment. Caddy reload is
-            #    inside _regenerate_caddy_routes_for_user.
-            _set_step(9, "running")
-            try:
-                await loop.run_in_executor(
-                    None,
-                    lambda: _regenerate_caddy_routes_for_user(
-                        app_row.get("owner_user_id"),
-                    ),
-                )
-            except Exception as e:
-                _set_step(9, "failed", str(e)[:200])
-                raise
-            _set_step(9, "done")
+        # 9. caddy_regen — overwrite the eager placeholder from step 1
+        #    with the REAL per-slug fragment. _regenerate_caddy_routes_for_user
+        #    writes either a static-shaped fragment (rooted at the
+        #    app dir, no /api/* reverse_proxy) or a fullstack-shaped
+        #    fragment (rooted at <slug>/static with /api/* → 127.0.0.1:<port>)
+        #    based on the row's service_name/port. Crucially this runs
+        #    for BOTH static and fullstack apps — the previous version
+        #    gated it on `is_fullstack and service_name and port`, which
+        #    left static deploys with the "Deploying..." placeholder
+        #    serving the public URL forever (every static deploy since
+        #    the v1.1 pipeline was added hit this). The row in
+        #    deployed_apps looks "running" because step 8 wrote it,
+        #    but the URL 200s on the in-flight page.
+        _set_step(9, "running")
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: _regenerate_caddy_routes_for_user(
+                    app_row.get("owner_user_id"),
+                ),
+            )
+        except Exception as e:
+            _set_step(9, "failed", str(e)[:200])
+            raise
+        _set_step(9, "done")
 
+        if is_fullstack and service_name and port:
             # 9.5 prefetch_cert — fullstack apps use a per-slug Caddy
             #     site block with `tls { on_demand }`, which means
             #     Caddy only obtains the per-host Let's Encrypt cert
