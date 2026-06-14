@@ -222,16 +222,30 @@ export default function ChatPage() {
     setDebugEvents([]);
     setWsStatus("connecting");
     lastEventTsRef.current = 0;
+    // Reset the chip's per-session state. The new session's WS connect
+    // event will re-populate these from the server's persisted value.
+    setContextUsed(0);
+    setContextCompacting(false);
+    setContextCompactedNotes([]);
 
     let cancelled = false;
     (async () => {
       try {
-        const [events, gitInfo] = await Promise.all([
+        const [events, gitInfo, sessionInfo] = await Promise.all([
           sessionApi.events(sessionId),
           sessionApi.git(sessionId).catch(() => null),
+          sessionsApi.get(sessionId).catch(() => null),
         ]);
         if (cancelled) return;
         if (gitInfo) setGit(gitInfo);
+        // Seed the context chip from the session's persisted
+        // `last_context_used` so the user doesn't see "0% used" flash
+        // for a frame on refresh / session switch. The WS
+        // `context_update` event (or the persisted value on WS connect)
+        // will overwrite this if the LLM fires again.
+        if (sessionInfo?.last_context_used) {
+          setContextUsed(Number(sessionInfo.last_context_used));
+        }
         // Walk the event log in chronological order, folding into turns +
         // (if the log ends mid-turn) an in-progress currentTurn. Setting
         // currentTurn from the rebuild is what makes streaming RESUME on

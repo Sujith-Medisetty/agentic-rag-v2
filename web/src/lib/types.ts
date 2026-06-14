@@ -44,6 +44,10 @@ export interface Session {
   name: string;
   last_active_at: number;
   created_at: number;
+  // Last real `input_tokens` from the most recent LLM call. The chat
+  // page reads this on mount to seed the context chip synchronously,
+  // so the user doesn't see "0% used" flash before the WS event arrives.
+  last_context_used?: number | null;
 }
 
 export interface Message {

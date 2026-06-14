@@ -92,6 +92,10 @@ class SessionResponse(BaseModel):
  # The owner of this session. None on legacy rows; new sessions always
  # have it set.
  user_id: str | None = None
+ # Last real `input_tokens` from the most recent LLM call. Read by the
+ # chat page on mount so the context chip is populated synchronously
+ # with the page render (instead of flashing 0% until the WS connects).
+ last_context_used: int | None = None
 
 class ProcessResponse(BaseModel):
  pid: int
