@@ -334,6 +334,30 @@ class WebReporter(ProgressReporter):
             "compacting": bool(compacting),
         })
 
+    def context_compacted(
+        self,
+        *,
+        removed: int,
+        kept: int,
+        tokens_before: int,
+        tokens_after: int,
+        summary_preview: str = "",
+        threshold: int = 0,
+    ) -> None:
+        # Chat-visible event. See agents/reporter.py:context_compacted
+        # for the contract. The summary_preview is truncated to 280 chars
+        # upstream; we re-cap defensively here in case a future caller
+        # sends a longer string.
+        preview = (summary_preview or "")[:280]
+        self._pub("context_compacted", {
+            "removed":         int(removed),
+            "kept":            int(kept),
+            "tokens_before":   int(tokens_before),
+            "tokens_after":    int(tokens_after),
+            "summary_preview": preview,
+            "threshold":       int(threshold),
+        })
+
     def thinking_text(self, text: str, done: bool = False) -> None:
         if not text and not done:
             return

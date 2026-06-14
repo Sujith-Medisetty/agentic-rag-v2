@@ -75,6 +75,26 @@ class ProgressReporter:
         bar. `warning=True` means we're at the warn tier (~50K); `compacting=True`
         means the agent is currently summarising old messages."""
 
+    def context_compacted(
+        self,
+        *,
+        removed: int,
+        kept: int,
+        tokens_before: int,
+        tokens_after: int,
+        summary_preview: str = "",
+        threshold: int = 0,
+    ) -> None:
+        """Chat-visible notification when auto-compaction fires. The UI
+        renders this as a system message in the transcript with a one-line
+        summary of what was kept / summarised, so the user can SEE that
+        older turns were collapsed and what the agent now remembers about
+        them. The full summary is still in the conversation as a
+        HumanMessage — this event is the breadcrumb that says "look here
+        for what got summarised"."""
+
+    # ---- rich activity (Phase 2) --------------------------------------
+
     # ---- rich activity (Phase 2) --------------------------------------
     def todo_update(self, items: list[dict]) -> None:
         """Full current todo list after a TodoWrite call. Items are

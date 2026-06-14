@@ -752,6 +752,21 @@ def _repair_orphan_tool_calls(messages: list[BaseMessage]) -> list[BaseMessage]:
     return cleaned
 
 
+def _auto_compact_threshold_value() -> int:
+    """Read the auto-compact threshold for the chat-visible notification.
+
+    The threshold lives in memory.checkpointer (so the runtime override via
+    OJAS_AUTO_COMPACT_INPUT_TOKENS is respected) — we import lazily so this
+    module doesn't pull in checkpointer on every agents.nodes import. Returns
+    the default 50_000 if the import fails for any reason.
+    """
+    try:
+        from memory.checkpointer import _auto_compact_threshold
+        return int(_auto_compact_threshold())
+    except Exception:
+        return 50_000
+
+
 def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
     """Return a new list with oversized ToolMessage bodies replaced by a
     one-line pointer. Preserves the tool CALL (on the preceding AIMessage)
@@ -910,7 +925,7 @@ def node_agent(state: RunnerState) -> dict:
     # at full price — late fire, paid twice. See memory.checkpointer.maybe_compact
     # for the threshold + summary logic.
     from memory.checkpointer import maybe_compact, mask_old_observations
-    history, did_compact = maybe_compact(history)
+    history, did_compact, compact_info = maybe_compact(history)
     if did_compact:
         try:
             from agents.reporter import get_reporter
@@ -919,6 +934,19 @@ def node_agent(state: RunnerState) -> dict:
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
                 warning=False,
                 compacting=False,
+            )
+            # Chat-visible notification: tell the user what just happened.
+            # Without this, auto-compact is invisible — the user has no way
+            # to know older turns got summarised, or what's preserved in
+            # the summary block. The payload includes the summary preview
+            # so the user can see at a glance what the agent now remembers.
+            get_reporter().context_compacted(
+                removed=compact_info.get("removed", 0),
+                kept=compact_info.get("kept", 0),
+                tokens_before=compact_info.get("tokens_before", 0),
+                tokens_after=compact_info.get("tokens_after", 0),
+                summary_preview=compact_info.get("summary_preview", ""),
+                threshold=_auto_compact_threshold_value(),
             )
         except Exception:
             pass

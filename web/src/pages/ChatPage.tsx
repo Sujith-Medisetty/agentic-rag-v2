@@ -36,6 +36,22 @@ import type {
   CommitRecord, ToolEvent, TurnSummary, Turn, SessionTotals,
   TimelineBlock,
 } from "@/lib/types";
+
+// Chat-visible auto-compact breadcrumb. One per `context_compacted` event
+// (server-side `maybe_compact` in memory/checkpointer.py fires this when
+// the message list crosses the auto-compact threshold). Renders as a
+// collapsible system message in the transcript so the user can SEE that
+// older turns got summarised and what the agent now remembers about them.
+type ContextCompactedNote = {
+  id: string;
+  ts: number;
+  removed: number;
+  kept: number;
+  tokensBefore: number;
+  tokensAfter: number;
+  summaryPreview: string;
+  threshold: number;
+};
 import PlanPanel from "@/components/PlanPanel";
 import TurnCard, { ActiveTurnCard } from "@/components/TurnCard";
 import RunningTotals from "@/components/RunningTotals";
@@ -130,6 +146,10 @@ export default function ChatPage() {
   const [contextBudget, setContextBudget] = useState(200_000);
   const [contextCompacting, setContextCompacting] = useState(false);
   const [contextWarning, setContextWarning] = useState(false);
+  // Auto-compact breadcrumb list. Each entry corresponds to a `context_compacted`
+  // WS event and renders as a collapsible system message in the transcript
+  // so the user can see what was summarised when. Cleared on session switch.
+  const [contextCompactedNotes, setContextCompactedNotes] = useState<ContextCompactedNote[]>([]);
   // Follow-mode for the chat scroll: stick to bottom while new events
   // arrive UNLESS the user scrolls up to read. If they do, leave them where
   // they are and pop a floating "↓" button so they can catch back up on a
@@ -392,6 +412,26 @@ export default function ChatPage() {
         setContextUsed(used);
         setContextWarning(Boolean(p.warning));
         setContextCompacting(Boolean(p.compacting));
+        return;
+      }
+      case "context_compacted": {
+        // Chat-visible breadcrumb when auto-compaction fires. Renders as
+        // a system message in the transcript so the user can SEE that older
+        // turns got summarised (and what the agent now remembers about them),
+        // rather than compaction being a silent background process.
+        const removed = Number(p.removed ?? 0);
+        if (removed <= 0) return;
+        const note: ContextCompactedNote = {
+          id: `compact-${ev.ts}-${removed}-${Number(p.kept ?? 0)}`,
+          ts: ev.ts,
+          removed,
+          kept: Number(p.kept ?? 0),
+          tokensBefore: Number(p.tokens_before ?? 0),
+          tokensAfter:  Number(p.tokens_after  ?? 0),
+          summaryPreview: String(p.summary_preview ?? ""),
+          threshold: Number(p.threshold ?? 0),
+        };
+        setContextCompactedNotes((prev) => [...prev, note]);
         return;
       }
       case "token_update": {
@@ -1236,6 +1276,15 @@ export default function ChatPage() {
           {turns.map((t, i) => (
             <TurnCard key={t.id} turn={t} index={i} />
           ))}
+          {/* Auto-compact breadcrumbs — one per `context_compacted` event
+              the server has emitted this session. Rendered BELOW the
+              turns (and the active turn) so they appear in chronological
+              order, with the most recent compact at the bottom. Each
+              card is collapsible so the user can read the summary
+              preview or fold it away. */}
+          {contextCompactedNotes.map((n) => (
+            <ContextCompactedNoteCard key={n.id} note={n} />
+          ))}
           {currentTurn && (
             <ActiveTurnCard turn={currentTurn} index={turns.length} />
           )}
@@ -1724,8 +1773,21 @@ function ContextChip({
   const pct = budget > 0 ? Math.max(0, Math.min(100, Math.round((used / budget) * 100))) : 0;
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
-  // Tiers: < 60% calm (subtle accent dot), 60-69% accent (getting fuller),
-  // 70-89% warn/orange (getting full), 90%+ danger/red (almost out).
+  // The chip's primary purpose is to tell the user HOW CLOSE THEY ARE to
+  // the next auto-compact — not how close they are to a hard model limit
+  // (the model is 512K, way above what Ojas keeps live). Show the
+  // "to-compact" percent as the label so the user can act on it; the
+  // tooltip shows the full breakdown including the model's 200K soft
+  // quality window.
+  //
+  // We do not know the auto-compact threshold in the UI without it being
+  // passed down — the server's `context_update` already includes the
+  // message-list size, so the user-facing label is "X% ctx" where X is
+  // the local Python estimate of the message list. The tooltip explains
+  // what's actually being measured.
+  //
+  // Tiers: < 50% calm, 50-79% warn, 80-99% danger. Compacting is its
+  // own pulsing state.
   let dotCls = "bg-accent/40";
   let textCls = "text-text";
   let borderCls = "border-border/60 bg-elevated/60";
@@ -1733,17 +1795,14 @@ function ContextChip({
     dotCls = "bg-accent animate-pulse-soft";
     textCls = "text-accent";
     borderCls = "border-accent/40 bg-accent/[0.06]";
-  } else if (pct >= 90) {
+  } else if (pct >= 80) {
     dotCls = "bg-danger/80";
     textCls = "text-danger";
     borderCls = "border-danger/40 bg-danger/[0.06]";
-  } else if (pct >= 70) {
+  } else if (pct >= 50) {
     dotCls = "bg-warn/80";
     textCls = "text-warn";
     borderCls = "border-warn/40 bg-warn/[0.05]";
-  } else if (pct >= 60) {
-    dotCls = "bg-accent/80";
-    textCls = "text-accent";
   }
 
   const label = compacting
@@ -1756,11 +1815,69 @@ function ContextChip({
       title={
         compacting
           ? "Compacting context — summarising older turns to keep the session running"
-          : `Context used: ${fmt(used)} of ${fmt(budget)} tokens (${pct}%)${warning ? " — getting full" : ""}`
+          : `Live context: ${fmt(used)} of ~${fmt(budget)} soft quality window (${pct}%)\n` +
+            `Auto-compact fires at 50K (25% of the bar) to keep the model fast.\n` +
+            `The model itself supports up to 512K — the 200K window is a quality cap, not a hard limit.${warning ? "\nGetting full — auto-compact will fire on the next turn." : ""}`
       }
     >
       <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
       <span className={`text-tx-xs font-medium ${textCls}`}>{label}</span>
+    </div>
+  );
+}
+
+// ============================================================================
+// ContextCompactedNoteCard — collapsible system message rendered in the
+// chat transcript each time auto-compaction fires (one per
+// `context_compacted` WS event). Default state is folded — the user
+// expands to read the summary preview. Keeps the chat clean while still
+// giving a visible breadcrumb of WHAT got summarised WHEN.
+// ============================================================================
+
+function ContextCompactedNoteCard({ note }: { note: ContextCompactedNote }) {
+  const [open, setOpen] = useState(false);
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
+  const freed = Math.max(0, note.tokensBefore - note.tokensAfter);
+
+  return (
+    <div className="mt-2 flex justify-start">
+      <div className="max-w-[92%] rounded-md border border-accent/30 bg-accent/[0.04] text-text">
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-tx-xs"
+          title={open ? "Hide auto-compact details" : "Show what was summarised"}
+        >
+          <span className="text-accent">📦</span>
+          <span className="font-medium text-text/90">
+            Auto-compacted context
+          </span>
+          <span className="text-text/60">
+            · summarised {note.removed} older message{note.removed === 1 ? "" : "s"} ({fmt(freed)} tokens freed)
+            · kept {note.kept} recent
+          </span>
+          <span className="ml-auto text-text/50">
+            {open ? "▾" : "▸"}
+          </span>
+        </button>
+        {open && (
+          <div className="border-t border-accent/20 px-3 py-2 text-tx-xs text-text/80">
+            <p className="mb-1.5 text-text/60">
+              Threshold: {fmt(note.threshold || 50_000)} tokens. Before: {fmt(note.tokensBefore)}. After: {fmt(note.tokensAfter)}.
+            </p>
+            {note.summaryPreview ? (
+              <pre className="whitespace-pre-wrap rounded bg-elevated/60 p-2 font-sans text-text/80">
+                {note.summaryPreview}{note.summaryPreview.length >= 280 ? "…" : ""}
+              </pre>
+            ) : (
+              <p className="text-text/50">No preview captured for this compaction.</p>
+            )}
+            <p className="mt-1.5 text-text/50">
+              The full summary is in the conversation as a hidden HumanMessage — the agent can re-read it any time.
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

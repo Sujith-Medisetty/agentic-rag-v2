@@ -518,7 +518,7 @@ def _compact_messages(messages: list) -> list:
     return [HumanMessage(content=continuation)] + to_keep
 
 
-def maybe_compact(messages: list) -> tuple[list, bool]:
+def maybe_compact(messages: list) -> tuple[list, bool, dict]:
     """Compact the message list NOW if it crosses the auto-compaction threshold.
 
     Called by the agent loop BEFORE `model.invoke(messages)`, so the turn that
@@ -526,22 +526,56 @@ def maybe_compact(messages: list) -> tuple[list, bool]:
     the giant one. The old `put()`-time check fired AFTER the LLM had already
     been billed for the full history — late fire, paid twice.
 
-    Returns `(messages, did_compact)`. If `did_compact` is True, the caller
-    should publish a `compacting` event to the UI.
+    Returns `(messages, did_compact, info)`. `info` is empty when no
+    compaction happened. When compaction did happen, `info` carries the
+    structured payload for the chat-visible `context_compacted` event:
+      - removed (int): messages summarised away
+      - kept (int): messages kept verbatim
+      - tokens_before (int): local estimate of the message-list size before
+      - tokens_after (int): same, after
+      - summary_preview (str): first 280 chars of the summary that was
+        injected as a HumanMessage, so the user can SEE what the agent
+        now remembers about the earlier turns.
     """
     if len(messages) <= _preserve_recent():
-        return messages, False
+        return messages, False, {}
     if _estimate_tokens(messages) < _auto_compact_threshold():
-        return messages, False
+        return messages, False, {}
+    tokens_before = _estimate_tokens(messages)
     compacted = _compact_messages(messages)
     removed = len(messages) - len(compacted)
     if removed <= 0:
-        return messages, False
+        return messages, False, {}
+    tokens_after = _estimate_tokens(compacted)
+
+    # Pull the first 280 chars of the summary block for the chat-visible
+    # message. The full summary is in the conversation as a HumanMessage
+    # — the user can always scroll up to read it, but a one-line preview
+    # in the chat header tells them WHAT got summarised at a glance.
+    summary_preview = ""
+    if compacted and isinstance(compacted[0], HumanMessage):
+        first = compacted[0].content if isinstance(compacted[0].content, str) else ""
+        # Strip the "this session is being continued…" preamble and
+        # the "Recent messages are preserved verbatim" tail — both are
+        # noise for the chat-visible preview. Just keep the summary body.
+        if "Summary:" in first:
+            first = first.split("Summary:", 1)[1]
+        if "Recent messages are preserved verbatim" in first:
+            first = first.split("Recent messages are preserved verbatim", 1)[0]
+        summary_preview = first.strip()[:280]
+
+    info = {
+        "removed": removed,
+        "kept": len(compacted),
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
+        "summary_preview": summary_preview,
+    }
     print(
         f"\033[2m[auto-compact: {removed} messages summarised, "
         f"~{removed * 200} tokens freed]\033[0m"
     )
-    return compacted, True
+    return compacted, True, info
 
 
 class CompactingCheckpointer(SqliteSaver):
