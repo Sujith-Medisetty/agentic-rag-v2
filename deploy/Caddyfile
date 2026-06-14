@@ -67,6 +67,22 @@
     header Cache-Control "no-store, must-revalidate"
 }
 
+# --------------------------------------------------------------------------
+# Per-slug site blocks for FULLSTACK apps. Imported at server level
+# (NOT inside the wildcard site block) so each one becomes its own site
+# block that takes precedence over `*.ojas.karmacode.cloud` for matching
+# hostnames. server/app.py:_regenerate_caddy_routes_for_user writes
+# these on every fullstack deploy + toggle — a static-only app has no
+# fragment, so the wildcard block above handles it.
+#
+# Without this import, every fullstack deploy still SUCCEEDS (the row
+# is created, the systemd unit starts, the cert is fetched, the
+# per-slug fragment file is written to disk) but the URL returns 404
+# because Caddy's wildcard block is the only thing matching the
+# hostname, and it has no idea the per-slug fragment exists.
+# --------------------------------------------------------------------------
+import /etc/caddy/routes.d/*.caddy
+
 ojas.karmacode.cloud {
     # The frontend's built static files. The install script copies them here.
     root * /opt/ojas/web/dist
