@@ -1000,25 +1000,24 @@ def node_agent(state: RunnerState) -> dict:
     ai = _stream_model_call(llm, messages)
     _run_budget.record(ai)
 
-    # Publish the authoritative context-used value from the LLM response.
-    # The full prompt the model saw this turn is:
-    #   input_tokens + cache_creation + cache_read
-    # `input_tokens` alone undercounts by the cache portion (often 20-30K
-    # of cached system prompt + early history on mid-session turns).
-    # This is the only chip source — pre-LLM local estimates were
-    # removed because they drifted from this number and caused the chip
-    # to bounce. The persisted value in the sessions row is the same
-    # number we publish here, so the chip is stable on WS reconnect.
+    # Publish the context-used value to the chip. We use the LLM-reported
+    # `input_tokens` (the actual prompt size for THIS turn, which on
+    # Anthropic already INCLUDES the cache_read portion — i.e. the
+    # system prompt + history the model was handed, uncached +
+    # cache_read combined into one number for the prompt as a whole).
+    # We deliberately do NOT add `cache_creation` + `cache_read` on
+    # top — those are cache accounting fields, not "more context" the
+    # user added. Without this, the chip inflates by the static system
+    # prompt on every turn (a casual "hey man" chat can read as 30K
+    # because the system prompt is cached and gets re-counted).
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold
         _usage = getattr(ai, "usage_metadata", None) or {}
         _input = int(_usage.get("input_tokens", 0) or 0)
         if _input > 0:
-            _cc, _cr = _extract_cache_fields(_usage)
-            _total = _input + _cc + _cr
             get_reporter().context_update(
-                used_tokens=_total,
+                used_tokens=_input,
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
                 compacting=False,
                 threshold=int(_auto_compact_threshold()),
