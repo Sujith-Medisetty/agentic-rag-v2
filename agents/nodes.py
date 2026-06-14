@@ -1001,35 +1001,67 @@ def node_agent(state: RunnerState) -> dict:
     _run_budget.record(ai)
 
     # Publish the context-used value to the chip. We use the LLM-reported
-    # `input_tokens` (the actual prompt size for THIS turn, which on
-    # Anthropic already INCLUDES the cache_read portion — i.e. the
-    # system prompt + history the model was handed, uncached +
-    # cache_read combined into one number for the prompt as a whole).
-    # We deliberately do NOT add `cache_creation` + `cache_read` on
-    # top — those are cache accounting fields, not "more context" the
-    # user added. Without this, the chip inflates by the static system
-    # prompt on every turn (a casual "hey man" chat can read as 30K
-    # because the system prompt is cached and gets re-counted).
+    # `input_tokens` MINUS cache_read MINUS cache_creation, so the chip
+    # shows the *new tokens* the model actually has to process this turn.
+    # Different providers report the total prompt size with different
+    # semantics:
+    #
+    #   - Anthropic native: `input_tokens` is the UNCACHED portion only;
+    #     `cache_read_input_tokens` and `cache_creation_input_tokens`
+    #     are reported separately.
+    #   - OpenAI standard + MiniMax-M3 (as ChatOpenAI): `input_tokens`
+    #     is the TOTAL prompt (uncached + cache_read + cache_creation
+    #     combined). The cache fields live in `input_token_details.
+    #     cache_read` / `cache_creation` (or `prompt_tokens_details.
+    #     cached_tokens` for vanilla OpenAI).
+    #
+    # We can't know which shape the current provider returns without
+    # inspecting both the input_tokens number AND the cache fields.
+    # Pragmatic fix: subtract cache_read + cache_creation when they're
+    # present and non-zero. If a provider reports `input_tokens` as
+    # uncached-only (Anthropic shape), subtracting the cache fields
+    # would under-count; we therefore ONLY subtract when the cache
+    # fields are POSITIVE — which is a strong signal the provider is
+    # reporting the total in `input_tokens` (no point reporting a
+    # `cache_read` field if `input_tokens` is already net-of-cache).
+    #
+    # Without this, the chip inflates by the static system prompt on
+    # every turn (a casual "hi" chat reads as 76k because the
+    # system prompt + 9 prior turns of history are all served from
+    # cache, and the provider's total-prompt number counts them
+    # again). With this, the chip honestly shows the *new* tokens
+    # the model had to think about this turn.
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold, record_llm_input_tokens
         _usage = getattr(ai, "usage_metadata", None) or {}
-        _input = int(_usage.get("input_tokens", 0) or 0)
-        if _input > 0:
+        _input_total = int(_usage.get("input_tokens", 0) or 0)
+        # Compute the actual NEW tokens billed this turn. If the
+        # provider didn't surface cache fields, _input_total is
+        # already the new tokens (Anthropic shape) and we use it as-is.
+        _cache_creation, _cache_read = _extract_cache_fields(_usage)
+        if _cache_read > 0 or _cache_creation > 0:
+            _input_new = max(0, _input_total - _cache_read - _cache_creation)
+        else:
+            _input_new = _input_total
+        if _input_new > 0:
             get_reporter().context_update(
-                used_tokens=_input,
+                used_tokens=_input_new,
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
                 compacting=False,
                 threshold=int(_auto_compact_threshold()),
+                cache_read=_cache_read,
+                cache_creation=_cache_creation,
             )
             # Stash for maybe_compact() to use as the primary trigger
-            # on the next turn. The chip and the trigger now share
-            # the same number — when the chip goes red, auto-compact
-            # will fire on the next turn. See memory.checkpointer for
-            # why the local _estimate_tokens was structurally incapable
-            # of catching the real prompt size (system prompt + tool
-            # defs + JSON envelope = ~5.6× the local char-based count).
-            record_llm_input_tokens(_input)
+            # on the next turn. We use the NEW-token number here too
+            # so the chip and the trigger stay in lockstep — when the
+            # chip goes red (>=100% of threshold), auto-compact will
+            # fire on the next turn. Before this fix, the trigger
+            # used the inflated total and fired constantly on a
+            # 5-message session because the system prompt alone
+            # "looked like" 25k tokens.
+            record_llm_input_tokens(_input_new)
     except Exception:
         pass
 

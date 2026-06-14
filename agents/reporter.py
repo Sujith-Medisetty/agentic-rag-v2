@@ -70,13 +70,25 @@ class ProgressReporter:
         warning: bool = False,
         compacting: bool = False,
         threshold: int = 0,
+        cache_read: int = 0,
+        cache_creation: int = 0,
     ) -> None:
         """Published on context-changing events (after each LLM call, around
         auto-compaction) so the UI can show a Claude Code-style "75% used"
         bar. `warning=True` means we're at the warn tier (~50K); `compacting=True`
         means the agent is currently summarising old messages. `threshold` is
         the auto-compact threshold (50K default) so the chip can show
-        "X% to compact" against the right denominator."""
+        "X% to compact" against the right denominator.
+
+        `used_tokens` is the NEW (uncached + writes) tokens the model
+        had to process this turn — not the total prompt including
+        cache hits. Use `cache_read` + `cache_creation` to surface
+        the cached fraction in the UI tooltip ("X new, Y cache hits"),
+        so the user can see when a long session is being kept cheap
+        by the prompt cache. Without this split, the chip would
+        inflate by the entire static system prompt on every turn
+        (a 5-turn session reading as 76k tokens of "context used"
+        just because the prefix keeps hitting cache)."""
 
     def context_compacted(
         self,

@@ -154,6 +154,14 @@ export default function ChatPage() {
   // Auto-compact threshold (50K default) — the chip shows "X% used"
   // against this denominator.
   const [contextThreshold, setContextThreshold] = useState(50_000);
+  // Most recent prompt-cache split. The chip's tooltip uses these
+  // to show "X new · Y cache hits" so a 76k chip can be read as
+  // "7k new, 69k cache hits" — without this, a long session
+  // running at 95% cache hit rate looks like 95% context used
+  // when really only 5% is fresh. 0 / 0 when the provider
+  // doesn't surface cache fields.
+  const [contextCacheRead, setContextCacheRead] = useState(0);
+  const [contextCacheCreation, setContextCacheCreation] = useState(0);
   // Auto-compact breadcrumb list. Each entry corresponds to a `context_compacted`
   // WS event and renders as a collapsible system message in the transcript
   // so the user can see what was summarised when. Cleared on session switch.
@@ -240,6 +248,8 @@ export default function ChatPage() {
     // event will re-populate these from the server's persisted value.
     setContextUsed(0);
     setContextCompacting(false);
+    setContextCacheRead(0);
+    setContextCacheCreation(0);
     setContextCompactedNotes([]);
 
     let cancelled = false;
@@ -494,16 +504,30 @@ export default function ChatPage() {
         return;
       }
       case "context_update": {
-        // Server publishes this after every LLM call. `used_tokens` is the
-        // real `input + cache_creation + cache_read` from the provider, so
-        // the chip matches the actual context window. `threshold` (50K
-        // default) is what the chip's "% used" denominator uses.
+        // Server publishes this after every LLM call. `used_tokens` is
+        // the NEW (uncached + writes) tokens the model actually
+        // processed this turn — the chip's "% used" denominator
+        // matches the real context burden (NOT the inflated total
+        // including cache hits, which would have a "hi" turn read
+        // as 76k because the static system prompt is cache-served
+        // on every call). `threshold` (50K default) is the
+        // auto-compact threshold.
+        //
+        // We also surface `cache_read` + `cache_creation` so the
+        // chip tooltip can show "X new, Y cache hits" — without
+        // that split, the user can't tell whether a high
+        // percentage is genuine context pressure or just the
+        // system prompt being re-counted from cache every turn.
         const used = Number(p.used_tokens ?? 0);
         const threshold = Number(p.threshold ?? 0);
+        const cacheRead = Number(p.cache_read ?? 0);
+        const cacheCreation = Number(p.cache_creation ?? 0);
         if (used <= 0) return;
         if (threshold > 0) setContextThreshold(threshold);
         setContextUsed(used);
         setContextCompacting(Boolean(p.compacting));
+        setContextCacheRead(cacheRead);
+        setContextCacheCreation(cacheCreation);
         return;
       }
       case "context_compacted": {
@@ -1376,6 +1400,8 @@ export default function ChatPage() {
                 return newest ? Math.max(0, newest.tokensBefore - newest.tokensAfter) : 0;
               })()
             }
+            cacheRead={contextCacheRead}
+            cacheCreation={contextCacheCreation}
           />
           <button
             type="button"
@@ -2012,6 +2038,7 @@ function rebuildTranscript(events: LiveEvent[]): {
 
 function ContextChip({
   used, threshold, compacting, compactCount, lastCompactSavedTokens,
+  cacheRead, cacheCreation,
 }: {
   used: number;
   threshold: number;
@@ -2023,6 +2050,14 @@ function ContextChip({
   // growth.
   compactCount: number;
   lastCompactSavedTokens: number;
+  // Most recent prompt-cache split. The chip's tooltip surfaces
+  // these as "X new · Y cache hits" so the user can see whether
+  // a high % used is genuine context pressure (lots of new
+  // tokens) or just the static system prompt being re-served
+  // from cache (lots of cache hits, almost no new tokens).
+  // 0 / 0 when the provider doesn't surface cache fields.
+  cacheRead: number;
+  cacheCreation: number;
 }) {
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
@@ -2049,16 +2084,30 @@ function ContextChip({
 
   const label = compacting ? "Compacting…" : `${pctUsed}% used`;
 
-  // Tooltip: full context + compact trail. The user can hover to
-  // confirm "the chip is currently at 153% because the most recent
-  // LLM call had 76k tokens, but we compacted 7 times earlier and
-  // this is the post-compact input — without those compactions
-  // this would be 250k+".
+  // Tooltip: full context + compact trail + cache split. The user
+  // can hover to confirm "the chip is currently at 14% because
+  // the most recent LLM call had 7k NEW tokens, 69k of which
+  // were served from the prompt cache; we also compacted 7
+  // times earlier so the underlying message list is small".
   const tooltipLines: string[] = [];
   if (compacting) {
     tooltipLines.push("Compacting context — summarising older turns to keep the session running");
   } else {
-    tooltipLines.push(`Context: ${fmt(used)} used. Auto-compact fires at ${fmt(threshold)}.`);
+    tooltipLines.push(
+      `Context: ${fmt(used)} new (uncached + writes). `
+      + `Auto-compact fires at ${fmt(threshold)}.`
+    );
+  }
+  if (cacheRead > 0 || cacheCreation > 0) {
+    const parts: string[] = [];
+    parts.push(`${fmt(cacheRead)} cache hits`);
+    if (cacheCreation > 0) parts.push(`${fmt(cacheCreation)} cache writes`);
+    const total = cacheRead + cacheCreation;
+    if (total > 0) {
+      const hitRate = Math.round((cacheRead / total) * 100);
+      parts.push(`(${hitRate}% cache hit rate)`);
+    }
+    tooltipLines.push(parts.join(" · "));
   }
   if (compactCount > 0) {
     tooltipLines.push(

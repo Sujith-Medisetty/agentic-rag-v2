@@ -343,17 +343,27 @@ class WebReporter(ProgressReporter):
         warning: bool = False,
         compacting: bool = False,
         threshold: int = 0,
+        cache_read: int = 0,
+        cache_creation: int = 0,
     ) -> None:
-        # Only emit the fields the chip actually reads. `used_tokens` is
-        # `input + cache_creation + cache_read` from the provider — the
-        # authoritative context-window size. `threshold` is the auto-compact
-        # ceiling (50K default) that the chip's "% used" denominator uses.
-        # Persist `used_tokens` so the chip shows the same number on WS
-        # reconnect as it does mid-turn (single-row UPDATE per turn).
+        # `used_tokens` is the *new* (uncached + writes) tokens the
+        # model processed this turn — already net of cache_read and
+        # cache_creation. The chip reads this as the "% used"
+        # denominator. We also surface the cache split so the UI
+        # can show "X new, Y cache hits" — without that, a long
+        # session running at 95% cache hit rate looks like 95%
+        # context used when really only 5% of the prompt is fresh.
+        # `threshold` is the auto-compact ceiling (50K default).
+        # Persist `used_tokens` so the chip shows the same number on
+        # WS reconnect as it does mid-turn (single-row UPDATE per
+        # turn). We also persist the cache fields so a reconnect
+        # mid-turn can show the same "X new, Y cache hits" split.
         self._pub("context_update", {
-            "used_tokens": int(used_tokens),
-            "compacting": bool(compacting),
-            "threshold": int(threshold),
+            "used_tokens":   int(used_tokens),
+            "compacting":    bool(compacting),
+            "threshold":     int(threshold),
+            "cache_read":    int(cache_read or 0),
+            "cache_creation": int(cache_creation or 0),
         })
         try:
             db.set_session_context_used(self.session_id, int(used_tokens))
