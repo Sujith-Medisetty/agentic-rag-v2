@@ -1012,6 +1012,32 @@ def node_agent(state: RunnerState) -> dict:
     ai = _stream_model_call(llm, messages)
     _run_budget.record(ai)
 
+    # Publish the AUTHORITATIVE context-used value from the LLM response —
+    # `usage.input_tokens` is the real prompt size the provider billed us
+    # for, i.e. exactly what was sitting in the context window for this
+    # turn. The pre-LLM estimate we sent above is local and may drift from
+    # the provider's count (especially after masking/stripping the
+    # post-mask message size no longer reflects the original token weight).
+    # Using the provider number makes the chip monotonic within a session:
+    # it ticks UP turn over turn, and drops only when auto-compact fires.
+    try:
+        from agents.reporter import get_reporter
+        from memory.checkpointer import _auto_compact_threshold
+        _usage = getattr(ai, "usage_metadata", None) or {}
+        _real_input = int(_usage.get("input_tokens", 0) or 0)
+        if _real_input > 0:
+            _compact_threshold = int(_auto_compact_threshold())
+            _warn_threshold = int(CONTEXT_WINDOW_TOKENS * 0.25)  # 50K of 200K
+            get_reporter().context_update(
+                used_tokens=_real_input,
+                budget_tokens=CONTEXT_WINDOW_TOKENS,
+                warning=_real_input >= _warn_threshold,
+                compacting=False,
+                threshold=_compact_threshold,
+            )
+    except Exception:
+        pass
+
     # If we had to repair, surface the repaired messages back into LangGraph
     # state so subsequent turns / checkpoints see the cleaned history. Using
     # RemoveMessage + re-add would be cleaner, but LangGraph's default `add`
