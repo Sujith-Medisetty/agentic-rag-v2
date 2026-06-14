@@ -132,6 +132,18 @@ export default function ChatPage() {
   // one deploy at a time per session), so we attribute progress
   // events to this ref. Cleared when the session changes.
   const lastClickedUpdateSlugRef = useRef<string | null>(null);
+  // Debounce handle for the live "/detected-dist" re-fetch. The
+  // build banner + per-pill "Update" button read from
+  // `lastDetected`, but the original code only re-fetched it on
+  // turn_summary + deploy_complete — so a 10-step `npm run build`
+  // could finish, the turn end, and the Update button wouldn't
+  // appear until the next refresh. Triggering a re-fetch on every
+  // file_changed (for files that look like a dist build artifact) +
+  // every bash tool_done is correct but chatty, so we debounce
+  // 500ms after the last trigger — N events collapse into ONE
+  // /detected-dist GET, so a long build costs exactly one server
+  // scan at the end. Cleared on session switch.
+  const detectedDistRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // "Build ready" detection — set when the session has a built dist
   // newer than the most recent deploy FROM this session. The chat
   // shows a banner under the agent's last turn when true, and the
@@ -203,6 +215,13 @@ export default function ChatPage() {
     // (which don't carry a slug) can be attributed to the slug the
     // user just clicked Update on. Resets when the session changes.
     lastClickedUpdateSlugRef.current = null;
+    // Cancel any pending debounced /detected-dist re-fetch from a
+    // previous session — we don't want a stale timer from session A
+    // firing setLastDetected for session B.
+    if (detectedDistRefreshTimerRef.current) {
+      clearTimeout(detectedDistRefreshTimerRef.current);
+      detectedDistRefreshTimerRef.current = null;
+    }
     setDeployProgress({});
     // HARD RESET all per-session state synchronously BEFORE any async load.
     // Without this, switching from session A to session B mid-turn left A's
@@ -365,11 +384,46 @@ export default function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
+  // ---- Live /detected-dist refresh --------------------------------------
+  // The build banner + per-pill "Update" button read from
+  // `lastDetected`, but the original code only re-fetched it on
+  // turn_summary + deploy_complete. So a 10-step `npm run build`
+  // could finish, the turn end, and the Update button wouldn't
+  // appear until the next refresh. Triggered on:
+  //   - file_changed whose path looks like a dist build artifact
+  //     (rare — agents usually edit source, but a deliberate edit
+  //     of dist/index.html or dist/assets/* should still update live)
+  //   - tool_done for bash commands (covers `npm run build` and
+  //     every other build tool that writes through the shell)
+  // Debounced 500ms after the last trigger so a 10-event build
+  // collapses into ONE server scan. The endpoint is cheap (O(workspace
+  // scan)) so this is the lowest-risk place to be "always live".
+  function scheduleDetectedDistRefresh(reason: string) {
+    if (!sessionId) return;
+    if (detectedDistRefreshTimerRef.current) {
+      clearTimeout(detectedDistRefreshTimerRef.current);
+    }
+    detectedDistRefreshTimerRef.current = setTimeout(() => {
+      detectedDistRefreshTimerRef.current = null;
+      const sid = sessionId;
+      sessionApi
+        .detectedDist(sid)
+        .then((d) => {
+          // Race guard: sessionId may have changed while the
+          // fetch was in flight (user navigated to a different
+          // session). The next setLastDetected would clobber the
+          // NEW session's value, so check first.
+          if (sid !== sessionId) return;
+          setLastDetected(d);
+        })
+        .catch(() => { /* best-effort; turn_summary still re-fetches */ });
+    }, 500);
+  }
+
   // Apply ONE event to current state. Pure function over (turns, currentTurn,
   // plan) — but expressed as setter calls because React state is split.
   function handleEvent(ev: LiveEvent) {
     const p = ev.payload as Record<string, any>;
-
     switch (ev.kind) {
       // --- Plan (turn-independent) ---
       case "todo_update": {
@@ -663,6 +717,15 @@ export default function ChatPage() {
           }
           return { ...curr, tools: patchToolList(curr.tools) };
         });
+        // Live Update-button refresh: bash tool_done covers the common
+        // case of `npm run build` / `vite build` / `next build` / etc.
+        // rewriting dist/. Source-file edits route through
+        // file_changed below instead, so this only fires for shell
+        // invocations — which is exactly where the dist mtime actually
+        // changes. Debounced 500ms via scheduleDetectedDistRefresh.
+        if (toolName === "bash" && !aid) {
+          scheduleDetectedDistRefresh("tool_done:bash");
+        }
         return;
       }
 
@@ -684,6 +747,23 @@ export default function ChatPage() {
             kind: "file", file: fc,
           }],
         } : curr);
+        // Live Update-button refresh: a file_changed that lands inside
+        // a dist build output (e.g. a deliberate edit of
+        // dist/index.html, or a tool the agent uses to write built
+        // assets) should bump the candidate's mtime the same way
+        // `npm run build` would. The check is intentionally narrow
+        // — /dist/ or /build/ segments in the path — to avoid
+        // triggering a scan for every source-file edit (those
+        // typically don't change dist mtime, and turn_summary's
+        // re-fetch covers them). Debounced 500ms.
+        const fcPath = fc.path;
+        if (
+          fcPath &&
+          (fcPath.includes("/dist/") || fcPath.includes("/build/") ||
+           fcPath.endsWith("/dist") || fcPath.endsWith("/build"))
+        ) {
+          scheduleDetectedDistRefresh("file_changed:dist");
+        }
         return;
       }
 

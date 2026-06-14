@@ -1012,7 +1012,7 @@ def node_agent(state: RunnerState) -> dict:
     # because the system prompt is cached and gets re-counted).
     try:
         from agents.reporter import get_reporter
-        from memory.checkpointer import _auto_compact_threshold
+        from memory.checkpointer import _auto_compact_threshold, record_llm_input_tokens
         _usage = getattr(ai, "usage_metadata", None) or {}
         _input = int(_usage.get("input_tokens", 0) or 0)
         if _input > 0:
@@ -1022,6 +1022,14 @@ def node_agent(state: RunnerState) -> dict:
                 compacting=False,
                 threshold=int(_auto_compact_threshold()),
             )
+            # Stash for maybe_compact() to use as the primary trigger
+            # on the next turn. The chip and the trigger now share
+            # the same number — when the chip goes red, auto-compact
+            # will fire on the next turn. See memory.checkpointer for
+            # why the local _estimate_tokens was structurally incapable
+            # of catching the real prompt size (system prompt + tool
+            # defs + JSON envelope = ~5.6× the local char-based count).
+            record_llm_input_tokens(_input)
     except Exception:
         pass
 

@@ -122,12 +122,29 @@ class SessionBus:
                         f"+{payload.get('output_delta',0)} out"
                     )
                 elif kind == "context_update":
-                    pct = payload.get("percent", 0)
+                    # The payload carries `used_tokens` + `threshold`; the
+                    # chip's "% used" denominator is the auto-compact
+                    # threshold (50K default), not the model context
+                    # window. Show BOTH so the trace line is actually
+                    # useful for triaging "is the chip in sync with the
+                    # LLM-reported value" — the previous label read
+                    # `payload.get('percent', 0)` which the publisher
+                    # never populates, so the trace was a permanent
+                    # `0% of 200,000` regardless of the real number.
+                    used = int(payload.get("used_tokens", 0) or 0)
+                    threshold = int(payload.get("threshold", 0) or 0)
+                    pct_of_threshold = (
+                        f"{round(used / threshold * 100)}%" if threshold > 0 else "?"
+                    )
+                    budget = payload.get("budget_tokens")
+                    budget_s = f" / {int(budget):,}" if budget else ""
                     flags = []
-                    if payload.get("warning"): flags.append("warn")
                     if payload.get("compacting"): flags.append("COMPACTING")
                     flag_s = f" [{','.join(flags)}]" if flags else ""
-                    preview = f"{pct}% of {payload.get('budget_tokens',0):,}{flag_s}"
+                    preview = (
+                        f"{pct_of_threshold} of {threshold:,} threshold"
+                        f" (used={used:,}{budget_s}){flag_s}"
+                    )
                 elif kind == "turn_summary":
                     preview = (
                         f"tools={payload.get('tools_used')} "

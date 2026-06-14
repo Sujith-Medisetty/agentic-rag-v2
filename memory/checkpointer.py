@@ -15,11 +15,35 @@ old messages → continue.
 
 import json
 import os
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
+
+# The LLM-reported input_tokens from the most recent call. Set by
+# nodes.py after each streamed model call. Used by maybe_compact() as
+# the PRIMARY trigger for auto-compaction. Why: the local
+# `_estimate_tokens(messages)` is a naive `len//4` estimator that
+# misses three large fixed costs the LLM actually pays for on every
+# call:
+#   1. The system prompt (~3-5K tokens, NOT in the messages list)
+#   2. The tool-definition schema list (~2-3K tokens, NOT in messages)
+#   3. JSON envelope wrapping on every tool_use / tool_result block
+#      (id, type, role markers) — measured at ~3-5× the estimator's
+#      per-message count for code-generation sessions.
+# In a real Calculator App Build session the estimator said 15,716
+# tokens while the LLM was actually getting 87,906 — a 5.6×
+# underestimate. The chip's "% used" was driven by the LLM's number
+# (correct), so it showed 176% — but maybe_compact never fired
+# because the local estimate stayed under the 50K threshold. This
+# contextvar bridges that gap: trust the LLM's own count when we
+# have one (i.e. after the first turn), fall back to the local
+# estimate only for the very first call.
+_LAST_LLM_INPUT_TOKENS: ContextVar[int] = ContextVar(
+    "ojas_last_llm_input_tokens", default=0,
+)
 
 # --- Auto-compaction thresholds ---
 # COMPACT_BUDGET: when estimated message-list tokens cross this, auto-compact
@@ -518,6 +542,25 @@ def _compact_messages(messages: list) -> list:
     return [HumanMessage(content=continuation)] + to_keep
 
 
+def record_llm_input_tokens(input_tokens: int) -> None:
+    """Called by nodes.py after each LLM call. Stores the LLM-reported
+    `input_tokens` so maybe_compact() can use it as the primary trigger.
+
+    Pass 0 or a negative value to clear (e.g. on a session restart)."""
+    try:
+        _LAST_LLM_INPUT_TOKENS.set(max(0, int(input_tokens)))
+    except (TypeError, ValueError):
+        _LAST_LLM_INPUT_TOKENS.set(0)
+
+
+def _last_llm_input_tokens() -> int:
+    """The LLM-reported input_tokens from the most recent call in this
+    context (request thread). 0 if no call has happened yet — in which
+    case maybe_compact falls back to the local character-based
+    estimate."""
+    return _LAST_LLM_INPUT_TOKENS.get()
+
+
 def maybe_compact(messages: list) -> tuple[list, bool, dict]:
     """Compact the message list NOW if it crosses the auto-compaction threshold.
 
@@ -539,8 +582,22 @@ def maybe_compact(messages: list) -> tuple[list, bool, dict]:
     """
     if len(messages) <= _preserve_recent():
         return messages, False, {}
-    if _estimate_tokens(messages) < _auto_compact_threshold():
-        return messages, False, {}
+
+    # Primary trigger: the LLM's own reported input_tokens from the
+    # most recent call. This is the same number the chat chip shows
+    # as "% used", so the two stay in lockstep — when the chip goes
+    # red (>=90%), auto-compact will fire on the next turn. Falls
+    # back to the local estimate for the very first turn (no LLM
+    # call has happened yet, so we have no input_tokens to compare).
+    threshold = _auto_compact_threshold()
+    last_input = _last_llm_input_tokens()
+    if last_input > 0:
+        if last_input < threshold:
+            return messages, False, {}
+    else:
+        # First-turn path: no LLM call yet, use the local estimator.
+        if _estimate_tokens(messages) < threshold:
+            return messages, False, {}
     tokens_before = _estimate_tokens(messages)
     compacted = _compact_messages(messages)
     removed = len(messages) - len(compacted)
