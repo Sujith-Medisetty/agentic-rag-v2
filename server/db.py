@@ -321,6 +321,13 @@ def _migrate_sessions(cx: sqlite3.Connection) -> None:
     additions = [
         ("user_id",          "TEXT REFERENCES users(id) ON DELETE CASCADE"),
         ("workspace_subdir", "TEXT"),
+        # Persisted context-fill state — the last real `input_tokens` from
+        # the most recent LLM call (incl. cache_read + cache_creation). Read
+        # back on WS connect so the chip shows the same number whether the
+        # user just opened the page or just got a response. Replaces the old
+        # local-estimate publish in app.py that gave the user a different
+        # number on page load vs mid-task.
+        ("last_context_used", "INTEGER"),
     ]
     for name, decl in additions:
         if name not in cols:
@@ -631,6 +638,20 @@ def touch_session(session_id: str) -> None:
         cx.execute(
             "UPDATE sessions SET last_active_at = ? WHERE id = ?",
             (_now(), session_id),
+        )
+
+
+def set_session_context_used(session_id: str, used_tokens: int) -> None:
+    """Persist the most recent real `input_tokens` for this session, so
+    the chip shows the same number on WS reconnect as it does mid-turn.
+    Called from the post-LLM publish path. Cheap (single UPDATE) and
+    idempotent — safe to call every turn."""
+    if used_tokens <= 0:
+        return
+    with _connect() as cx:
+        cx.execute(
+            "UPDATE sessions SET last_context_used = ? WHERE id = ?",
+            (int(used_tokens), session_id),
         )
 
 

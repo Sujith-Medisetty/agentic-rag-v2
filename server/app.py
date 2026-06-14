@@ -2631,52 +2631,26 @@ async def stream(websocket: WebSocket, session_id: str):
     if not bus.is_bound():
         bus.bind_loop(asyncio.get_running_loop())
     bus.subscribe(websocket)
-    # Emit an initial context_update so the header chip + bottom bar show
-    # immediately on connect (not just on the first LLM call of the next
-    # turn). The estimate is computed from the LATEST LangGraph checkpoint's
-    # `messages` channel — that's where the actual conversation history
-    # lives (the server.db stores only session metadata, not chat content).
+    # Emit an initial context_update so the header chip shows immediately on
+    # connect (not just on the first LLM call of the next turn). The value
+    # comes from the last real `input_tokens` we persisted in this session's
+    # row — same number the user saw mid-task, so the chip doesn't snap to
+    # a different value on page load. A fresh session with no LLM call yet
+    # has no persisted value; we just skip the publish and the chip stays
+    # hidden until the first LLM response.
     try:
         from memory.checkpointer import (
-            _estimate_tokens, CONTEXT_WINDOW_TOKENS,
+            _auto_compact_threshold, CONTEXT_WINDOW_TOKENS,
         )
-        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-        from pathlib import Path as _P
-        import sqlite3 as _sq
-        ckpt_db = _P.home() / ".agent" / "checkpoints.db"
-        if ckpt_db.exists():
-            # `thread_id` in checkpoints.db == `session_id` in our app —
-            # the langgraph thread is the conversation's stable id.
-            _cx = _sq.connect(str(ckpt_db))
-            _cx.row_factory = _sq.Row
-            try:
-                row = _cx.execute(
-                    "SELECT checkpoint FROM checkpoints "
-                    "WHERE thread_id = ? "
-                    "ORDER BY checkpoint_id DESC LIMIT 1",
-                    (session_id,),
-                ).fetchone()
-            finally:
-                _cx.close()
-            if row and row["checkpoint"]:
-                try:
-                    ckp = JsonPlusSerializer().loads_typed(
-                        ("msgpack", row["checkpoint"])
-                    )
-                except Exception:
-                    ckp = None
-                if isinstance(ckp, dict):
-                    msgs = ckp.get("channel_values", {}).get("messages", [])
-                    if isinstance(msgs, list) and msgs:
-                        used = _estimate_tokens(msgs)
-                        warn = int(CONTEXT_WINDOW_TOKENS * 0.25)
-                        bus.publish("context_update", {
-                            "used_tokens":  used,
-                            "budget_tokens": CONTEXT_WINDOW_TOKENS,
-                            "percent": round(used / CONTEXT_WINDOW_TOKENS * 100, 1) if CONTEXT_WINDOW_TOKENS else 0,
-                            "warning":  used >= warn,
-                            "compacting": False,
-                        })
+        persisted = db.get_session(session_id)
+        if persisted and persisted.get("last_context_used"):
+            used = int(persisted["last_context_used"])
+            bus.publish("context_update", {
+                "used_tokens":  used,
+                "budget_tokens": CONTEXT_WINDOW_TOKENS,
+                "compacting": False,
+                "threshold": int(_auto_compact_threshold()),
+            })
     except Exception:
         # Don't let an initial-context hiccup break the WS upgrade
         pass

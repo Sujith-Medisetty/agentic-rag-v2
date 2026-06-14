@@ -322,19 +322,26 @@ class WebReporter(ProgressReporter):
         self,
         *,
         used_tokens: int,
-        budget_tokens: int,
+        budget_tokens: int = 0,
         warning: bool = False,
         compacting: bool = False,
         threshold: int = 0,
     ) -> None:
+        # Only emit the fields the chip actually reads. `used_tokens` is
+        # `input + cache_creation + cache_read` from the provider — the
+        # authoritative context-window size. `threshold` is the auto-compact
+        # ceiling (50K default) that the chip's "% used" denominator uses.
+        # Persist `used_tokens` so the chip shows the same number on WS
+        # reconnect as it does mid-turn (single-row UPDATE per turn).
         self._pub("context_update", {
             "used_tokens": int(used_tokens),
-            "budget_tokens": int(budget_tokens),
-            "percent": round(used_tokens / budget_tokens * 100, 1) if budget_tokens else 0,
-            "warning": bool(warning),
             "compacting": bool(compacting),
             "threshold": int(threshold),
         })
+        try:
+            db.set_session_context_used(self.session_id, int(used_tokens))
+        except Exception:
+            pass
 
     def context_compacted(
         self,

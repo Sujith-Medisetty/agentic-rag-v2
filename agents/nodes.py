@@ -927,20 +927,19 @@ def node_agent(state: RunnerState) -> dict:
     from memory.checkpointer import maybe_compact, mask_old_observations
     history, did_compact, compact_info = maybe_compact(history)
     if did_compact:
+        # Chat-visible notification: tell the user what just happened.
+        # Without this, auto-compact is invisible — the user has no way
+        # to know older turns got summarised, or what's preserved in
+        # the summary block. The payload includes the summary preview
+        # so the user can see at a glance what the agent now remembers.
+        # We DON'T publish a redundant `context_update` here — the
+        # post-LLM publish below is the single source of truth for the
+        # chip's used-tokens number. Pre-LLM local estimates have
+        # drifted from the provider's real number in the past (no
+        # system prompt in the local count, mask/strip just ran) and
+        # caused the chip to bounce.
         try:
             from agents.reporter import get_reporter
-            get_reporter().context_update(
-                used_tokens=_estimate_msg_tokens(history),
-                budget_tokens=CONTEXT_WINDOW_TOKENS,
-                warning=False,
-                compacting=False,
-                threshold=_auto_compact_threshold_value(),
-            )
-            # Chat-visible notification: tell the user what just happened.
-            # Without this, auto-compact is invisible — the user has no way
-            # to know older turns got summarised, or what's preserved in
-            # the summary block. The payload includes the summary preview
-            # so the user can see at a glance what the agent now remembers.
             get_reporter().context_compacted(
                 removed=compact_info.get("removed", 0),
                 kept=compact_info.get("kept", 0),
@@ -1001,24 +1000,15 @@ def node_agent(state: RunnerState) -> dict:
     ai = _stream_model_call(llm, messages)
     _run_budget.record(ai)
 
-    # Publish the AUTHORITATIVE context-used value from the LLM response —
-    # `usage.input_tokens` is the real prompt size the provider billed us
-    # for, i.e. exactly what was sitting in the context window for this
-    # turn. The pre-LLM estimate we sent above is local and may drift from
-    # the provider's count (especially after masking/stripping the
-    # post-mask message size no longer reflects the original token weight).
-    # Publish the AUTHORITATIVE context-used value from the LLM response.
-    # The total tokens the model actually saw this turn is:
-    #   input_tokens  (the new, uncached input)
-    # + cache_creation_input_tokens  (tokens just written to cache)
-    # + cache_read_input_tokens  (tokens served from cache, often the
-    #                              entire static system prompt + early
-    #                              history — a large chunk on mid-session
-    #                              turns that we'd otherwise miss)
-    # `input_tokens` alone undercounts dramatically. Use the sum so the
-    # chip matches the real context window the model processed. Result
-    # is monotonic within a session: ticks UP turn over turn, drops only
-    # when auto-compact fires.
+    # Publish the authoritative context-used value from the LLM response.
+    # The full prompt the model saw this turn is:
+    #   input_tokens + cache_creation + cache_read
+    # `input_tokens` alone undercounts by the cache portion (often 20-30K
+    # of cached system prompt + early history on mid-session turns).
+    # This is the only chip source — pre-LLM local estimates were
+    # removed because they drifted from this number and caused the chip
+    # to bounce. The persisted value in the sessions row is the same
+    # number we publish here, so the chip is stable on WS reconnect.
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold
@@ -1027,14 +1017,11 @@ def node_agent(state: RunnerState) -> dict:
         if _input > 0:
             _cc, _cr = _extract_cache_fields(_usage)
             _total = _input + _cc + _cr
-            _compact_threshold = int(_auto_compact_threshold())
-            _warn_threshold = int(CONTEXT_WINDOW_TOKENS * 0.25)  # 50K of 200K
             get_reporter().context_update(
                 used_tokens=_total,
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
-                warning=_total >= _warn_threshold,
                 compacting=False,
-                threshold=_compact_threshold,
+                threshold=int(_auto_compact_threshold()),
             )
     except Exception:
         pass

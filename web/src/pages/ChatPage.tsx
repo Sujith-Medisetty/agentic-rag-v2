@@ -143,11 +143,9 @@ export default function ChatPage() {
   // Context-used progress for the bottom-of-chat bar. Updated by `context_update`
   // WS events. 0 means "no data yet" (don't render the bar).
   const [contextUsed, setContextUsed] = useState(0);
-  const [contextBudget, setContextBudget] = useState(200_000);
   const [contextCompacting, setContextCompacting] = useState(false);
-  const [contextWarning, setContextWarning] = useState(false);
-  // Auto-compact threshold (50K default) — the chip shows "X% used" against
-  // this denominator, NOT the 200K soft quality window.
+  // Auto-compact threshold (50K default) — the chip shows "X% used"
+  // against this denominator.
   const [contextThreshold, setContextThreshold] = useState(50_000);
   // Auto-compact breadcrumb list. Each entry corresponds to a `context_compacted`
   // WS event and renders as a collapsible system message in the transcript
@@ -404,20 +402,15 @@ export default function ChatPage() {
         return;
       }
       case "context_update": {
-        // Cumulative context-used % so the bottom bar can show "78% used" in
-        // Claude Code style. Published by the server after every LLM call and
-        // around auto-compaction. `warning` = at the warn tier. `compacting`
-        // = summarisation is happening right now. `threshold` = the
-        // auto-compact threshold (50K default); the chip uses this as the
-        // denominator for the "X% used" label.
-        const used  = Number(p.used_tokens  ?? 0);
-        const budget = Number(p.budget_tokens ?? 0);
+        // Server publishes this after every LLM call. `used_tokens` is the
+        // real `input + cache_creation + cache_read` from the provider, so
+        // the chip matches the actual context window. `threshold` (50K
+        // default) is what the chip's "% used" denominator uses.
+        const used = Number(p.used_tokens ?? 0);
         const threshold = Number(p.threshold ?? 0);
         if (used <= 0) return;
-        if (budget > 0) setContextBudget(budget);
         if (threshold > 0) setContextThreshold(threshold);
         setContextUsed(used);
-        setContextWarning(Boolean(p.warning));
         setContextCompacting(Boolean(p.compacting));
         return;
       }
@@ -1172,9 +1165,7 @@ export default function ChatPage() {
         <div className="flex items-center gap-2 justify-self-end">
           <ContextChip
             used={contextUsed}
-            budget={contextBudget}
             threshold={contextThreshold}
-            warning={contextWarning}
             compacting={contextCompacting}
           />
           <button
@@ -1761,37 +1752,27 @@ function rebuildTranscript(events: LiveEvent[]): {
 }
 
 // ============================================================================
-// ContextChip — compact "X% context" pill in the chat header (right zone).
-// Always visible (when we have a value) so the user can see the fill state
-// at any moment — fresh session, mid-turn, idle between turns. The dot color
-// gives the fill state at a glance:
-//   < 60%       → calm (low usage, room left)
-//   60-89%      → warn (orange, getting full, compaction may fire soon)
-//   90%+        → danger (red, almost out)
+// ContextChip — compact "X% used" pill in the chat header. Shows the % of
+// the auto-compact threshold (50K default) that's currently filled. The
+// number ticks UP as the context grows, and 100% is the moment
+// auto-compaction fires. Color tiers at a glance:
+//   < 60%       → calm
+//   60-89%      → warn (orange)
+//   90%+        → danger (red)
 //   compacting  → pulsing accent dot, label reads "Compacting…"
-//
-// Hidden until the server has sent at least one context_update event for the
-// session (so the chip doesn't pop in for a fresh empty chat).
+// Hidden until the server sends at least one context_update event.
 // ============================================================================
 
 function ContextChip({
-  used, budget, threshold, warning, compacting,
-}: { used: number; budget: number; threshold: number; warning: boolean; compacting: boolean }) {
+  used, threshold, compacting,
+}: { used: number; threshold: number; compacting: boolean }) {
   if (!used && !compacting) return null;
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
-  // The chip shows percent USED against the auto-compact threshold (50K
-  // default). The number ticks UP as the context fills, and 100% is the
-  // moment auto-compaction fires — same model as Claude Code's "75% used".
-  // The model budget (200K) is irrelevant here; we surface only the
-  // compact threshold because that's the operational ceiling the user
-  // cares about.
   const pctUsed = threshold > 0
     ? Math.max(0, Math.min(999, Math.round((used / threshold) * 100)))
     : 0;
 
-  // Tiers: < 60% calm, 60-89% warn, 90%+ danger. Compacting is its own
-  // pulsing state.
   let dotCls = "bg-accent/40";
   let textCls = "text-text";
   let borderCls = "border-border/60 bg-elevated/60";
@@ -1809,9 +1790,7 @@ function ContextChip({
     borderCls = "border-warn/40 bg-warn/[0.05]";
   }
 
-  const label = compacting
-    ? "Compacting…"
-    : `${pctUsed}% used`;
+  const label = compacting ? "Compacting…" : `${pctUsed}% used`;
 
   return (
     <div
@@ -1819,7 +1798,7 @@ function ContextChip({
       title={
         compacting
           ? "Compacting context — summarising older turns to keep the session running"
-          : `Context: ${fmt(used)} used. Auto-compact fires at ${fmt(threshold)} (${pctUsed}% there).${warning ? " Getting full." : ""}`
+          : `Context: ${fmt(used)} used. Auto-compact fires at ${fmt(threshold)}.`
       }
     >
       <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
