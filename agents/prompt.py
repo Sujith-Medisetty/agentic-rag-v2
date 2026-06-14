@@ -432,6 +432,28 @@ def get_ojas_app_rules_section() -> str:
         "`frontend/src/components/install-button.tsx`. Replace "
         "`frontend/src/App.tsx` with your UI. Same `base: './'` rule on Vite.",
         "",
+        "CRITICAL — REPLACE the starter `App.tsx` AND its `<Dashboard />`. "
+        "The fullstack template's `frontend/src/App.tsx` ships with `return "
+        "<Dashboard />;` and that Dashboard does `fetch(\\`${API}/items\\`)`. "
+        "If you keep it, the user opens the deployed app and sees **\"Could "
+        "not reach the backend: HTTP 404\"** — the salon/calculator/weather/ "
+        "whatever backend doesn't expose `/api/items`, so the Dashboard 404s "
+        "on the very first render. This is the #1 cause of \"the app "
+        "deployed but the UI is broken\". The fix is mandatory and three-step:\n"
+        "  1. Build your real UI (calendar grid, calculator, todo list, "
+        "weather card — whatever the user asked for). Do NOT keep the "
+        "starter Dashboard. The template's `<Dashboard />` is a working "
+        "example wired to `/api/items`; it has no place in a real app.\n"
+        "  2. Replace `frontend/src/App.tsx` so it returns YOUR UI "
+        "component, not `<Dashboard />`. If the file still says `import "
+        "Dashboard from \"@/components/dashboard\"` and `return <Dashboard />` "
+        "after your build, you forgot.\n"
+        "  3. Either delete `frontend/src/components/dashboard.tsx` (cleanest) "
+        "or leave it as dead code — but the *import in App.tsx* is what "
+        "actually mounts it. If the import is gone, the 404 is gone.\n"
+        "Same rule for the static template's `<SectionsExample />` / "
+        "`<ProductExample />` — those are placeholders, not your UI.",
+        "",
         "## 4. Storage rule — localStorage is for tiny UI prefs only",
         "",
         "When you DO build a static app, do NOT default to localStorage "

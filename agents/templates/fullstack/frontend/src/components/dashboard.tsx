@@ -219,7 +219,21 @@ export default function Dashboard() {
       const data: Item[] = await res.json();
       setItems(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load items.");
+      // 404 means the starter Dashboard is still mounted in App.tsx and
+      // the user's real backend doesn't expose /api/items. Surface a
+      // clear "the agent forgot to replace App.tsx" hint instead of a
+      // generic "backend down" — the agent prompt has a CRITICAL rule
+      // about this; this fallback is the second line of defence.
+      const msg = err instanceof Error ? err.message : "Failed to load items.";
+      if (/404/.test(msg)) {
+        setError(
+          "This Dashboard is the template's starter example (it calls /api/items). " +
+          "If you see this, the agent's real UI was never wired into App.tsx — " +
+          "edit frontend/src/App.tsx to render your actual component instead of <Dashboard />."
+        );
+      } else {
+        setError(msg);
+      }
     } finally {
       setLoading(false);
     }
