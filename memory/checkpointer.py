@@ -47,16 +47,18 @@ _LAST_LLM_INPUT_TOKENS: ContextVar[int] = ContextVar(
 
 # --- Auto-compaction thresholds ---
 # COMPACT_BUDGET: when estimated message-list tokens cross this, auto-compact
-# fires BEFORE the next LLM call. Lowered from 80K → 50K (with a UI warning
-# tier at 25% of CONTEXT_WINDOW) so the live window stays lean for the
-# 30+ turn salon-build sessions — the long tail of edits otherwise piles
-# up and we'd be re-sending the same stale file contents on every call.
+# fires BEFORE the next LLM call. Default 80K so the chip's "% used" stays
+# in the calm/warn range for normal sessions (35-45k prompts read as
+# 44-56% rather than 70-90%), and compactions only fire on the genuinely
+# over-stuffed sessions. At 50K (the prior default) the chip was hitting
+# 100% on every tool-heavy turn because system prompt + tool defs alone
+# are ~16K and a few file-edits push the rest over the threshold.
 #
 # CONTEXT_WINDOW: the working context the LLM can actually reason over. Used
 # for the UI context-used percentage bar — Claude Code-style "75% used"
 # indicator. MiniMax-M3-512k nominally fits 512K, but quality holds up to
 # ~200K. Tune via env if needed.
-DEFAULT_AUTO_COMPACT_INPUT_TOKENS = 50_000
+DEFAULT_AUTO_COMPACT_INPUT_TOKENS = 80_000
 AUTO_COMPACT_THRESHOLD_ENV_VAR = "OJAS_AUTO_COMPACT_INPUT_TOKENS"  # was CLAUDE_CODE_…
 AUTO_COMPACT_THRESHOLD_LEGACY_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 CONTEXT_WINDOW_TOKENS = 200_000  # what the UI's 100% fill represents
