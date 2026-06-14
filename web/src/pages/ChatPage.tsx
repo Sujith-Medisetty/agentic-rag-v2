@@ -2084,33 +2084,31 @@ function ContextChip({
 
   const label = compacting ? "Compacting…" : `${pctUsed}% used`;
 
-  // Tooltip: full context + compact trail + cache split. The user
-  // can hover to confirm "the chip is currently at 14% because
-  // the most recent LLM call had 7k NEW tokens, 69k of which
-  // were served from the prompt cache; we also compacted 7
-  // times earlier so the underlying message list is small".
+  // Tooltip: full context + compact trail + cache split. The
+  // chip's "% used" label is computed against `used` (the NEW
+  // tokens — what the model has to actually think about this
+  // turn, net of cache). The tooltip unpacks the breakdown so
+  // the user can see "X new (this is the chip), Y cached
+  // (served from prefix, much cheaper), Z total prompt (the
+  // model was given Z tokens of context this turn)". The
+  // breakdown matters for users who want to know "why is the
+  // chip calm while the model call was big" — answer: most
+  // of it was cached.
   const tooltipLines: string[] = [];
   if (compacting) {
     tooltipLines.push("Compacting context — summarising older turns to keep the session running");
   } else {
-    // The chip label uses `used` as-is (the TOTAL prompt size =
-    // input + cache_read + cache_creation), because that's what
-    // the user thinks of as "how full is my context". The
-    // tooltip below unpacks that into new vs cached so the user
-    // can see whether the high number is genuine pressure or
-    // just static prefix re-served from cache.
-    const newTokens = Math.max(0, used - cacheRead - cacheCreation);
+    const totalPrompt = used + cacheRead + cacheCreation;
     tooltipLines.push(
-      `Context: ${fmt(used)} total (model's prompt this turn). `
+      `Context: ${fmt(used)} new (uncached + writes). `
       + `Auto-compact fires at ${fmt(threshold)}.`
     );
-    if (newTokens > 0 || cacheRead > 0) {
-      const total = cacheRead + cacheCreation;
-      const hitRate = total > 0 ? Math.round((cacheRead / total) * 100) : 0;
+    if (totalPrompt > used || cacheRead > 0) {
+      const hitRate = totalPrompt > 0
+        ? Math.round((cacheRead / Math.max(1, totalPrompt)) * 100)
+        : 0;
       tooltipLines.push(
-        `${fmt(newTokens)} new · ${fmt(cacheRead)} cache hits`
-        + (cacheCreation > 0 ? ` · ${fmt(cacheCreation)} cache writes` : "")
-        + (hitRate > 0 ? ` (${hitRate}% cache hit rate)` : "")
+        `Total prompt this turn: ${fmt(totalPrompt)} (${fmt(cacheRead)} cache hits${cacheCreation > 0 ? `, ${fmt(cacheCreation)} cache writes` : ""}${hitRate > 0 ? `, ${hitRate}% hit rate` : ""})`
       );
     }
   }

@@ -345,25 +345,29 @@ class WebReporter(ProgressReporter):
         threshold: int = 0,
         cache_read: int = 0,
         cache_creation: int = 0,
+        input_total: int = 0,
     ) -> None:
         # `used_tokens` is the *new* (uncached + writes) tokens the
         # model processed this turn — already net of cache_read and
-        # cache_creation. The chip reads this as the "% used"
-        # denominator. We also surface the cache split so the UI
-        # can show "X new, Y cache hits" — without that, a long
-        # session running at 95% cache hit rate looks like 95%
-        # context used when really only 5% of the prompt is fresh.
-        # `threshold` is the auto-compact ceiling (50K default).
-        # Persist `used_tokens` so the chip shows the same number on
-        # WS reconnect as it does mid-turn (single-row UPDATE per
-        # turn). We also persist the cache fields so a reconnect
-        # mid-turn can show the same "X new, Y cache hits" split.
+        # cache_creation. The chip's "% used" label is computed
+        # against `threshold` from this number, so a "hi" turn on a
+        # session running at 99.8% cache hit rate shows ~0% (only
+        # 136 new tokens) instead of 154% (the cache-inflated
+        # total). The auto-compact trigger uses the same number, so
+        # chip and trigger stay in lockstep.
+        #
+        # `input_total` is the full prompt size (used_tokens +
+        # cache_read + cache_creation) — included in the event so
+        # the chip tooltip can show "X new · Y cache hits"
+        # without the LABEL being the inflated number. 0 if the
+        # provider didn't surface cache fields.
         self._pub("context_update", {
             "used_tokens":   int(used_tokens),
             "compacting":    bool(compacting),
             "threshold":     int(threshold),
             "cache_read":    int(cache_read or 0),
             "cache_creation": int(cache_creation or 0),
+            "input_total":   int(input_total or 0),
         })
         try:
             db.set_session_context_used(self.session_id, int(used_tokens))

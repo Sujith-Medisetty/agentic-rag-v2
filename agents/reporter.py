@@ -72,6 +72,7 @@ class ProgressReporter:
         threshold: int = 0,
         cache_read: int = 0,
         cache_creation: int = 0,
+        input_total: int = 0,
     ) -> None:
         """Published on context-changing events (after each LLM call, around
         auto-compaction) so the UI can show a Claude Code-style "75% used"
@@ -82,13 +83,17 @@ class ProgressReporter:
 
         `used_tokens` is the NEW (uncached + writes) tokens the model
         had to process this turn — not the total prompt including
-        cache hits. Use `cache_read` + `cache_creation` to surface
-        the cached fraction in the UI tooltip ("X new, Y cache hits"),
-        so the user can see when a long session is being kept cheap
-        by the prompt cache. Without this split, the chip would
-        inflate by the entire static system prompt on every turn
-        (a 5-turn session reading as 76k tokens of "context used"
-        just because the prefix keeps hitting cache)."""
+        cache hits. The chip's "% used" label is computed against
+        `threshold` from this number, so a "hi" turn on a session
+        running at 99.8% cache hit rate shows ~0% (only 136 new
+        tokens) instead of 154% (the cache-inflated total).
+
+        `input_total` is the full prompt size (used_tokens +
+        cache_read + cache_creation) — included in the event so
+        the chip tooltip can show the cache split ("X new · Y
+        cache hits") without the label being the inflated
+        number. Pass 0 if the provider didn't surface cache
+        fields (Anthropic shape, where used_tokens IS the total)."""
 
     def context_compacted(
         self,
