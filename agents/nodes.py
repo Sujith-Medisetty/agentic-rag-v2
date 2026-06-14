@@ -892,6 +892,10 @@ def node_agent(state: RunnerState) -> dict:
     checkpointed boundary (tool results already delivered). Re-running the same
     thread_id resumes from here with a fresh budget — no crash, no lost work.
     """
+    # Plumb session_id from state into the local scope so we can pass
+    # it to maybe_compact / record_llm_input_tokens. See the comment
+    # in agents/state.py for why this is needed.
+    session_id = state.get("session_id") or ""
     pause = _run_budget.check()
     if pause is not None:
         from agents.reporter import get_reporter
@@ -936,7 +940,7 @@ def node_agent(state: RunnerState) -> dict:
     # at full price — late fire, paid twice. See memory.checkpointer.maybe_compact
     # for the threshold + summary logic.
     from memory.checkpointer import maybe_compact, mask_old_observations
-    history, did_compact, compact_info = maybe_compact(history)
+    history, did_compact, compact_info = maybe_compact(history, session_id=session_id)
     if did_compact:
         # Chat-visible notification: tell the user what just happened.
         # Without this, auto-compact is invisible — the user has no way
@@ -1103,8 +1107,12 @@ def node_agent(state: RunnerState) -> dict:
             )
             # Auto-compact trigger uses the same total number.
             # When the chip goes red (>=100% of threshold),
-            # auto-compact fires on the next turn.
-            record_llm_input_tokens(_input_total)
+            # auto-compact fires on the next turn. Pass
+            # `session_id` so the value is keyed in the cross-turn
+            # module dict — without it the per-context ContextVar
+            # would reset to 0 at the start of the next turn and
+            # the primary trigger would never fire.
+            record_llm_input_tokens(_input_total, session_id=session_id)
     except Exception:
         pass
 

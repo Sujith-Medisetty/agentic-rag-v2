@@ -44,6 +44,15 @@ from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
 _LAST_LLM_INPUT_TOKENS: ContextVar[int] = ContextVar(
     "ojas_last_llm_input_tokens", default=0,
 )
+# Module-level cross-turn cache: session_id -> last reported LLM
+# input_tokens. The ContextVar above is per-context, and
+# `session_runner.run_turn` does `ctx = copy_context()` for every
+# turn before invoking the agent loop — so without this dict the
+# value would reset to 0 at the start of every turn and the
+# LLM-count-based auto-compact trigger would never fire. The DB
+# column `sessions.last_context_used` is the durable mirror; this
+# dict is the hot-path cache.
+_LAST_INPUT_TOKENS_BY_SESSION: dict[str, int] = {}
 
 # --- Auto-compaction thresholds ---
 # COMPACT_BUDGET: when estimated message-list tokens cross this, auto-compact
@@ -544,26 +553,49 @@ def _compact_messages(messages: list) -> list:
     return [HumanMessage(content=continuation)] + to_keep
 
 
-def record_llm_input_tokens(input_tokens: int) -> None:
+def record_llm_input_tokens(input_tokens: int, session_id: str | None = None) -> None:
     """Called by nodes.py after each LLM call. Stores the LLM-reported
     `input_tokens` so maybe_compact() can use it as the primary trigger.
 
-    Pass 0 or a negative value to clear (e.g. on a session restart)."""
+    Pass 0 or a negative value to clear (e.g. on a session restart).
+
+    Also writes to a module-level dict keyed by `session_id` so the
+    value survives ACROSS turns. The ContextVar
+    (_LAST_LLM_INPUT_TOKENS) is per-context, and `run_turn` does
+    `ctx = contextvars.copy_context()` for each turn — so the
+    ContextVar resets to 0 at the start of every turn, and the
+    primary "did the LLM just see > threshold tokens?" trigger
+    never fires. The module-level dict + (when session_id is
+    available) DB-persisted `sessions.last_context_used` is the
+    actual primary trigger; the ContextVar is kept for backwards
+    compat (some test paths still call it without a session_id).
+    """
+    value = 0
     try:
-        _LAST_LLM_INPUT_TOKENS.set(max(0, int(input_tokens)))
+        value = max(0, int(input_tokens))
     except (TypeError, ValueError):
-        _LAST_LLM_INPUT_TOKENS.set(0)
+        pass
+    _LAST_LLM_INPUT_TOKENS.set(value)
+    if session_id:
+        _LAST_INPUT_TOKENS_BY_SESSION[session_id] = value
 
 
-def _last_llm_input_tokens() -> int:
-    """The LLM-reported input_tokens from the most recent call in this
-    context (request thread). 0 if no call has happened yet — in which
-    case maybe_compact falls back to the local character-based
-    estimate."""
+def _last_llm_input_tokens(session_id: str | None = None) -> int:
+    """The LLM-reported input_tokens from the most recent call. 0 if no
+    call has happened yet — in which case maybe_compact falls back
+    to the local character-based estimate.
+
+    Reads from the per-session module dict first (cross-turn),
+    then falls back to the ContextVar (per-context, for tests
+    and code paths that call without a session_id)."""
+    if session_id:
+        v = _LAST_INPUT_TOKENS_BY_SESSION.get(session_id)
+        if v is not None:
+            return v
     return _LAST_LLM_INPUT_TOKENS.get()
 
 
-def maybe_compact(messages: list) -> tuple[list, bool, dict]:
+def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, bool, dict]:
     """Compact the message list NOW if it crosses the auto-compaction threshold.
 
     Called by the agent loop BEFORE `model.invoke(messages)`, so the turn that
@@ -591,8 +623,15 @@ def maybe_compact(messages: list) -> tuple[list, bool, dict]:
     # red (>=90%), auto-compact will fire on the next turn. Falls
     # back to the local estimate for the very first turn (no LLM
     # call has happened yet, so we have no input_tokens to compare).
+    # `session_id` is needed to read the cross-turn module-level
+    # cache; without it, we'd fall back to the per-context
+    # ContextVar which resets to 0 every turn (each `run_turn` does
+    # `copy_context()`). The local estimator underestimates by 5-6x
+    # (no system prompt, no tool defs, no JSON envelope), so a
+    # session genuinely above threshold can look "fine" by the local
+    # number — the LLM-count trigger is the only reliable one.
     threshold = _auto_compact_threshold()
-    last_input = _last_llm_input_tokens()
+    last_input = _last_llm_input_tokens(session_id)
     if last_input > 0:
         if last_input < threshold:
             return messages, False, {}

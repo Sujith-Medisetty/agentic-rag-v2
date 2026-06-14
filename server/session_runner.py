@@ -195,6 +195,14 @@ async def run_turn(
             "mode":            "auto",
             "iterations":      0,
             "max_iterations":  max_iterations,
+            # Plumb session_id into LangGraph state so node_agent can
+            # pass it to maybe_compact / record_llm_input_tokens.
+            # The auto-compact trigger uses an LLM-reported
+            # `input_tokens` value keyed by session_id; without this
+            # the value is per-context (resets to 0 every turn) and
+            # the trigger never fires — the chip just sits at 100%
+            # forever.
+            "session_id":      session_id,
         }
         for _ in runner_graph.stream(
             initial_state, config=config, stream_mode="updates",

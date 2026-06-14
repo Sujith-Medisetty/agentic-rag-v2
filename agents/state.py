@@ -31,3 +31,12 @@ class RunnerState(TypedDict, total=False):
  # Graceful-pause signalling (set when a run budget is hit; see nodes._RunBudget).
  paused: bool # True when the loop stopped on a budget, not completion
  pause_reason: dict # {"reason":..., "detail":...}
+
+ # Plumbed from session_runner.run_turn so the agent loop can
+ # key cross-turn state (e.g. maybe_compact's session-scoped
+ # cache) by session. Without this the auto-compact trigger
+ # can't tell "this turn was billed 80k tokens" from "no turn
+ # has happened yet" — it would always fall back to the local
+ # estimator, which underestimates by 5-6× and never trips the
+ # 80k threshold.
+ session_id: str
