@@ -270,6 +270,37 @@ async def run_turn(
         reporter.error("cancelled by user")
         reporter.assistant_text("", done=True)
         db.append_message(session_id, "assistant", "[cancelled by user]")
+
+        # Persist the user message that started this turn into the
+        # LangGraph state. Without this, a turn that was cancelled
+        # mid-stream leaves the state unchanged (no checkpoint was
+        # written during the LLM stream), so the user message that
+        # triggered the cancelled turn is LOST. The next turn reads
+        # the pre-cancel state and never sees the interrupted
+        # question — the LLM responds to the *prior* turn's context
+        # as if the user never typed anything.
+        #
+        # We do a minimal `update_state` with just the user message
+        # for two channels: `messages` (the add_messages reducer
+        # appends it to the existing accumulator) and `live_messages`
+        # (REPLACE reducer, so we read the current live_messages
+        # first, append, write back). This is best-effort: if the
+        # graph or checkpointer is in a wedged state we don't want
+        # the cancel-cleanup itself to fail.
+        try:
+            from agents.graph import runner_graph as _rg
+            _cfg = {"configurable": {"thread_id": session_id}}
+            _prior = _rg.get_state(_cfg)
+            _prior_live = list(_prior.values.get("live_messages") or [])
+            _rg.update_state(
+                _cfg,
+                {
+                    "messages": [HumanMessage(content=user_prompt)],
+                    "live_messages": _prior_live + [HumanMessage(content=user_prompt)],
+                },
+            )
+        except Exception:
+            pass
     except Exception as e:
         # Error path — surface the error, close the stream so the UI stops
         # showing "Thinking…", and persist a system message so the user
