@@ -186,8 +186,23 @@ async def run_turn(
                 (max_iterations * 2 + 10) if max_iterations > 0 else 100_000
             ),
         }
+        # Carry the new user message into BOTH the `messages` accumulator
+        # (via the add_messages reducer, which appends) AND `live_messages`
+        # (the per-turn LLM input source — default reducer is REPLACE).
+        # The previous turn's `live_messages` snapshot is the post-compact
+        # working set; we APPEND the new user message to it so the LLM
+        # actually sees the user's new question. Without this,
+        # `live_messages` stays stale across turns and the LLM call
+        # fires with the prior turn's context, responding to nothing.
+        prior_live: list = []
+        try:
+            prior_state = runner_graph.get_state(config)
+            prior_live = list(prior_state.values.get("live_messages") or [])
+        except Exception:
+            prior_live = []
         initial_state = {
             "messages":        [HumanMessage(content=user_prompt)],
+            "live_messages":   list(prior_live) + [HumanMessage(content=user_prompt)],
             "task":            user_prompt,
             "workspace":       workspace,
             "repo":            "",
