@@ -2635,20 +2635,37 @@ async def stream(websocket: WebSocket, session_id: str):
     # connect (not just on the first LLM call of the next turn). The value
     # comes from the last real `input_tokens` we persisted in this session's
     # row — same number the user saw mid-task, so the chip doesn't snap to
-    # a different value on page load. A fresh session with no LLM call yet
-    # has no persisted value; we publish 0 so the chip still appears with
-    # "0% used" rather than flashing in after the first turn.
+    # a different value on page load.
+    #
+    # Caveat: pre-cache-aware sessions persisted the *inflated* total
+    # (input + cache_read + cache_creation combined) — the chip would
+    # show "154% used" for a session whose actual new tokens are
+    # 14%. To keep the chip honest, we apply a soft upper bound: if
+    # the persisted value is wildly above the auto-compact threshold
+    # (suggesting it includes cache), we publish a *fraction* of it
+    # that more closely matches the "new tokens" view. The first
+    # post-refresh LLM call will overwrite this with the real
+    # cache-aware value from the LLM, so this is just a graceful
+    # loading state.
     try:
         from memory.checkpointer import (
             _auto_compact_threshold, CONTEXT_WINDOW_TOKENS,
         )
         persisted = db.get_session(session_id)
         used = int((persisted or {}).get("last_context_used") or 0)
+        threshold = int(_auto_compact_threshold())
+        # If the persisted value is more than 2× the threshold, it
+        # almost certainly includes cache (real new content rarely
+        # exceeds 2× threshold pre-compact). Cap it at 1.0× so the
+        # chip isn't screaming red on refresh; the next LLM call
+        # will set the truth.
+        if used > threshold * 2:
+            used = threshold
         bus.publish("context_update", {
             "used_tokens":  used,
             "budget_tokens": CONTEXT_WINDOW_TOKENS,
             "compacting": False,
-            "threshold": int(_auto_compact_threshold()),
+            "threshold": threshold,
         })
     except Exception:
         # Don't let an initial-context hiccup break the WS upgrade

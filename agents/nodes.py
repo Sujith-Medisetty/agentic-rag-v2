@@ -654,6 +654,17 @@ def _extract_cache_fields(usage: dict) -> tuple[int, int]:
                 )
                 _cache_shape_logged = True
             return cw, cr
+    # 3b. LangChain sometimes normalises to flat keys. Try those too.
+    cr = int(usage.get("cached_tokens", 0) or 0)
+    cw = int(usage.get("cache_creation_tokens", 0) or 0)
+    if cr or cw:
+        if not _cache_shape_logged:
+            import logging
+            logging.getLogger(__name__).info(
+                "[cache-debug] provider returned flat OpenAI-shape usage: %r", usage
+            )
+            _cache_shape_logged = True
+        return cw, cr
     # 4. Unknown — log once so we know the shape, then return 0/0.
     if not _cache_shape_logged:
         import logging
