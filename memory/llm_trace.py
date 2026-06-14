@@ -36,6 +36,25 @@ class LLMCallRecord:
     duration_ms: int                  # wall-clock for the call
     finish_reason: str = ""           # stop / tool_calls / length / etc.
 
+    def to_json(self) -> dict:
+        """Plain-dict form for JSON responses. Messages go through
+        `serialize_messages` so LangChain message objects (which FastAPI
+        can't json-serialise directly) become safe dicts."""
+        return {
+            "ts": self.ts,
+            "iteration": self.iteration,
+            "model": self.model,
+            "request_messages": serialize_messages(self.request_messages),
+            "response": (
+                serialize_messages([self.response])[0]
+                if not isinstance(self.response, dict)
+                else self.response
+            ),
+            "usage": dict(self.usage) if self.usage else {},
+            "duration_ms": self.duration_ms,
+            "finish_reason": self.finish_reason,
+        }
+
 
 class LLMTraceStore:
     """Per-session ring buffer of LLMCallRecord. Process-wide singleton

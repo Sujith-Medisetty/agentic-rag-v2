@@ -12,6 +12,7 @@ Six validation submodules run in sequence before any bash command executes:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -138,6 +139,15 @@ DESTRUCTIVE_PATTERNS = [
 ]
 
 ALWAYS_DESTRUCTIVE_COMMANDS = {"shred", "wipefs"}
+
+# Process-management commands that are ALWAYS forbidden, regardless of
+# permission mode. These have no legitimate use inside a build session and
+# can take down the Ojas backend (which listens on :8765) if the agent
+# `kill`s the wrong pid. The validator pipeline returns `block` for these
+# in every mode — see check_process_management().
+ALWAYS_FORBIDDEN_PROCESS_COMMANDS = {
+    "kill", "pkill", "killall", "fuser", "pgrep",
+}
 
 # System paths the agent must NEVER target with a write command. Note we
 # intentionally exclude `/opt/` because Ojas itself lives at `/opt/ojas/`
@@ -273,6 +283,17 @@ def validate_sed(command: str, mode: PermissionMode) -> ValidationResult:
 # 4. Destructive check
 # ---------------------------------------------------------------------------
 
+def validate_destructive_with_protected_pids(command: str) -> ValidationResult:
+    """Wraps check_destructive and re-runs the protected-pid BLOCK inside
+    it, so even if the pipeline ordering ever changes, a kill of a
+    protected pid is a hard BLOCK (not a warn from a side-check).
+    """
+    r = check_destructive(command)
+    if not r.is_allowed:
+        return r
+    return validate_protected_pids(command)
+
+
 def check_destructive(command: str) -> ValidationResult:
     for pattern, warning in DESTRUCTIVE_PATTERNS:
         if pattern in command:
@@ -287,6 +308,38 @@ def check_destructive(command: str) -> ValidationResult:
     if "rm " in command and "-r" in command and "-f" in command:
         return ValidationResult.warn(
             "Recursive forced deletion detected — verify the target path is correct"
+        )
+
+    # Process-management commands are blocked in every mode, not just
+    # read-only. A misfired `kill <pid>` from inside a build session can
+    # take down the Ojas backend (port 8765) and crash the parent agent's
+    # own session. Always block, never warn.
+    first_proc = _extract_first_command(command)
+    if first_proc in ALWAYS_FORBIDDEN_PROCESS_COMMANDS:
+        return ValidationResult.block(
+            f"Command '{first_proc}' is forbidden — killing processes from "
+            f"inside a build session can take down the Ojas backend (port "
+            f"8765) and crash the agent's own session. If you need to free a "
+            f"port, pick a different port. If you need to stop a dev server "
+            f"you started, use the exact pid from your earlier bash output."
+        )
+
+    # Indirect kill: a kill-family verb (kill / pkill / killall / fuser -k)
+    # fed by stdin, a pipe, or process substitution. Static analysis can't
+    # see the actual pid, so we can't whitelist "agent's own child" — we
+    # just refuse the shape. Catches `xargs kill < pids.txt`, `echo 476086
+    # | kill`, `kill <(echo 476086)`, and friends.
+    if re.search(
+        r"\b(kill|pkill|killall)\b", command, re.IGNORECASE
+    ) and re.search(r"(\|\s*(xargs\s+)?(kill|pkill|killall)\b|<\s*\(\s*.*\b(kill|pkill|killall)\b|\b(kill|pkill|killall)\b\s*<)",
+        command, re.IGNORECASE,
+    ):
+        return ValidationResult.block(
+            "Refused: kill-family verb fed by stdin/pipe/substitution. "
+            "Static analysis cannot verify the target is not the Ojas "
+            "backend. If you need to stop a child process, terminate the "
+            "session (the cleanup will SIGTERM it) or use the exact pid "
+            "from your earlier bash output with `kill <pid>`."
         )
 
     return ValidationResult.allow()
@@ -315,6 +368,52 @@ def validate_paths(command: str, workspace: str) -> ValidationResult:
 
     return ValidationResult.allow()
 
+def validate_protected_pids(command: str) -> ValidationResult:
+    """Hard BLOCK on any kill-family verb whose args include a protected
+    pid (the live Ojas backend uvicorn, caddy reverse proxy, or any pid
+    pinned in OJAS_PROTECTED_PIDS). Runs FIRST in the pipeline so it
+    cannot be skipped by a warn from validate_mode (e.g. a kill with
+    `>/dev/null` redirect in workspace-write mode used to return the
+    workspace-warn and never reach the kill check).
+    """
+    if not re.search(
+        r"\b(kill|pkill|killall)\b", command, re.IGNORECASE
+    ):
+        return ValidationResult.allow()
+
+    protected = _discover_protected_pids()
+    if not protected:
+        return ValidationResult.allow()
+
+    for pid in protected:
+        if re.search(rf"(?<!\w){pid}(?!\w)", command):
+            return ValidationResult.block(
+                f"Refused: command targets protected pid {pid} "
+                f"(Ojas backend or caddy reverse proxy) with a kill verb. "
+                f"Ojas processes are untouchable from inside a build "
+                f"session. If a different process needs to stop, end the "
+                f"session (the cleanup will SIGTERM it) or pick a "
+                f"different free port for your dev server."
+            )
+
+    return ValidationResult.allow()
+
+
+def _discover_protected_pids() -> set[int]:
+    """Discover the live pids of the Ojas uvicorn backend and caddy
+    reverse proxy. Used by validate_protected_pids. Discovery is cached
+    on first call and only re-runs if the cache is cleared.
+    """
+    # Import here to keep the module import order happy; tools.bash also
+    # does this discovery, but bash_validator is the FIRST line of
+    # defence and shouldn't depend on tools.bash.
+    try:
+        from tools.bash import _protected_pids
+        return _protected_pids()
+    except Exception:
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # Full pipeline — run all validations in order
 # ---------------------------------------------------------------------------
@@ -329,15 +428,17 @@ def validate_command(
     Returns the first non-Allow result, or Allow if all pass.
 
     Order
+    0. protected-pid BLOCK — runs first, can't be skipped by a mode-warn
     1. mode validation (includes read-only check)
     2. sed validation
     3. destructive check
     4. path validation
     """
     for check in [
+        lambda: validate_protected_pids(command),
         lambda: validate_mode(command, mode),
         lambda: validate_sed(command, mode),
-        lambda: check_destructive(command),
+        lambda: validate_destructive_with_protected_pids(command),
         lambda: validate_paths(command, workspace),
     ]:
         result = check()

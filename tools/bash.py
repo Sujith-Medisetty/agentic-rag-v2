@@ -5,13 +5,20 @@ Handles subprocess spawning, timeout, background execution.
 Safety validation happens in safety/bash_validator.py before this runs.
 
 PROCESS-SAFETY HARD GUARD (added Jun 2026 after the agent ran
-`fuser -k 8765/tcp` and killed its own parent backend):
-A small allowlist-style check below refuses any command that tries to
-kill a process bound to the Ojas backend's port, or that uses
-`fuser -k` / `pkill` / `killall` against the parent. The system prompt
-also tells the agent to NEVER kill processes — pick a different free
-port instead. The hard guard is belt-and-braces in case the model
-ignores the prompt.
+`fuser -k 8765/tcp` and killed its own parent backend, then again
+issued a bare `kill` from a parallel build session that took the
+backend down for ~2 minutes):
+Three independent layers block any kill attempt that could reach the
+Ojas backend (uvicorn on :8765) or caddy:
+  1. `safety/bash_validator.ALWAYS_FORBIDDEN_PROCESS_COMMANDS` blocks
+     `kill` / `pkill` / `killall` / `fuser` / `pgrep` in every mode.
+  2. The port-based check below refuses any kill-family verb that
+     mentions a protected port (default 8765).
+  3. The PID-based check below refuses any kill-family verb whose
+     arguments include a protected pid (Ojas backend, caddy,
+     systemd). The agent is told NEVER to kill processes; the
+     hard guard is belt-and-braces in case the model ignores the
+     prompt.
 """
 
 from __future__ import annotations
@@ -70,12 +77,78 @@ def _protected_ports() -> set[int]:
     return out or {8765}
 
 
+# Pids that the agent must never kill. Defaults to live-discovered pids
+# for the Ojas backend (uvicorn) and caddy; can be extended via env var
+# `OJAS_PROTECTED_PIDS=1234,5678` for unit-pid + ancillary pids.
+#
+# The lookup is cheap (one /proc read), runs once per bash tool call,
+# and the discovered set is stable for the lifetime of the backend —
+# the only thing that changes pids is an ojas-backend restart, at which
+# point we want the NEW pid protected anyway. Cached at module import.
+_PROTECTED_PIDS: set[int] | None = None
+
+
+def _discover_protected_pids() -> set[int]:
+    """Return the set of pids we must refuse to kill. Combines:
+      • the live ojas uvicorn backend pid (matched by argv 'server.app:app')
+      • the live caddy reverse-proxy pid (matched by argv 'caddy run')
+      • any extra pids the operator pinned via OJAS_PROTECTED_PIDS env var
+        (used to also pin the systemd-managed main pid 1, an MCP pid, etc.)
+    """
+    extra: set[int] = set()
+    for tok in re.split(r"[,\s]+", os.getenv("OJAS_PROTECTED_PIDS", "")):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            extra.add(int(tok))
+        except ValueError:
+            continue
+
+    discovered: set[int] = set()
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().decode("utf-8", "replace").replace("\x00", " ").strip()
+            except (OSError, PermissionError):
+                continue
+            # Match uvicorn running the Ojas app, OR caddy running as the
+            # Ojas reverse proxy. We match the argv pattern, not the binary
+            # name, so a malicious fork of "caddy" wouldn't get a free pass
+            # unless it actually runs as the configured proxy.
+            if "server.app:app" in cmd and "uvicorn" in cmd:
+                discovered.add(pid)
+            elif cmd.startswith("/usr/bin/caddy") or "caddy run" in cmd:
+                discovered.add(pid)
+    except OSError:
+        pass
+
+    return discovered | extra
+
+
+def _protected_pids() -> set[int]:
+    global _PROTECTED_PIDS
+    if _PROTECTED_PIDS is None:
+        _PROTECTED_PIDS = _discover_protected_pids()
+    return _PROTECTED_PIDS
+
+
 # Kill-family verbs we look for. Detection is intentionally generous —
 # easier to false-positive a `fuser -k` than to miss one.
 _KILL_VERBS = re.compile(
     r"\b(fuser\s+[^|;&]*-k|kill\b|pkill\b|killall\b)",
     re.IGNORECASE,
 )
+
+# A standalone `kill` with NO pid arg (or only a signal flag and no pid)
+# defaults to killing every process in the caller's process group — which
+# from inside the agent's bash includes the agent's own uvicorn parent.
+# Refuse bare `kill` so the LLM can't slip it past the verb check.
+_BARE_KILL = re.compile(r"^\s*kill(\s+-\w+)*\s*$", re.IGNORECASE)
 
 
 def _check_self_destruct(command: str) -> str | None:
@@ -90,11 +163,19 @@ def _check_self_destruct(command: str) -> str | None:
          a child of it; safer to block all of them than to whitelist).
       3. ANY combination of a kill-family verb + a protected port number
          (8765 by default) anywhere in the command — extra defence layer.
+      4. A bare `kill` with no pid defaults to "kill my process group",
+         which from inside the agent's shell includes the parent uvicorn.
+         Refused.
+      5. ANY kill-family verb whose arguments include a protected pid
+         (live uvicorn backend, caddy, anything pinned in
+         OJAS_PROTECTED_PIDS) is refused — even if the agent got the pid
+         via `ps` and typed it in by hand. This is the second-to-last
+         line of defence against a creative LLM.
 
     The agent can still terminate its OWN children via `kill <pid>` with a
     specific pid it spawned itself; we only refuse pkill/killall (broad
-    targeting) and fuser -k (port-based targeting), which are the two
-    that can hit the parent.
+    targeting), fuser -k (port-based targeting), and any command that
+    touches a protected pid.
     """
     cmd = command.strip()
     if not cmd:
@@ -128,11 +209,23 @@ def _check_self_destruct(command: str) -> str | None:
             "port for your dev server."
         )
 
-    # (3) Any kill-family verb mentioning a protected port. Catches
-    # creative `kill -9 $(lsof -ti :8765)` style commands.
-    protected = _protected_ports()
+    # (4) Bare `kill` (no pid) defaults to "kill the caller's process
+    # group" which from inside the agent's bash includes the parent
+    # uvicorn. Refused regardless of flags.
+    if _BARE_KILL.match(cmd):
+        return (
+            "Refused: `kill` with no pid defaults to killing the "
+            "caller's process group, which includes the Ojas backend. "
+            "If you need to stop a child you started, use "
+            "`kill <specific-pid>` with the pid from the bash output."
+        )
+
+    # (3 + 5) Any kill-family verb mentioning a protected port OR a
+    # protected pid. Catches creative `kill -9 $(lsof -ti :8765)` and
+    # `kill <uvicorn-pid>` style commands.
     if _KILL_VERBS.search(cmd):
-        for port in protected:
+        protected_ports = _protected_ports()
+        for port in protected_ports:
             # Look for the port number near a kill verb: ':8765', '8765/tcp',
             # 'port 8765', or bare '8765' near a kill verb.
             pat = rf"(:{port}\b|\b{port}/(?:tcp|udp)\b|\bport\s+{port}\b|\b{port}\b)"
@@ -143,6 +236,25 @@ def _check_self_destruct(command: str) -> str | None:
                     f"free port (try 3000-3999 or 5000-9999, just NOT "
                     f"{port}) instead of killing whatever is on it."
                 )
+
+        protected_pids = _protected_pids()
+        if protected_pids:
+            for pid in protected_pids:
+                # Match the pid as a bare integer in the command. We anchor
+                # to word boundaries to avoid false positives like a `1`
+                # inside a hash or path. Pids are always positive integers
+                # and only appear as whitespace-separated tokens in a
+                # kill command, so a simple word-boundary check is enough.
+                if re.search(rf"(?<!\w){pid}(?!\w)", cmd):
+                    return (
+                        f"Refused: command targets protected pid {pid} "
+                        f"(Ojas backend or reverse proxy) with a "
+                        f"kill-family verb. The Ojas processes are "
+                        f"untouchable from inside a build session. If a "
+                        f"different process needs to stop, it is Ojas's "
+                        f"job, not yours — pick a different free port "
+                        f"or use the session-delete cleanup."
+                    )
 
     return None
 

@@ -988,20 +988,23 @@ def github(action: str, repo: str, **kwargs) -> str:
 # ============================================================================
 @tool("TodoWrite", args_schema=TodoWriteInput)
 def TodoWrite(todos: list) -> str:
-    """Create or update your todo list. The UI shows this as a LIVE plan panel
-    that the user is watching — every state transition (pending → in_progress
-    → completed) is rendered immediately. Get this wrong and the user can't
-    see what you're doing.
+    """Create or update your todo list. The UI shows this as a LIVE plan
+    panel that the user is watching — every state transition (pending →
+    in_progress → completed) is rendered immediately. Get this wrong and
+    the user can't see what you're doing. MANDATORY for any task with
+    3+ distinct steps; the system prompt calls this out as a CRITICAL
+    rule.
 
-    WHEN TO CALL (mandatory):
-    - MUST call TodoWrite as the FIRST action of any task with 3+ distinct
-      steps. Emit the full plan with all items `pending` on turn 1, before
-      any other tool call. The user is forming an opinion in the first 5
-      seconds; an empty plan panel then is a UX failure.
-    - Call TodoWrite on every state transition. The cadence is STRICT — one
-      TodoWrite call per transition, never batched.
-    - Skip TodoWrite ONLY for genuinely trivial single-step requests (a one-
-      line edit, a single question, a quick lookup). If in doubt, plan it.
+    WHEN TO CALL (mandatory — not a suggestion):
+    - MUST be your FIRST tool call of any task with 3+ distinct steps.
+      Emit the full plan with every item `pending` on turn 1, BEFORE
+      any other tool call. The user is forming an opinion in the first
+      5 seconds; an empty plan panel then is a UX failure.
+    - MUST call on every state transition. One TodoWrite call per
+      transition, never batched.
+    - Skip ONLY for genuinely trivial single-step requests (a one-line
+      edit, a single question, a quick lookup). If in doubt, plan it —
+      2+ tool calls in the plan = plan it.
 
     ITEM SHAPE (each item is a dict):
     - `content`: imperative form, e.g. "Add tone/style section". Used for
@@ -1011,25 +1014,31 @@ def TodoWrite(todos: list) -> str:
       RIGHT NOW, not what the eventual result is.
     - `status`: `pending` | `in_progress` | `completed`.
 
-    CALLS ARE TOTAL: pass the FULL current list every time. Writes are not
-    incremental — adding a new item means re-sending the whole array with
-    the new item added and statuses updated.
+    CALLS ARE TOTAL: pass the FULL current list every time. Writes are
+    not incremental — adding a new item means re-sending the whole
+    array with the new item added and statuses updated.
 
-    PARALLEL WORK: you MAY mark multiple items `in_progress` at the same
-    time when you're working on them in parallel (e.g. writing three
-    independent files in one assistant turn). The UI renders every
-    in_progress item with a left bar and the activeForm text — so parallel
-    work is visible to the user as a batch, not collapsed.
+    PARALLEL WORK: you MAY mark multiple items `in_progress` at the
+    same time when you're working on them in parallel (e.g. writing
+    three independent files in one assistant turn). The UI renders
+    every in_progress item with a left bar and the activeForm text —
+    so parallel work is visible to the user as a batch, not collapsed.
 
     TRANSITIONS (one TodoWrite call per transition):
-    - Starting work on an item: flip it to `in_progress` (and any parallel
-      siblings) — emit BEFORE the tool calls that do the work.
-    - Finishing an item: flip it to `completed` IMMEDIATELY in the same
-      turn as the tool that finished it. Do NOT wait until all parallel
-      items finish to update — emit a TodoWrite call for each completion,
-      even if the batch is still in flight. One completion = one call.
-    - Dropping a no-longer-relevant item: just remove it from the next
-      call's array. No need for a separate "abandoned" status.
+    - Starting work on an item: flip it to `in_progress` (and any
+      parallel siblings) — emit BEFORE the tool calls that do the
+      work.
+    - Finishing an item: flip it to `completed` IMMEDIATELY in the
+      same turn as the tool that finished it. Do NOT wait until all
+      parallel items finish to update — emit a TodoWrite call for
+      each completion, even if the batch is still in flight. One
+      completion = one call.
+    - Plan changes (new step, dropped step, reorder): emit a
+      TodoWrite call with the full updated list. Plans are not set
+      in stone — change them freely, but EVERY change goes through
+      a TodoWrite call so the panel reflects reality.
+    - Dropping a no-longer-relevant item: just remove it from the
+      next call's array. No need for a separate "abandoned" status.
     """
     try:
         items = [
