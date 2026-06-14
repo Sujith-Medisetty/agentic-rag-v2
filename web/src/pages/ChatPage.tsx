@@ -1314,6 +1314,10 @@ export default function ChatPage() {
             <BuildReadyBanner
               onDeploy={() => setShowDeployModal(true)}
               mtime={lastDetected.fresh_mtime}
+              // Match the nav-strip pill: if the user already has a
+              // deployed app from this session, the banner says
+              // "Update"; otherwise "Deploy".
+              hasDeployedApp={deployedApps.length > 0}
             />
           )}
         </div>
@@ -2416,11 +2420,18 @@ function timeAgoShort(epochSeconds: number): string {
 }
 
 function BuildReadyBanner({
-  onDeploy, mtime,
+  onDeploy, mtime, hasDeployedApp,
 }: {
   onDeploy: () => void;
   mtime: number;
+  hasDeployedApp: boolean;
 }) {
+  // Match the nav-strip pill's label: "Deploy" on the first deploy for
+  // this session, "Update" when there's already a deployed app and the
+  // user just rebuilt. The banner only renders when fresh_build is true
+  // (newer than the last deploy), so Update is always the right call
+  // when an app exists.
+  const cta = hasDeployedApp ? "Update" : "Deploy";
   return (
     <div
       data-testid="build-ready-banner"
@@ -2440,7 +2451,7 @@ function BuildReadyBanner({
         onClick={onDeploy}
         className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-md border border-accent/40 bg-accent/20 px-3 py-1.5 text-tx-sm font-medium text-accent hover:bg-accent/30"
       >
-        <UploadIcon /> Deploy
+        <UploadIcon /> {cta}
       </button>
     </div>
   );
