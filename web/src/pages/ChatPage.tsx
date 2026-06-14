@@ -2266,16 +2266,37 @@ function ContextChip({
   // model is the one that works on touch.
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+  // Separate ref on the BUTTON (not the wrapper) so we can read
+  // the chip's actual screen position for fixed-positioning the
+  // popover. The popover is rendered with `position: fixed` to
+  // escape the chat header's stacking context (the header uses
+  // `backdrop-blur-xl` which forces a new stacking context —
+  // inside that context z-50 works, but the PlanPanel below the
+  // header is a sibling that draws on top of any `absolute`
+  // overflow from the header). fixed positioning breaks out of
+  // ALL stacking contexts and anchors to the viewport, so the
+  // popover is guaranteed to render above the PlanPanel.
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const [popPos, setPopPos] = useState<{ top: number; right: number } | null>(null);
 
-  // Click-outside-to-close. The popover lives inside `wrapperRef`
-  // along with the chip button, so a click on the chip toggles
-  // (button onClick) but a click anywhere else on the page closes
-  // (this document listener). Mouse and touch are bound separately
-  // because TS infers the event type from the listener name —
-  // MouseEvent and TouchEvent don't share a base class with the
-  // fields we need.
+  // Click-outside-to-close + reposition on scroll/resize while open.
+  // Mouse and touch are bound separately because TS infers the
+  // event type from the listener name — MouseEvent and TouchEvent
+  // don't share a base class with the fields we need.
   useEffect(() => {
     if (!open) return;
+    const computePos = () => {
+      if (!buttonRef.current) return;
+      const r = buttonRef.current.getBoundingClientRect();
+      // Place popover's right edge at the chip's right edge, just
+      // below the chip. Right-alignment matches the original
+      // `right-0` behaviour. If the page is scrolled, the chip
+      // moves with the header (the header is sticky) and the
+      // popover follows it — getBoundingClientRect already
+      // accounts for the current scroll offset.
+      setPopPos({ top: r.bottom + 6, right: window.innerWidth - r.right });
+    };
+    computePos();
     const onDoc = (e: Event) => {
       if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
         setOpen(false);
@@ -2287,10 +2308,17 @@ function ContextChip({
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("touchstart", onDoc);
     document.addEventListener("keydown", onKey);
+    // Re-anchor on scroll/resize so the popover tracks the chip
+    // if the user scrolls while it's open. Without this the
+    // popover would float in space as the sticky header moves.
+    window.addEventListener("scroll", computePos, true);
+    window.addEventListener("resize", computePos);
     return () => {
       document.removeEventListener("mousedown", onDoc);
       document.removeEventListener("touchstart", onDoc);
       document.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", computePos, true);
+      window.removeEventListener("resize", computePos);
     };
   }, [open]);
 
@@ -2343,6 +2371,7 @@ function ContextChip({
   return (
     <div ref={wrapperRef} className="relative inline-flex shrink-0">
       <button
+        ref={buttonRef}
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
@@ -2363,7 +2392,20 @@ function ContextChip({
         <div
           role="dialog"
           aria-label="Context usage details"
-          className="absolute right-0 top-full z-50 mt-1.5 w-72 rounded-md border border-border bg-elevated/95 p-3 text-tx-xs text-text shadow-lift backdrop-blur-md"
+          // position: fixed escapes ALL ancestor stacking contexts
+          // (the chat header's backdrop-blur-xl creates one, the
+          // PlanPanel's backdrop-blur-md creates one, etc.). z-60
+          // is the highest in the file — above the help overlay
+          // (z-30), deploy progress modal (z-30), name-conflict
+          // modal (z-40), and any other UI chrome. The popover is
+          // a transient detail panel, so it being top-of-stack
+          // is the right priority order.
+          style={
+            popPos
+              ? { position: "fixed", top: popPos.top, right: popPos.right }
+              : { position: "fixed", top: -9999, right: -9999, visibility: "hidden" as const }
+          }
+          className="z-[60] w-72 rounded-md border border-border bg-elevated/95 p-3 text-tx-xs text-text shadow-lift backdrop-blur-md"
           // Stop the popover itself from registering a mousedown that
           // the document-level click-outside listener would otherwise
           // treat as "outside" and close. Clicks INSIDE the popover
