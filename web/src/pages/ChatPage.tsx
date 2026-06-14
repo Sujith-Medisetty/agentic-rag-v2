@@ -618,6 +618,15 @@ export default function ChatPage() {
         const preview = typeof p.preview === "string" ? p.preview : undefined;
         const previewTruncated = !!p.preview_truncated;
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
+        // Parse the smart-truncation marker the bash tool embeds in its
+        // preview text. Format (set in tools/wrappers.py):
+        //   …truncated N chars; this was a SUCCESS/FAILURE.
+        //   # truncation: kept_first=X, kept_last=Y, dropped=Z, total=T
+        //   Full output saved to `/path`.
+        //   …
+        // We keep the parsing tolerant — the marker may evolve. If any
+        // field is missing we still surface "truncated" but with zeros.
+        const truncation = parseBashTruncationMarker(preview);
         setCurrentTurn((curr) => {
           if (!curr) return curr;
           const patchToolList = (list: ToolEvent[]) => {
@@ -629,6 +638,7 @@ export default function ChatPage() {
                   status: isError ? "error" : "done",
                   preview,
                   previewTruncated,
+                  truncation: truncation ?? next[i].truncation,
                   endedAt: ev.ts,
                 };
                 break;
@@ -1618,6 +1628,9 @@ function rebuildTranscript(events: LiveEvent[]): {
         if (!curr) break;
         const aid = typeof p.agent_id === "string" ? p.agent_id : "";
         const list = (aid && curr.agents[aid]) ? curr.agents[aid].tools : curr.tools;
+        const _trunc = parseBashTruncationMarker(
+          typeof p.preview === "string" ? p.preview : undefined,
+        );
         for (let i = list.length - 1; i >= 0; i--) {
           if (list[i].tool === p.tool && list[i].status === "running") {
             list[i] = {
@@ -1625,6 +1638,7 @@ function rebuildTranscript(events: LiveEvent[]): {
               status: p.error ? "error" : "done",
               preview: typeof p.preview === "string" ? p.preview : undefined,
               previewTruncated: !!p.preview_truncated,
+              truncation: _trunc ?? list[i].truncation,
               endedAt: ev.ts,
             };
             break;
@@ -1998,6 +2012,33 @@ function formatTokensTiny(n: number): string {
 
 function formatCostTiny(c: number): string {
   return c < 0.01 ? `$${c.toFixed(4)}` : `$${c.toFixed(c < 1 ? 3 : 2)}`;
+}
+
+// Parse the smart-truncation marker the bash tool embeds in its preview
+// text. The format is set in tools/wrappers.py: see _smart_truncate_bash_output.
+// Returns null when the preview doesn't contain the marker (i.e. the bash
+// output was either fully passed through or the tool isn't bash). Keep
+// this tolerant: the marker format may evolve, so missing fields should
+// degrade to "truncated but numbers unknown" rather than throwing.
+function parseBashTruncationMarker(
+  preview: string | undefined,
+): ToolEvent["truncation"] | null {
+  if (!preview) return null;
+  // The marker is the last meaningful block in the preview. Find the
+  // structured `# truncation: ...` line and parse the key=value pairs.
+  const m = preview.match(/# truncation: kept_first=(\d+), kept_last=(\d+), dropped=(\d+), total=(\d+)/);
+  if (!m) return null;
+  const keptFirst = parseInt(m[1], 10);
+  const keptLast = parseInt(m[2], 10);
+  const dropped = parseInt(m[3], 10);
+  const total = parseInt(m[4], 10);
+  // Verdict: SUCCESS or FAILURE
+  const verdictMatch = preview.match(/this was a (SUCCESS|FAILURE)/);
+  const verdict: "SUCCESS" | "FAILURE" = verdictMatch?.[1] === "FAILURE" ? "FAILURE" : "SUCCESS";
+  // Spill path: "Full output saved to `/path`."
+  const pathMatch = preview.match(/Full output saved to `([^`]+)`/);
+  const spillPath = pathMatch?.[1] ?? null;
+  return { keptFirst, keptLast, dropped, total, spillPath, verdict };
 }
 
 

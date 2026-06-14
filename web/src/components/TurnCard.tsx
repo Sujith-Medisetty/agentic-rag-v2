@@ -458,6 +458,18 @@ function ToolNodeImpl({ tool }: { tool: ToolEvent }) {
   const preview = tool.preview ?? (tool.status === "error" ? "failed" : "");
   const firstLine = preview.split("\n")[0];
   const hasMore = preview.length > 110 || preview.includes("\n");
+  // Copy-spill-path button feedback. We set this to "Copied!" briefly
+  // then revert; the timeout is short so it doesn't get in the way
+  // when the user clicks multiple times.
+  const [copied, setCopied] = useState<"path" | "view" | null>(null);
+  const onCopy = (text: string, kind: "path" | "view") => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(
+        () => { setCopied(kind); setTimeout(() => setCopied(null), 1200); },
+        () => {},
+      );
+    }
+  };
 
   return (
     <div className="rounded-md px-1 py-0.5 hover:bg-elevated/40">
@@ -511,11 +523,124 @@ function ToolNodeImpl({ tool }: { tool: ToolEvent }) {
               )}
             </>
           )}
+          {/* Smart bash output truncation notice. Shown whenever the
+              bash tool embedded a `# truncation: ...` line in its
+              preview. The numbers come straight from the backend so
+              the user can see exactly what was kept vs dropped, and
+              the spill path is one click to copy. Renders BELOW the
+              preview block (visible whether the preview is expanded
+              or not) so the user always sees the truncation status
+              when scanning the chat — this is what was missing
+              before, where truncation was hidden inside the
+              collapsible preview. */}
+          {tool.truncation && (
+            <BashTruncationNotice
+              t={tool.truncation}
+              copied={copied}
+              onCopy={onCopy}
+            />
+          )}
         </>
       )}
     </div>
   );
 }
+
+// Stand-alone notice card for the bash tool's smart head+tail
+// truncation. Renders a clear "Output was truncated: first N + last M
+// of T total chars" line, the verdict (SUCCESS/FAILURE) so the user
+// knows the LLM saw a failure, and one-click copy of the spill path
+// (for the user to inspect via their own terminal / editor) plus the
+// suggested sed command (for a quick middle slice).
+function BashTruncationNotice({
+  t,
+  copied,
+  onCopy,
+}: {
+  t: NonNullable<ToolEvent["truncation"]>;
+  copied: "path" | "view" | null;
+  onCopy: (text: string, kind: "path" | "view") => void;
+}) {
+  // Format numbers with thousand-separators for readability.
+  const fmt = (n: number) => n.toLocaleString();
+  // "first 4,500 + last 6,200 of 33,987 total" is the message the user
+  // asked for verbatim. Keep this sentence stable — the user reads
+  // many of these in a long session and patterns on the wording.
+  const isFailure = t.verdict === "FAILURE";
+  return (
+    <div
+      className={`mx-5 mt-1 rounded border px-2 py-1.5 font-sans text-tx-xs ${
+        isFailure
+          ? "border-danger/40 bg-danger/5 text-text"
+          : "border-warning/40 bg-warning/5 text-text"
+      }`}
+    >
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span
+          className={`font-semibold ${isFailure ? "text-danger" : "text-warning"}`}
+        >
+          ⚠ Output was truncated
+        </span>
+        <span className="text-muted">— only</span>
+        <code className="rounded bg-bg/60 px-1 font-mono">
+          first {fmt(t.keptFirst)}
+        </code>
+        <span className="text-muted">+</span>
+        <code className="rounded bg-bg/60 px-1 font-mono">
+          last {fmt(t.keptLast)}
+        </code>
+        <span className="text-muted">of</span>
+        <code className="rounded bg-bg/60 px-1 font-mono">
+          {fmt(t.total)} total
+        </code>
+        <span className="text-muted">chars were fed to the agent.</span>
+        <span className="text-muted">
+          ({fmt(t.dropped)} dropped from the middle)
+        </span>
+      </div>
+      {t.spillPath && (
+        <div className="mt-1 flex flex-wrap items-baseline gap-1.5">
+          <span className="text-muted">Full output saved to:</span>
+          <code
+            className="cursor-pointer break-all rounded bg-bg/60 px-1 font-mono text-text hover:bg-elevated/80"
+            title="Click to copy"
+            onClick={() => onCopy(t.spillPath!, "path")}
+          >
+            {t.spillPath}
+          </code>
+          <button
+            type="button"
+            onClick={() => onCopy(t.spillPath!, "path")}
+            className="font-sans text-tx-xs text-accent hover:text-text"
+            title="Copy the spill file path"
+          >
+            {copied === "path" ? "✓ copied" : "copy path"}
+          </button>
+        </div>
+      )}
+      <div className="mt-1 text-muted">
+        To grab a specific slice without re-running, the agent can:
+        <code className="ml-1 rounded bg-bg/60 px-1 font-mono">
+          sed -n 'N,Mp' {t.spillPath ?? "<spill>"}
+        </code>
+        <button
+          type="button"
+          onClick={() =>
+            onCopy(
+              `sed -n 'N,Mp' ${t.spillPath ?? "<spill>"}`,
+              "view",
+            )
+          }
+          className="ml-1 font-sans text-tx-xs text-accent hover:text-text"
+          title="Copy a sed one-liner for a middle slice"
+        >
+          {copied === "view" ? "✓ copied" : "copy sed cmd"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 const ToolNode = memo(ToolNodeImpl);
 
 // LiveDuration — ticks every 250ms while running, freezes when ended.

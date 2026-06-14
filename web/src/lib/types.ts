@@ -137,6 +137,19 @@ export interface ToolEvent {
   target?: string;
   preview?: string;
   previewTruncated?: boolean;   // true when the backend capped the preview (rare; outputs > ~100KB)
+  // Smart bash output truncation metadata. Present when the bash tool
+  // truncated its output head+tail and spilled the full content to a
+  // temp file. The UI renders a "Output was truncated: first N + last
+  // M of T total" notice from these fields; the spillPath is a click-to-
+  // copy server-side path the user can `read_file` or `cat` themselves.
+  truncation?: {
+    keptFirst: number;          // chars from the head preserved inline
+    keptLast: number;           // chars from the tail preserved inline
+    dropped: number;            // chars dropped from the middle
+    total: number;              // total original output size
+    spillPath: string | null;   // absolute path to the full output, or null if spill failed
+    verdict: "SUCCESS" | "FAILURE";
+  };
   status: "running" | "done" | "error";
   startedAt: number;
   endedAt?: number;             // set when tool_done lands; used to show duration
