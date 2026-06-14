@@ -69,11 +69,14 @@ class ProgressReporter:
         budget_tokens: int,
         warning: bool = False,
         compacting: bool = False,
+        threshold: int = 0,
     ) -> None:
         """Published on context-changing events (after each LLM call, around
         auto-compaction) so the UI can show a Claude Code-style "75% used"
         bar. `warning=True` means we're at the warn tier (~50K); `compacting=True`
-        means the agent is currently summarising old messages."""
+        means the agent is currently summarising old messages. `threshold` is
+        the auto-compact threshold (50K default) so the chip can show
+        "X% to compact" against the right denominator."""
 
     def context_compacted(
         self,

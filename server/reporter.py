@@ -325,6 +325,7 @@ class WebReporter(ProgressReporter):
         budget_tokens: int,
         warning: bool = False,
         compacting: bool = False,
+        threshold: int = 0,
     ) -> None:
         self._pub("context_update", {
             "used_tokens": int(used_tokens),
@@ -332,6 +333,7 @@ class WebReporter(ProgressReporter):
             "percent": round(used_tokens / budget_tokens * 100, 1) if budget_tokens else 0,
             "warning": bool(warning),
             "compacting": bool(compacting),
+            "threshold": int(threshold),
         })
 
     def context_compacted(

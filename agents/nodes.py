@@ -934,6 +934,7 @@ def node_agent(state: RunnerState) -> dict:
                 budget_tokens=CONTEXT_WINDOW_TOKENS,
                 warning=False,
                 compacting=False,
+                threshold=_auto_compact_threshold_value(),
             )
             # Chat-visible notification: tell the user what just happened.
             # Without this, auto-compact is invisible — the user has no way
@@ -980,11 +981,17 @@ def node_agent(state: RunnerState) -> dict:
         from agents.reporter import get_reporter
         used = _estimate_msg_tokens(history)
         warn_threshold = int(CONTEXT_WINDOW_TOKENS * 0.25)  # 50K of 200K
+        # Threshold (50K default) is what the chip shows "X% to compact" against.
+        # The 200K bar is only kept for the warning tier — the user-facing
+        # percent on the chip is now `used / threshold`.
+        from memory.checkpointer import _auto_compact_threshold
+        compact_threshold = int(_auto_compact_threshold())
         get_reporter().context_update(
             used_tokens=used,
             budget_tokens=CONTEXT_WINDOW_TOKENS,
             warning=used >= warn_threshold,
             compacting=False,
+            threshold=compact_threshold,
         )
     except Exception:
         pass

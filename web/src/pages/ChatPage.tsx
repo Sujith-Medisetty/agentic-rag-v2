@@ -146,6 +146,9 @@ export default function ChatPage() {
   const [contextBudget, setContextBudget] = useState(200_000);
   const [contextCompacting, setContextCompacting] = useState(false);
   const [contextWarning, setContextWarning] = useState(false);
+  // Auto-compact threshold (50K default) — the chip shows "X% to compact"
+  // against this denominator, NOT the 200K soft quality window.
+  const [contextThreshold, setContextThreshold] = useState(50_000);
   // Auto-compact breadcrumb list. Each entry corresponds to a `context_compacted`
   // WS event and renders as a collapsible system message in the transcript
   // so the user can see what was summarised when. Cleared on session switch.
@@ -404,11 +407,15 @@ export default function ChatPage() {
         // Cumulative context-used % so the bottom bar can show "78% used" in
         // Claude Code style. Published by the server after every LLM call and
         // around auto-compaction. `warning` = at the warn tier. `compacting`
-        // = summarisation is happening right now.
+        // = summarisation is happening right now. `threshold` = the
+        // auto-compact threshold (50K default); the chip uses this as the
+        // denominator for the "X% to compact" label.
         const used  = Number(p.used_tokens  ?? 0);
         const budget = Number(p.budget_tokens ?? 0);
+        const threshold = Number(p.threshold ?? 0);
         if (used <= 0) return;
         if (budget > 0) setContextBudget(budget);
+        if (threshold > 0) setContextThreshold(threshold);
         setContextUsed(used);
         setContextWarning(Boolean(p.warning));
         setContextCompacting(Boolean(p.compacting));
@@ -1166,6 +1173,7 @@ export default function ChatPage() {
           <ContextChip
             used={contextUsed}
             budget={contextBudget}
+            threshold={contextThreshold}
             warning={contextWarning}
             compacting={contextCompacting}
           />
@@ -1767,27 +1775,21 @@ function rebuildTranscript(events: LiveEvent[]): {
 // ============================================================================
 
 function ContextChip({
-  used, budget, warning, compacting,
-}: { used: number; budget: number; warning: boolean; compacting: boolean }) {
+  used, budget, threshold, warning, compacting,
+}: { used: number; budget: number; threshold: number; warning: boolean; compacting: boolean }) {
   if (!used && !compacting) return null;
-  const pct = budget > 0 ? Math.max(0, Math.min(100, Math.round((used / budget) * 100))) : 0;
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
-  // The chip's primary purpose is to tell the user HOW CLOSE THEY ARE to
-  // the next auto-compact — not how close they are to a hard model limit
-  // (the model is 512K, way above what Ojas keeps live). Show the
-  // "to-compact" percent as the label so the user can act on it; the
-  // tooltip shows the full breakdown including the model's 200K soft
-  // quality window.
-  //
-  // We do not know the auto-compact threshold in the UI without it being
-  // passed down — the server's `context_update` already includes the
-  // message-list size, so the user-facing label is "X% ctx" where X is
-  // the local Python estimate of the message list. The tooltip explains
-  // what's actually being measured.
-  //
-  // Tiers: < 50% calm, 50-79% warn, 80-99% danger. Compacting is its
-  // own pulsing state.
+  // The chip shows percent TO auto-compact, not percent of the model.
+  // The user wants to know "how close am I to the next compaction?" —
+  // that's what the threshold (50K default) is for. The 200K number
+  // is still passed in (for the warning tier) but is NOT the label.
+  const pctToCompact = threshold > 0
+    ? Math.max(0, Math.min(999, Math.round((used / threshold) * 100)))
+    : 0;
+
+  // Tiers: < 60% calm, 60-89% warn, 90%+ danger. Compacting is its own
+  // pulsing state.
   let dotCls = "bg-accent/40";
   let textCls = "text-text";
   let borderCls = "border-border/60 bg-elevated/60";
@@ -1795,11 +1797,11 @@ function ContextChip({
     dotCls = "bg-accent animate-pulse-soft";
     textCls = "text-accent";
     borderCls = "border-accent/40 bg-accent/[0.06]";
-  } else if (pct >= 80) {
+  } else if (pctToCompact >= 90) {
     dotCls = "bg-danger/80";
     textCls = "text-danger";
     borderCls = "border-danger/40 bg-danger/[0.06]";
-  } else if (pct >= 50) {
+  } else if (pctToCompact >= 60) {
     dotCls = "bg-warn/80";
     textCls = "text-warn";
     borderCls = "border-warn/40 bg-warn/[0.05]";
@@ -1807,7 +1809,7 @@ function ContextChip({
 
   const label = compacting
     ? "Compacting…"
-    : `${pct}% ctx`;
+    : `${pctToCompact}% to compact`;
 
   return (
     <div
@@ -1815,9 +1817,7 @@ function ContextChip({
       title={
         compacting
           ? "Compacting context — summarising older turns to keep the session running"
-          : `Live context: ${fmt(used)} of ~${fmt(budget)} soft quality window (${pct}%)\n` +
-            `Auto-compact fires at 50K (25% of the bar) to keep the model fast.\n` +
-            `The model itself supports up to 512K — the 200K window is a quality cap, not a hard limit.${warning ? "\nGetting full — auto-compact will fire on the next turn." : ""}`
+          : `Context: ${fmt(used)} used. Auto-compact fires at ${fmt(threshold)} (${pctToCompact}% there).${warning ? " Getting full." : ""}`
       }
     >
       <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotCls}`} />
