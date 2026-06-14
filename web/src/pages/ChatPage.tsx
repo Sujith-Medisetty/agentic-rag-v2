@@ -278,6 +278,35 @@ export default function ChatPage() {
         setTurns(rebuilt);
         setCurrentTurn(rebuiltCurrent);
         setPlan(replayedPlan);
+        // Rebuild the auto-compact breadcrumb list from history. The
+        // live WS handler adds cards as `context_compacted` events
+        // arrive, but on a fresh page load (or a refresh that landed
+        // AFTER compactions have already happened) the events table
+        // has all the compactions that fired during the session —
+        // if we don't replay them here, the user sees a session
+        // where the chat chip says "compacted N times" but ZERO
+        // breadcrumb cards. Each historical event maps to a
+        // ContextCompactedNote with the same shape the WS handler
+        // uses; identical IDs ensure a follow-up live event for the
+        // same compaction (impossible in practice — compactions
+        // don't double-fire) wouldn't double-render.
+        const historicalCompactions: ContextCompactedNote[] = events
+          .filter((e) => e.kind === "context_compacted")
+          .map((e) => {
+            const p = (e.payload ?? {}) as Record<string, any>;
+            return {
+              id: `compact-${e.created_at * 1000}-${Number(p.removed ?? 0)}-${Number(p.kept ?? 0)}`,
+              ts: e.created_at * 1000,
+              removed: Number(p.removed ?? 0),
+              kept: Number(p.kept ?? 0),
+              tokensBefore: Number(p.tokens_before ?? 0),
+              tokensAfter:  Number(p.tokens_after  ?? 0),
+              summaryPreview: String(p.summary_preview ?? ""),
+              threshold: Number(p.threshold ?? 0),
+            };
+          })
+          .filter((n) => n.removed > 0);  // matches the WS-side guard
+        setContextCompactedNotes(historicalCompactions);
         // Load this session's deployed apps so the strip renders correctly
         // on every mount (refresh / session switch). Failure is non-fatal —
         // strip just shows empty.
