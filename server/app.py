@@ -1774,6 +1774,56 @@ async def messages_post(
     if not bus.is_bound():
         bus.bind_loop(asyncio.get_running_loop())
 
+    # If a turn is already running for this session, cancel it and
+    # wait for the cancellation to fully finalise BEFORE scheduling
+    # the new turn. This is the Claude-Code-style "stop and answer"
+    # behaviour: the user types a new question while a task is in
+    # flight, hits Enter, and the agent stops what it was doing
+    # and serves the new question — instead of:
+    #   (a) ignoring the new question until the old turn finishes
+    #       (the bug this fixes), or
+    #   (b) spawning a SECOND concurrent run_turn task that races
+    #       the first for checkpoint ownership and interleaves its
+    #       assistant_text into the old turn's history.
+    # The cancel-and-wait serialises them: T1 fully closes (with
+    # its [cancelled by user] breadcrumb), then T2 starts on a
+    # clean checkpoint. The user sees the old turn's response end
+    # with "■ stopped", then the new turn's response to the new
+    # question. CancelledError + turn_summary + DB write are all
+    # done by session_runner's CancelledError handler — we just
+    # await the task to ensure they all land before T2 begins.
+    prev = _active_turns.get(session_id)
+    if prev is not None and not prev.done():
+        prev.cancel()
+        try:
+            # Bounded wait so a wedged worker thread (the Python
+            # thread-cancel limitation noted in cancel_turn's
+            # docstring) can't deadlock the new submission. The
+            # worker thread can keep dripping events for a few
+            # seconds after cancel, but the asyncio task itself
+            # resolves as soon as the CancelledError handler in
+            # run_turn has written the [cancelled by user] row
+            # and emitted turn_summary. 2s is plenty for that.
+            await asyncio.wait_for(asyncio.shield(prev), timeout=2.0)
+        except asyncio.TimeoutError:
+            # CancelledError was raised but the run_turn cleanup
+            # didn't finish in time. Move on anyway — the new turn
+            # will land in its own asyncio.Task and the bus will
+            # still serialise events per-publisher. The old turn's
+            # finalization will continue in the background and
+            # naturally end the task; the done_callback below
+            # still pops _active_turns.
+            pass
+        except (asyncio.CancelledError, Exception):
+            # The task was already cancelled and is now finishing
+            # up. We don't care about the outcome — we just needed
+            # the cleanup to make progress before T2 starts.
+            pass
+        # The done_callback below will pop _active_turns once the
+        # cancelled task truly ends. We don't pop it here because
+        # the task object is still referenced by the callback's
+        # closure and may not have run its cleanup yet.
+
     # Fire-and-forget. Errors land on the bus via reporter.error().
     task = asyncio.create_task(run_turn(
         session_id=session_id,

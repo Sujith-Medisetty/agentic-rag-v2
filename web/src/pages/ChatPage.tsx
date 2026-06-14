@@ -109,7 +109,28 @@ export default function ChatPage() {
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  // True while we're mid-cancel — i.e. the user hit Enter / Send while a
+  // turn was already in flight and we're awaiting the cancel-then-send
+  // handoff to the server. The Send button morphs into "Stopping…" +
+  // a spinner so the user knows their input was received (they're
+  // NOT being ignored) and that the in-flight task is being aborted
+  // before the new one starts. Without this, the user could think
+  // their new message went into a void for the 1-2 seconds it takes
+  // the cancel to land and the new turn to begin streaming.
+  const [interrupting, setInterrupting] = useState(false);
+  // Mirror of `sending` in a ref so the async send() loop can poll
+  // the latest value (React's setState is asynchronous; reading the
+  // `sending` state inside the loop would always see the stale
+  // snapshot from when send() was called). The ref is kept in sync
+  // via a useEffect below.
+  const sendingRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Keep sendingRef in sync with the `sending` state. Used by send()
+  // below to poll the latest value across an async boundary (React
+  // state reads inside an async function always see the snapshot
+  // from when the function was called, not the latest value).
+  useEffect(() => { sendingRef.current = sending; }, [sending]);
 
   // Prefill from the home screen's "Try saying" cards. The Workspace
   // page creates a new session, then navigates here with
@@ -1267,7 +1288,49 @@ export default function ChatPage() {
   const send = async (e: React.FormEvent) => {
     e.preventDefault();
     const text = input.trim();
-    if (!text || !sessionId || sending) return;
+    if (!text || !sessionId) return;
+    // If a turn is mid-flight, the user hitting Enter should be
+    // "stop what you're doing and answer THIS" — NOT a no-op that
+    // leaves them feeling ignored. The old `if (sending) return`
+    // guard made the input feel sticky when the agent was clearly
+    // busy on something else; Claude Code never blocks the user
+    // from interrupting. So:
+    //
+    //   1. Call sessionApi.cancel() to abort the in-flight turn
+    //      server-side. The server's POST /messages handler now
+    //      also cancels any in-flight turn before scheduling the
+    //      new one, so this is belt-and-suspenders — if the cancel
+    //      POST races the cancel-then-send server path, the
+    //      server's own guard still serialises them correctly.
+    //   2. Show "Stopping…" in the button so the user has visible
+    //      feedback that their input was received.
+    //   3. Wait for the WS turn_summary to arrive (which clears
+    //      `sending` via the existing handler), with a bounded
+    //      timeout in case the cancel finalisation hangs. Then
+    //      submit the new message.
+    //
+    // We do NOT block on a fixed sleep — the WS handler is the
+    // authoritative signal that the old turn has finalised. If it
+    // arrives within 3s, great; if not, we send anyway because
+    // the server's per-session serialisation (one turn at a time)
+    // means the new POST will wait for the old finalisation on
+    // its end. Better to send late than to leave the user with
+    // a stuck "Stopping…" spinner.
+    if (sending) {
+      setInterrupting(true);
+      try {
+        // Fire cancel and wait for `sending` to flip false. The
+        // WS turn_summary handler at line ~270 is what sets it
+        // false — once the cancelled turn has fully finalised.
+        sessionApi.cancel(sessionId).catch(() => {});
+        const start = Date.now();
+        while (sendingRef.current && Date.now() - start < 3000) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      } finally {
+        setInterrupting(false);
+      }
+    }
 
     // History bookkeeping — record every submitted line, reset nav cursor.
     pushHistory(text);
@@ -1275,6 +1338,10 @@ export default function ChatPage() {
     setDraftBeforeHistory("");
 
     // Handle slash commands locally — don't hit the agent for /help, /clear, etc.
+    // (Note: /stop and /cancel are still handled by runSlashCommand as a
+    // fallback — but the user typing plain text + Enter mid-turn now goes
+    // through the "stop and send" path above, which is the more common
+    // Claude-Code-shaped gesture.)
     if (await runSlashCommand(text)) {
       setInput("");
       return;
@@ -1736,29 +1803,78 @@ export default function ChatPage() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onInputKeyDown}
-              placeholder="Type a message, or / for commands…"
+              // Placeholder flips mid-turn to teach the new gesture:
+              // "press Enter to stop and ask" — Claude-Code style.
+              // Without this hint, users don't know that Enter while
+              // a turn is in flight will interrupt the old turn AND
+              // submit the new question (the old `sending` guard
+              // made Enter a silent no-op).
+              placeholder={
+                currentTurn?.isStreaming
+                  ? "Press Enter to stop current task and ask this…"
+                  : "Type a message, or / for commands…"
+              }
               className="field min-h-touch flex-1 text-base md:text-sm"
               autoCapitalize="sentences"
               autoCorrect="on"
               enterKeyHint="send"
-              disabled={sending && !currentTurn?.isStreaming}
+              // The input is always editable — even mid-turn, the
+              // user should be able to type a follow-up. The
+              // old `disabled={sending && !currentTurn?.isStreaming}`
+              // combination disabled the input in exactly the case
+              // the user most needs it (mid-flight follow-up).
             />
             {currentTurn?.isStreaming && !currentTurn.error ? (
+              // Mid-turn. The button is Send (not Stop) so the
+              // single-click action is "stop and send my new
+              // question" — which is what the user is trying to
+              // do when they type + Enter mid-task. If the input
+              // is empty, the button is a plain Stop (cancel only).
               <button
-                type="button"
+                type={input.trim() ? "submit" : "button"}
                 onClick={async () => {
                   if (!sessionId) return;
-                  try { await sessionApi.cancel(sessionId); } catch {}
+                  // Only stop-don't-send if the input is empty.
+                  // If the input has text, let the form submit
+                  // handler run (which will stop + send).
+                  if (!input.trim()) {
+                    try { await sessionApi.cancel(sessionId); } catch {}
+                  }
                 }}
-                className="min-h-touch min-w-touch rounded-lg border border-danger/40 bg-danger/10 px-4 py-2 text-sm font-semibold text-danger hover:bg-danger/15"
-                title="Cancel the in-flight turn (/stop)"
+                // Visual cue: orange-tinted mid-turn (not the
+                // danger-red pure Stop, not the accent Send) so
+                // the user reads it as "send, but it'll interrupt".
+                // Plus a small spinner dot while `interrupting` is
+                // true so the user sees their click landed.
+                className={
+                  "min-h-touch min-w-touch rounded-lg border px-4 py-2 text-sm font-semibold transition " +
+                  (interrupting
+                    ? "border-warn/60 bg-warn/15 text-warn"
+                    : input.trim()
+                      ? "border-warn/40 bg-warn/10 text-warn hover:bg-warn/15"
+                      : "border-danger/40 bg-danger/10 text-danger hover:bg-danger/15")
+                }
+                title={
+                  input.trim()
+                    ? "Stop the current task and send this question"
+                    : "Cancel the in-flight turn (/stop)"
+                }
               >
-                ■ Stop
+                {interrupting ? (
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="inline-block size-3 animate-spin rounded-full border-2 border-warn border-t-transparent" />
+                    Stopping…
+                  </span>
+                ) : input.trim() ? (
+                  "Interrupt & Send"
+                ) : (
+                  "■ Stop"
+                )}
               </button>
             ) : (
               <button
                 type="submit"
-                disabled={sending || !input.trim()}
+                disabled={!input.trim()}
                 className="btn-primary min-h-touch min-w-touch"
               >
                 {sending ? "…" : "Send"}
