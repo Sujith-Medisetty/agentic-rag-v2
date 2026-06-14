@@ -2061,8 +2061,16 @@ function ContextChip({
 }) {
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n);
 
+  // Cap the displayed percentage at 100% — the chip is a
+  // "till the next auto-compact" gauge, not a "how many times
+  // over" indicator. Once `used >= threshold`, auto-compact
+  // fires (or is about to fire on the next turn) and the chip
+  // should show 100% — screaming 156% / 311% for a session
+  // whose LLM is just receiving a large prompt is misleading
+  // because the user has no way to act on the overage. The
+  // tooltip below carries the raw number for triage.
   const pctUsed = threshold > 0
-    ? Math.max(0, Math.min(999, Math.round((used / threshold) * 100)))
+    ? Math.max(0, Math.min(100, Math.round((used / threshold) * 100)))
     : 0;
 
   let dotCls = "bg-accent/40";
