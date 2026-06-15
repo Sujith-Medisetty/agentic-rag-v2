@@ -461,6 +461,19 @@ def _compact_messages(messages: list) -> list:
         ):
             cut += 1
             continue
+        # Walk past any HumanMessage at the cut boundary so the
+        # most recent user question is always in the kept tail,
+        # not in the summary. Without this, the cut can land on a
+        # HumanMessage (e.g. the user's "what about dark mode?"
+        # sitting right after a long tool-call sequence) and the
+        # summariser absorbs it into a one-line note — the LLM
+        # never sees it as a discrete user turn. Stop when we
+        # land on a non-HumanMessage (an AI response, which is
+        # what should follow a user question in conversation
+        # order).
+        if isinstance(nxt, HumanMessage):
+            cut += 1
+            continue
         break
 
     to_summarise = messages[:cut]
