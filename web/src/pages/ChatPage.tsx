@@ -23,7 +23,7 @@
 // Reconstructing on mount: fetch /messages + /events, walk the event log,
 // fold into turns[]. This gives full restore-on-reload behaviour.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useParams, useOutletContext, useLocation } from "react-router-dom";
 import type { Project as ProjectType } from "@/lib/types";
@@ -56,6 +56,12 @@ import { formatDuration, formatTokens } from "@/lib/format";
 import { SunIcon, MoonIcon } from "@/components/icons";
 
 // Single source of truth for slash commands. Used by both the inline
+// Max height of the chat composer textarea, in pixels. 24px line-height ×
+// 6 lines = 144px. Above this, the textarea shows an internal scrollbar
+// instead of growing further. Picked to match Claude.ai's composer cap.
+const MAX_COMPOSER_HEIGHT = 144;
+
+// Slash-command list. Surfaced via two UI surfaces: the `/`-trigger
 // autocomplete picker (live, as the user types) and the /help overlay (full
 // reference). Keep `cmd` lowercase and starting with "/".
 const SLASH_COMMANDS: { cmd: string; desc: string }[] = [
@@ -132,12 +138,46 @@ export default function ChatPage() {
   // via a useEffect below.
   const sendingRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Ref to the chat composer textarea. Used by the auto-grow effect
+  // (lines below) to grow the box as the user types, capped at
+  // MAX_COMPOSER_HEIGHT so a 50-line paste doesn't take over the screen.
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Keep sendingRef in sync with the `sending` state. Used by send()
   // below to poll the latest value across an async boundary (React
   // state reads inside an async function always see the snapshot
   // from when the function was called, not the latest value).
   useEffect(() => { sendingRef.current = sending; }, [sending]);
+
+  // -------------------------------------------------------------------------
+  // Composer auto-grow.
+  //
+  // The chat composer starts as a 1-line input but expands as the user types
+  // — Claude.ai-style — capped at MAX_COMPOSER_HEIGHT (6 lines @ 24 px line
+  // height = 144 px). Above the cap, the textarea scrolls internally so
+  // pasting a 50-line stack trace doesn't take over the screen.
+  //
+  // Why useLayoutEffect and not useEffect: we need the height applied
+  // BEFORE the browser paints the new value, otherwise the textarea
+  // briefly shows the old height with the new content overflowing.
+  // Reading scrollHeight forces a synchronous layout, which is exactly
+  // what useLayoutEffect is for.
+  //
+  // The effect depends on `input` so it runs on every keystroke (and
+  // on history ↑/↓ recall, which mutates `input` programmatically).
+  // -------------------------------------------------------------------------
+  useLayoutEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    // Reset to auto first so a SHRINK (e.g. after a multi-line paste
+    // gets deleted) measures the natural height, not the previous
+    // explicit height.
+    el.style.height = "auto";
+    const next = Math.min(el.scrollHeight, MAX_COMPOSER_HEIGHT);
+    el.style.height = `${next}px`;
+    // Internal scroll only when the content actually exceeds the cap.
+    el.style.overflowY = el.scrollHeight > MAX_COMPOSER_HEIGHT ? "auto" : "hidden";
+  }, [input]);
 
   // Prefill from the home screen's "Try saying" cards. The Workspace
   // page creates a new session, then navigates here with
@@ -1377,10 +1417,17 @@ export default function ChatPage() {
     }
   };
 
-  // Keyboard routing for the input box. Priority: slash picker > history nav.
+  // Keyboard routing for the composer box. Priority: slash picker > history nav.
   // The picker is contextual — only active when the input starts with "/" and
   // there's at least one match — so plain typing is unaffected.
-  const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  //
+  // Enter key semantics for the textarea (different from the old <input>):
+  //   - Enter (no shift)  -> SUBMIT (matches the old <input> behavior so
+  //                          muscle memory carries over; matches Claude.ai)
+  //   - Shift+Enter       -> newline (the standard multi-line escape)
+  // We handle this at the END of the function so slash-picker and history
+  // overrides still win — those keys reach their branches first and `return`.
+  const onInputKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // ----- Slash picker active -----
     if (showSlashPicker) {
       if (e.key === "ArrowDown") {
@@ -1447,7 +1494,15 @@ export default function ChatPage() {
       e.preventDefault();
       setHistoryIdx(-1);
       setInput(draftBeforeHistory);
+    } else if (e.key === "Enter" && !e.shiftKey) {
+      // Enter (no shift) on the textarea = submit. Shift+Enter falls through
+      // to the textarea's default behavior and inserts a newline. The form's
+      // onSubmit handler (`send`) does the actual work. We preventDefault so
+      // no extra newline sneaks in before the submit fires.
+      e.preventDefault();
+      (e.currentTarget.form as HTMLFormElement | undefined)?.requestSubmit();
     }
+    // Shift+Enter: no branch needed — textarea inserts "\n" by default.
   };
 
   // True when this is a brand-new session with no exchanges yet. Drives the
@@ -1836,7 +1891,8 @@ export default function ChatPage() {
             <button type="button" onClick={() => setInput("/stop")} className="hover:text-accent">/stop</button>
           </div>
           <div className="flex gap-2">
-            <input
+            <textarea
+              ref={composerRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onInputKeyDown}
@@ -1851,11 +1907,22 @@ export default function ChatPage() {
                   ? "Press Enter to stop current task and ask this…"
                   : "Type a message, or / for commands…"
               }
-              className="field min-h-touch flex-1 text-base md:text-sm"
+              rows={1}
+              // Auto-grow driven by the useLayoutEffect above (see
+              // `composerRef` + `MAX_COMPOSER_HEIGHT`). Classes: `field`
+              // gives the base look, `min-h-touch` keeps the collapsed
+              // height tappable, `flex-1` fills the row, `resize-none`
+              // disables the bottom-right drag handle (the user can't
+              // override our cap), `leading-snug` + `py-2` give the
+              // 24-px line-height used to compute MAX_COMPOSER_HEIGHT,
+              // and `overflow-hidden` is set dynamically by the effect.
+              className="field min-h-touch flex-1 resize-none overflow-hidden text-base leading-snug py-2 md:text-sm"
               autoCapitalize="sentences"
               autoCorrect="on"
+              // `enterKeyHint` is iOS-only — on mobile keyboards it
+              // shows "Return" / "Send" / etc. on the return key.
               enterKeyHint="send"
-              // The input is always editable — even mid-turn, the
+              // The composer is always editable — even mid-turn, the
               // user should be able to type a follow-up. The
               // old `disabled={sending && !currentTurn?.isStreaming}`
               // combination disabled the input in exactly the case
