@@ -13,7 +13,11 @@ import { Toaster as Sonner, type ToasterProps } from "sonner";
  * but did NOT respect the user's manual override.
  *
  * Positioning notes:
- *  - `position="top-right"` keeps toasts out of the way of chat / forms.
+ *  - `position="top-center"` makes the toast slide DOWN from the top
+ *    edge, centered. Feels like a "popup" rather than a corner
+ *    notification. Was `top-right` until 2026-06-15; right-corner
+ *    toasts felt out of place next to the centered Radix Dialog
+ *    (which uses `fixed left-[50%] top-[50%]` + `zoom-in-95`).
  *  - `offset` accounts for the sticky top nav so toasts don't sit behind it.
  *  - `mobileOffset` keeps the toast above the iOS home indicator.
  *  - `richColors` is OFF so the design tokens (--background, --border) win
@@ -26,7 +30,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
     <Sonner
       theme={resolvedTheme as ToasterProps["theme"]}
       className="toaster group"
-      position="top-right"
+      position="top-center"
       offset="14px"
       mobileOffset="14px"
       expand
