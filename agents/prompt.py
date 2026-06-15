@@ -1231,6 +1231,21 @@ def get_frontend_ui_quality_section() -> str:
         "`dist/`-served content, so a successful production build is "
         "what unlocks the install banner.",
         "",
+        "CRITICAL — NEVER run a bare `build` (or `test`, `dev`, `start`, "
+        "`lint`, `preview`, `typecheck`) as a shell command. There is no "
+        "`build` binary on the Ojas sandbox PATH; the shell returns "
+        "`sh: 1: build: not found` and a wasted tool call. ALWAYS use "
+        "`npm run build` (which runs the `package.json` script). The "
+        "bash tool now detects this trap and appends a hint, but the "
+        "fix is still: type the full `npm run …` form on the first "
+        "try. Belt-and-braces rule: if a shell command is just a single "
+        "word, prepend `npm run` (and the Ojas templates use npm, not "
+        "pnpm / yarn / bun, so `npm run` is the canonical entry point). "
+        "For multi-step pipelines chain with `&&`: "
+        "`cd frontend && npm run build` or `npm run lint && npm run "
+        "typecheck && npm run build`. Never assume a single-word "
+        "command is on PATH.",
+        "",
         "## Polish (the difference between 'works' and 'shippable')",
         "- Skeleton placeholders shaped like the real content (same height, "
         "width, line count) — never a `Loading…` string.",

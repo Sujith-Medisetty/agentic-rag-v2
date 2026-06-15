@@ -346,6 +346,38 @@ def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
     if result.returncode != 0:
         rci = f"exit_code:{result.returncode}"
 
+    # Friendly hint for the bare-`build` ENOENT trap. When the model
+    # types `build` (a single word, no path) `sh -lc` tries to exec
+    # a binary called `build`, which doesn't exist on the Ojas
+    # sandbox PATH, and returns:
+    #   sh: 1: build: not found          (or)
+    #   /bin/sh: line 1: build: No such file or directory
+    # followed by a generic exit 127. The model then spends the
+    # next turn confused — it knows `npm run build` is what it
+    # wanted, but the literal error string doesn't say so. Detect
+    # the trap and append a one-line hint that points at the
+    # right command. Only fires for the bare-word case (commands
+    # starting with `./build`, `/usr/bin/build`, `cd … && build`
+    # are still allowed — they're not the typo).
+    stripped = command.strip()
+    first_token = stripped.split(maxsplit=1)[0] if stripped else ""
+    pkg_scripts = {"build", "test", "dev", "start", "lint", "preview", "typecheck"}
+    stderr_lower = stderr.lower()
+    is_enoent = ("not found" in stderr_lower) or ("no such file" in stderr_lower)
+    is_bare_script = (
+        result.returncode == 127
+        and first_token in pkg_scripts
+        and "/" not in first_token
+        and "." not in first_token.split("/")[0]
+        and is_enoent
+    )
+    if is_bare_script:
+        stderr = (
+            f"{stderr.rstrip()}\n"
+            f"[ojas-hint] `{first_token}` is a package.json script — "
+            f"use `npm run {first_token}` (or `cd frontend && npm run {first_token}`) instead."
+        )
+
     return BashOutput(
         stdout=stdout,
         stderr=stderr,
