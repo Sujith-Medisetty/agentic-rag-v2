@@ -158,6 +158,16 @@ function CreateItemDialog({ onCreated }: { onCreated: () => void }) {
   });
 
   return (
+    /*
+     * Radix invariant: <DialogTrigger> and <DialogContent> MUST be
+     * descendants of the same <Dialog> provider. The trigger consumes
+     * the context the Dialog creates; if it's a sibling instead of a
+     * child, runtime throws "DialogTrigger must be used within Dialog"
+     * and the whole app renders blank. Keep them under the same
+     * <Dialog> — even if the trigger is in one visual location and the
+     * panel in another. The calculator build on 2026-06-15 hit this
+     * bug and shipped with a blank screen.
+     */
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <Button>
@@ -274,6 +284,17 @@ export default function Dashboard() {
           style={{ paddingTop: "env(safe-area-inset-top)" }}
         >
           <Sheet>
+            {/*
+              Radix invariant: <SheetTrigger> and <SheetContent> MUST
+              be descendants of the same <Sheet> provider. The
+              trigger consumes the context the Sheet creates; if it's
+              a sibling instead of a child, runtime throws
+              "DialogTrigger must be used within Dialog" and the whole
+              app renders blank. Keep them under the same <Sheet> —
+              even if the trigger button is in one visual location
+              and the panel is in another. The calculator build on
+              2026-06-15 hit this bug and shipped with a blank screen.
+            */}
             <SheetTrigger asChild>
               <Button
                 variant="ghost"

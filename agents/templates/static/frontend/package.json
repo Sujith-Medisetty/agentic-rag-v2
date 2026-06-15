@@ -5,13 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "node scripts/check-deps.mjs",
+    "prebuild": "node scripts/check-deps.mjs && node scripts/verify-radix.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "verify:deps": "node scripts/check-deps.mjs",
+    "verify:radix": "node scripts/verify-radix.mjs",
     "verify:render": "node scripts/verify-render.mjs",
-    "verify": "npm run verify:deps && npm run build && npm run verify:render"
+    "verify": "npm run verify:deps && npm run verify:radix && npm run build && npm run verify:render"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.1.0",
