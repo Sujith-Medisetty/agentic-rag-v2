@@ -471,6 +471,26 @@ def get_ojas_app_rules_section() -> str:
         "needs a sub-header (e.g. a section title inside the calendar), "
         "use a `<h2>` or `<h3>` — not a full `<header>` element.",
         "",
+        "CRITICAL — Radix UI `<Dialog>`, `<Sheet>`, `<AlertDialog>` "
+        "(and the matching `*Trigger`, `*Content` components) MUST be "
+        "in a single parent/child tree. The trigger consumes a context "
+        "the dialog/Sheet provides — if the trigger is a sibling of "
+        "the dialog (instead of a descendant), the trigger throws "
+        "\"DialogTrigger must be used within Dialog\" at runtime, "
+        "React unmounts the whole tree, and the user sees a blank "
+        "white screen. Concretely: if your feature component needs a "
+        "trigger in one visual location and a content panel in another "
+        "(e.g. a History button next to the display that opens a slide-"
+        "out panel), wrap the ENTIRE return in `<Sheet>` (or "
+        "`<Dialog>`) so both the `<SheetTrigger>` and the "
+        "`<SheetContent>` are descendants of the same provider. Do NOT "
+        "put the trigger inline at one place and the `<Sheet>` block "
+        "as a separate sibling higher in the tree — that triggers the "
+        "runtime error. The calculator session on 2026-06-15 shipped "
+        "with a blank screen because the agent put the trigger next "
+        "to the display but left the `<Sheet>` block as a separate "
+        "sibling at the top of the return.",
+        "",
         "## 4. Storage rule — localStorage is for tiny UI prefs only",
         "",
         "When you DO build a static app, do NOT default to localStorage "
