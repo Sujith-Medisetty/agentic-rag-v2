@@ -34,6 +34,7 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-hook-form": "^7.54.0",
+    "react-router-dom": "^6.28.0",
     "sonner": "^1.7.1",
     "tailwind-merge": "^2.5.4",
     "tailwindcss-animate": "^1.0.7",
