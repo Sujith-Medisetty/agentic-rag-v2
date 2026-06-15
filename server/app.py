@@ -1959,7 +1959,7 @@ async def cancel_turn(
 # ---------------------------------------------------------------------------
 #
 # Each POST /api/sessions/<sid>/deploy spawns a background task that walks
-# 11 steps (copy dist, copy backend, venv, pip install, write unit, enable
+# 13 steps (validate, eager_caddy, copy_dist, inject_pwa, copy_backend,
 # service, write DB row, regen Caddy, start service, finalize). The
 # frontend polls GET /deploy-jobs/<job_id> for the per-step status and
 # the eventual result. This mirrors the _active_turns pattern used by
@@ -1974,7 +1974,7 @@ import threading as _threading
 from dataclasses import dataclass, field
 
 # Number of named steps the UI checklist always renders. Must match
-# the 11 entries emitted in _run_deploy_job; counted at import time
+# the 13 entries emitted in _run_deploy_job; counted at import time
 # so an out-of-sync build fails fast rather than silently rendering
 # a 4-step checklist for a fullstack deploy.
 _DEPLOY_STEP_COUNT = 13
@@ -4101,7 +4101,7 @@ async def _run_deploy_job(
     user_id: str,
 ) -> None:
     """The actual deploy pipeline, kicked off by sessions_deploy. Walks
-    the 11 steps in _DEPLOY_STEPS; each step is marked running, the
+    the 13 steps in _DEPLOY_STEPS; each step is marked running, the
     blocking work runs in the default executor (so the event loop is
     responsive + the task is cancellable), then the step is marked
     done/failed. Per-step state is published to the bus via
@@ -4121,7 +4121,7 @@ async def _run_deploy_job(
     def _set_step(idx: int, status: str, message: str | None = None) -> None:
         """Mutate job.steps[idx] in place. The list is padded to
         _DEPLOY_STEPS length on first call so callers can address any
-        index from 0..10. Emits a deploy_progress event for every
+        index from 0..12. Emits a deploy_progress event for every
         transition."""
         import sys
         name, label = _DEPLOY_STEPS[idx]
@@ -4280,42 +4280,54 @@ async def _run_deploy_job(
         port: int | None = None
         slug_safe = re.sub(r"[^a-z0-9_-]", "-", slug.lower())[:40]
         if is_fullstack:
-        # 3. copy_backend
-            _set_step(3, "running")
+            # Fullstack branch: step indices 3-7 are the backend work
+            # (copy → venv → pip → unit → enable). Step 2 (copy_dist)
+            # and step 3 in the canonical list (inject_pwa) already
+            # ran ABOVE this block — they apply to both static and
+            # fullstack, so the `if is_fullstack:` starts at the first
+            # backend-only step (index 4) and bumps the rest by one
+            # to leave the caddy/db/start steps at 9-11.
+
+            # 4. copy_backend (was step 3 before the renumber — the
+            #    old code overwrote inject_pwa's "done" status with
+            #    copy_backend's "running"/"done" cycle, which made
+            #    the UI checklist show "Adding PWA defaults" twice
+            #    for fullstack deploys)
+            _set_step(4, "running")
             try:
                 await loop.run_in_executor(None, lambda: _do_copy_backend(
                     project_abs=project_abs, target=target,
-                ))
-            except Exception as e:
-                _set_step(3, "failed", str(e)[:200])
-                raise
-            _set_step(3, "done")
-
-        # 4. venv_create
-            _set_step(4, "running")
-            try:
-                await loop.run_in_executor(None, lambda: _do_venv_create(
-                    backend_dst=target / "backend",
                 ))
             except Exception as e:
                 _set_step(4, "failed", str(e)[:200])
                 raise
             _set_step(4, "done")
 
-        # 5. pip_install (the long step — 1-5 minutes on a fresh venv)
+            # 5. venv_create
             _set_step(5, "running")
+            try:
+                await loop.run_in_executor(None, lambda: _do_venv_create(
+                    backend_dst=target / "backend",
+                ))
+            except Exception as e:
+                _set_step(5, "failed", str(e)[:200])
+                raise
+            _set_step(5, "done")
+
+            # 6. pip_install (the long step — 1-5 minutes on a fresh venv)
+            _set_step(6, "running")
             def _do_pip():
                 return _pip_install_for_app(
                     target / "backend", project_abs / "backend" / "requirements.txt",
                 )
             ok, err = await loop.run_in_executor(None, _do_pip)
             if not ok:
-                _set_step(5, "failed", err[:200])
+                _set_step(6, "failed", err[:200])
                 raise RuntimeError(f"pip install failed: {err}")
-            _set_step(5, "done")
+            _set_step(6, "done")
 
-        # 6. write_unit
-            _set_step(6, "running")
+            # 7. write_unit
+            _set_step(7, "running")
             existing_row = db.get_deployed_app(slug) or {}
             if existing_row.get("port") and existing_row.get("service_name"):
                 port = int(existing_row["port"])
@@ -4323,7 +4335,7 @@ async def _run_deploy_job(
                 try:
                     port = await loop.run_in_executor(None, _allocate_app_port)
                 except RuntimeError as e:
-                    _set_step(6, "failed", str(e))
+                    _set_step(7, "failed", str(e))
                     raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(e))
             service_name = f"ojas-app-{slug_safe}.service"
             try:
@@ -4332,24 +4344,26 @@ async def _run_deploy_job(
                     lambda: _write_systemd_unit(slug_safe, port, target / "backend"),
                 )
             except Exception as e:
-                _set_step(6, "failed", str(e)[:200])
+                _set_step(7, "failed", str(e)[:200])
                 raise
-            _set_step(6, "done")
+            _set_step(7, "done")
 
-        # 7. enable_service
-            _set_step(7, "running")
+            # 8. enable_service
+            _set_step(8, "running")
             try:
                 await loop.run_in_executor(
                     None,
                     lambda: _do_enable_service(service_name),
                 )
             except Exception as e:
-                _set_step(7, "failed", str(e)[:200])
+                _set_step(8, "failed", str(e)[:200])
                 raise
-            _set_step(7, "done")
+            _set_step(8, "done")
 
-        # 8. db_row
-        _set_step(8, "running")
+        # 9. db_row (now step 9 for both static and fullstack —
+        #    static apps skip steps 4-8 since they have no backend,
+        #    and the "done" state is just left as the canonical label)
+        _set_step(9, "running")
         if in_place:
             db.touch_deployed_app(slug, project_dir=project_dir)
             if is_fullstack and service_name and port:
@@ -4381,22 +4395,22 @@ async def _run_deploy_job(
                 "public_domain": _resolve_public_domain(),
             },
         )
-        _set_step(8, "done")
+        _set_step(9, "done")
 
-        # 9. caddy_regen — overwrite the eager placeholder from step 1
-        #    with the REAL per-slug fragment. _regenerate_caddy_routes_for_user
-        #    writes either a static-shaped fragment (rooted at the
-        #    app dir, no /api/* reverse_proxy) or a fullstack-shaped
-        #    fragment (rooted at <slug>/static with /api/* → 127.0.0.1:<port>)
-        #    based on the row's service_name/port. Crucially this runs
-        #    for BOTH static and fullstack apps — the previous version
-        #    gated it on `is_fullstack and service_name and port`, which
-        #    left static deploys with the "Deploying..." placeholder
-        #    serving the public URL forever (every static deploy since
-        #    the v1.1 pipeline was added hit this). The row in
-        #    deployed_apps looks "running" because step 8 wrote it,
-        #    but the URL 200s on the in-flight page.
-        _set_step(9, "running")
+        # 10. caddy_regen — overwrite the eager placeholder from step 1
+        #     with the REAL per-slug fragment. _regenerate_caddy_routes_for_user
+        #     writes either a static-shaped fragment (rooted at the
+        #     app dir, no /api/* reverse_proxy) or a fullstack-shaped
+        #     fragment (rooted at <slug>/static with /api/* → 127.0.0.1:<port>)
+        #     based on the row's service_name/port. Crucially this runs
+        #     for BOTH static and fullstack apps — the previous version
+        #     gated it on `is_fullstack and service_name and port`, which
+        #     left static deploys with the "Deploying..." placeholder
+        #     serving the public URL forever (every static deploy since
+        #     the v1.1 pipeline was added hit this). The row in
+        #     deployed_apps looks "running" because step 8 wrote it,
+        #     but the URL 200s on the in-flight page.
+        _set_step(10, "running")
         try:
             await loop.run_in_executor(
                 None,
@@ -4405,12 +4419,12 @@ async def _run_deploy_job(
                 ),
             )
         except Exception as e:
-            _set_step(9, "failed", str(e)[:200])
+            _set_step(10, "failed", str(e)[:200])
             raise
-        _set_step(9, "done")
+        _set_step(10, "done")
 
         if is_fullstack and service_name and port:
-            # 9.5 prefetch_cert — fullstack apps use a per-slug Caddy
+            # 11. prefetch_cert — fullstack apps use a per-slug Caddy
             #     site block with `tls { on_demand }`, which means
             #     Caddy only obtains the per-host Let's Encrypt cert
             #     on the FIRST user request -- and during that 3-5s
@@ -4428,24 +4442,24 @@ async def _run_deploy_job(
             #     the user just gets the legacy "refresh a few times"
             #     experience for that one bad case.
             if subdomain_url:
-                _set_step(10, "running")
+                _set_step(11, "running")
                 try:
                     await loop.run_in_executor(
                         None, lambda: _prefetch_tls_cert(subdomain_url, slug),
                     )
                 except Exception as e:
                     print(f"[ojas] cert prefetch for {slug} failed: {e}")
-                _set_step(10, "done")
+                _set_step(11, "done")
 
-            # 11. start_service + 5s health poll
-            _set_step(11, "running")
+            # 12. start_service + 5s health poll
+            _set_step(12, "running")
             ok = await loop.run_in_executor(
                 None, lambda: _start_app_service(app_row),
             )
             if not ok:
                 # Soft failure — row is in place, user can retry.
                 db.set_deployed_app_state(slug, "starting", error_message="health check failed")
-            _set_step(11, "done")
+            _set_step(12, "done")
 
         # Finalize
         db.set_deployed_app_state(slug, "running", last_health_at=int(time.time()))

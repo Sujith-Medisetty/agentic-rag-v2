@@ -660,15 +660,23 @@ def get_ojas_app_rules_section() -> str:
         "`npm run verify` is the only command that proves the app works; "
         "a plain `npm run build` is just types and bundling.",
         "",
-        "Both Ojas templates ship `scripts/check-deps.mjs` (the dep-tree "
-        "check) and `scripts/verify-render.tsx` (the render smoke test) "
-        "pre-installed. If you scaffold from a template they are already "
-        "wired into `prebuild` and `verify` — just run `npm run verify`. "
-        "If you scaffolded from `npm create vite` directly (or hand-wrote a "
-        "`package.json`), copy the two scripts from another Ojas project "
-        "and add the `prebuild` / `verify` lines to `package.json` "
-        "yourself. Skipping this is what lets a two-React bundle ship to "
-        "the user as a perfectly deployable blank page.",
+        "Both Ojas templates ship three pre-installed guards under "
+        "`frontend/scripts/`: `check-deps.mjs` (catches the two-React "
+        "duplicate-hoist bug from `npm install` outside the project), "
+        "`verify-render.mjs` (esbuild + react-dom/server smoke test that "
+        "actually executes the App's render path), and `verify-radix.mjs` "
+        "(catches the Radix Trigger/Content parent-child invariant — a "
+        "`<SheetTrigger>` next to its display but outside the `<Sheet>` "
+        "block throws `DialogTrigger must be used within Dialog` at "
+        "runtime and ships a blank screen). All three are already wired "
+        "into `prebuild` and `verify` — just run `npm run verify` and "
+        "the three run in order. If you scaffolded from `npm create "
+        "vite` directly (or hand-wrote a `package.json`), copy all "
+        "three scripts from another Ojas project AND add the "
+        "`prebuild` / `verify` lines to `package.json` yourself. "
+        "Skipping any of these is what lets a two-React bundle or a "
+        "Radix-orphan-Trigger ship to the user as a perfectly "
+        "deployable blank page.",
         "",
         "## 6. Edit-after-deploy — what happens when the user asks for a change",
         "",
