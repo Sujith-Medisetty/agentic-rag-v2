@@ -856,53 +856,23 @@ def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
     return out
 
 
-# Heavy tool-call arg keys — these often carry multi-KB strings
-# (file bodies for edits, heredocs for bash). Truncating just these
-# preserves the agent's intent (file path, function name) while
-# shedding the heavy strings.
-_TOOL_CALL_LARGE_ARG_KEYS = (
-    "new_string",
-    "old_string",
-    "content",
-    "command",
-)
+# Heavy tool-call arg keys — DISABLED 2026-06-15 per user direction
+# (the bash-output and per-tool-result caps downstream are sufficient
+# protection; the agent needs the full write_file content / edit_file
+# new_string + old_string / bash command on each turn).
+_TOOL_CALL_LARGE_ARG_KEYS = ()
 
 
 def _truncate_tool_call_args(tool_calls: list) -> tuple[list, int]:
-    """Replace large string arg values in tool call dicts with a
-    one-line stub. Other args (path, query, etc.) pass through
-    verbatim. Returns (new_calls, n_truncated)."""
-    limit = 800
-    if limit <= 0:
-        return tool_calls, 0
-    out: list = []
-    n = 0
-    for tc in tool_calls:
-        if not isinstance(tc, dict):
-            out.append(tc)
-            continue
-        args = tc.get("args")
-        if not isinstance(args, dict):
-            out.append(tc)
-            continue
-        changed = False
-        new_args = dict(args)
-        for key in _TOOL_CALL_LARGE_ARG_KEYS:
-            val = new_args.get(key)
-            if isinstance(val, str) and len(val) > limit:
-                head = val[:limit].replace("\n", " ⏎ ")
-                new_args[key] = (
-                    f"[arg truncated: {len(val):,} chars "
-                    f"(~{len(val) // 4:,} tokens); first {limit} chars: "
-                    f"{head!r}… re-invoke the tool to see the full body]"
-                )
-                changed = True
-                n += 1
-        if changed:
-            out.append({**tc, "args": new_args})
-        else:
-            out.append(tc)
-    return out, n
+    """No-op: A2 truncation was removed 2026-06-15 per user direction.
+    Bash-output caps and per-tool-result caps downstream are sufficient
+    protection, so the per-arg cap (was 800 chars on new_string /
+    old_string / content / command) is no longer needed.
+
+    Returns the input list reference untouched plus n=0. Kept as a
+    function so the call site at line 841 still type-checks; can be
+    deleted when the cap is restored or the call site is rewritten."""
+    return tool_calls, 0
 
 
 # How many of the most recent AIMessages to keep their reasoning_content /
