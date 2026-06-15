@@ -3637,7 +3637,7 @@ def _regenerate_caddy_routes_for_user(owner_user_id: str | None) -> None:
     # Live slugs are the running ones; stopped ones get their
     # fragment wiped so the user-facing URL falls through to the
     # wildcard block (which serves the .paused/ shared page).
-    live_slugs = {r["slug"] for r in rows if r.get("state") == "running"}
+    live_slugs = {r["slug"] for r in rows if r["state"] == "running"}
     # Wipe stale fragments (deleted apps, paused apps)
     for f in OJAS_CADDY_ROUTES_DIR.glob("*.caddy"):
         if f.stem not in live_slugs:
