@@ -54,11 +54,26 @@ CHARS_PER_TOKEN = 4
 PRESERVE_RECENT = 30
 PRESERVE_RECENT_ENV_VAR = "OJAS_PRESERVE_RECENT"
 
-# Tool-result truncation: bodies over 800 chars get collapsed to a
-# one-line pointer. The agent can re-invoke the tool to get the fresh
-# body. We keep the tool CALL (path + args) verbatim since that's
-# the agent's intent.
-TOOL_RESULT_TRUNCATE_AT_CHARS = 800
+# Tool-result truncation: bodies over this many chars get collapsed
+# to a one-line pointer. The agent can re-invoke the tool to get the
+# fresh body. We keep the tool CALL (path + args) verbatim since
+# that's the agent's intent.
+#
+# The 800-char cap was too aggressive: it collapsed the agent's
+# immediate post-write verification reads (Read of a freshly written
+# 16KB file) to a one-line stub, and the agent concluded the file
+# was corrupt when actually the on-disk file was fine. The agent
+# then ran `sed`/`python` "repairs" based on its truncated view,
+# which is where the REAL corruption entered the file. With this
+# cap at 4000 (~1KB of tokens), most file reads, grep outputs, and
+# test results fit in one observation without being collapsed, and
+# the per-message cap only catches pathological cases (multi-MB
+# log dumps, `find` outputs, large `npm install` logs). Long-term
+# budget control is the job of `mask_old_observations`, which
+# collapses older observations while keeping the most recent K
+# verbatim. `_truncate_live_history` in agents/nodes.py also
+# preserves the last 4 ToolMessages verbatim regardless of size.
+TOOL_RESULT_TRUNCATE_AT_CHARS = 4000
 TOOL_RESULT_TRUNCATE_ENV_VAR = "OJAS_TRUNCATE_TOOL_RESULT_AT"
 
 # Preamble + tail injected as a HumanMessage at compact time, so the

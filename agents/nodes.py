@@ -790,12 +790,47 @@ def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
     preceding AIMessage stay verbatim — the agent's intent is what
     matters. Uses `model_copy(update=...)` so the on-disk checkpoint
     keeps the full body; only the per-turn request gets the trimmed
-    view."""
+    view.
+
+    The most recent K (default 4) ToolMessages are passed through
+    verbatim, regardless of size. Without this, the agent's
+    immediate post-write verification reads (Read of a freshly
+    written 16KB file, `wc -l` of the same, `python3 -m py_compile`,
+    `grep -c` checks) get collapsed to a one-line stub and the agent
+    concludes the file is corrupt — when actually the on-disk file
+    is fine. It then runs `sed`/`python` "repairs" based on its
+    truncated view, which is where the REAL corruption enters the
+    file. See the 7b4e6289 todo-app build for the canonical example
+    of this loop. Older observations (>K back) still get capped —
+    `mask_old_observations` handles long-term budget pressure
+    separately, so the per-message cap here is just a safety net
+    against pathological single-message bloat."""
+    # Find the indices of the last K ToolMessages. Walk back from the
+    # end; collect the first K ToolMessage positions. Anything before
+    # `preserve_from` gets the cap applied.
+    KEEP_RECENT = 4
+    tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
+    # Preserve the last K observations verbatim. If there are FEWER
+    # than K observations in total, preserve them all (a short
+    # history of large tool results is exactly the post-write
+    # verification pattern — we don't want to collapse any of them).
+    if len(tool_indices) >= KEEP_RECENT:
+        preserve_from = tool_indices[-KEEP_RECENT]
+    else:
+        preserve_from = tool_indices[0] if tool_indices else None
+
     out: list[BaseMessage] = []
     n_truncated_tool = 0
     n_truncated_call = 0
-    for m in messages:
+    n_preserved = 0
+    for i, m in enumerate(messages):
         if isinstance(m, ToolMessage):
+            # Recent observations: pass through verbatim, regardless of
+            # length, so the agent can verify its own writes.
+            if preserve_from is not None and i >= preserve_from:
+                out.append(m)
+                n_preserved += 1
+                continue
             new_content = _truncate_tool_result(m.content)
             if new_content is not m.content:
                 n_truncated_tool += 1
@@ -811,12 +846,12 @@ def _truncate_live_history(messages: list[BaseMessage]) -> list[BaseMessage]:
                 out.append(m)
         else:
             out.append(m)
-    if n_truncated_tool or n_truncated_call:
+    if n_truncated_tool or n_truncated_call or n_preserved:
         import logging
         logging.getLogger(__name__).info(
-            "[history-trim] truncated %d tool result(s) + %d tool call arg(s) "
-            "for the live window",
-            n_truncated_tool, n_truncated_call,
+            "[history-trim] truncated %d tool result(s) + %d tool call arg(s); "
+            "preserved %d recent observation(s) verbatim",
+            n_truncated_tool, n_truncated_call, n_preserved,
         )
     return out
 

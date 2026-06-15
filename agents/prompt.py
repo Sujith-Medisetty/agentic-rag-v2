@@ -490,6 +490,38 @@ def get_ojas_app_rules_section() -> str:
         "with a blank screen because the agent put the trigger next "
         "to the display but left the `<Sheet>` block as a separate "
         "sibling at the top of the return.",
+
+        "",
+        "CRITICAL — A truncated tool result is NOT file corruption. "
+        "When a tool result in your conversation looks like "
+        "`[output truncated: 16,170 chars (~1,540 tokens); first 800 "
+        "chars: 'className=...'… re-invoke the tool to see the full "
+        "body]`, that is the per-turn context-budget cap, NOT the "
+        "file on disk being corrupt. The on-disk file is the source "
+        "of truth. Concretely:",
+        "  - The `write_file` tool is lossless for any size. The file "
+        "ends up on disk exactly as you wrote it, quotes and newlines "
+        "preserved.",
+        "  - After writing, the most-recent K=4 tool results in your "
+        "live history are preserved verbatim regardless of size, so "
+        "your immediate post-write Read / `wc -l` / `grep -c` / "
+        "`python3 -m py_compile` results are NOT collapsed.",
+        "  - Older observations (back further than K=4) get collapsed "
+        "by `mask_old_observations` to a one-line stub. That stub is "
+        "NOT evidence of corruption — re-invoke the tool if you need "
+        "the fresh body.",
+        "  - If you suspect a write was corrupted, verify on disk:",
+        "    * `wc -l file` — must be > 1 for multi-line content.",
+        "    * `grep -c '\"' file` — must be > 0 for TSX/HTML/JSON.",
+        "    * For Python: `python3 -m py_compile file && echo OK`.",
+        "    * For TSX: `npx tsc --noEmit --skipLibCheck file.tsx`.",
+        "  - **Never** `sed`/`awk`/`python` patch in place when you "
+        "suspect corruption — delete the file (`rm -f file`) and "
+        "rewrite it from scratch in smaller chunks. Patches on top of "
+        "corruption compound, and the patch expressions themselves "
+        "may carry the same truncation fragility. The 7b4e6289 todo "
+        "session shipped 4 attempts at the same 16KB file because of "
+        "this exact loop.",
         "",
         "## 4. Storage rule — localStorage is for tiny UI prefs only",
         "",
