@@ -268,26 +268,44 @@ async def run_turn(
 
         # Persist the user message that started this turn into the
         # LangGraph state. Without this, a turn that was cancelled
-        # Persist the user message that started this turn. Without
-        # this, a turn cancelled mid-stream leaves no checkpoint
-        # (the LLM was still streaming when the cancel landed) and
-        # the user message is LOST — the next turn reads the
-        # pre-cancel state and never sees the interrupted question.
-        # update_state is best-effort; a wedged checkpointer must
-        # not fail the cancel-cleanup itself.
+        # mid-stream leaves no checkpoint (the LLM was still streaming
+        # when the cancel landed) and the user message is LOST — the
+        # next turn reads the pre-cancel state and never sees the
+        # interrupted question.
+        #
+        # IMPORTANT: only append if the user prompt is NOT already in
+        # `live_messages`. The happy-path `_drive` already seeds the
+        # initial state with `prior_live + [HumanMessage(user_prompt)]`
+        # before streaming, so if the cancel lands AFTER that seed
+        # (which is almost always — node_agent hasn't had a chance to
+        # run yet) the prompt is already there. The earlier version
+        # of this code unconditionally appended, which duplicated
+        # every cancelled user prompt and the second copy later got
+        # swept away by `maybe_compact` — taking neighboring human
+        # messages (i.e. the prior turn's real question) with it.
+        # Content-match dedup is good enough here; the seed and the
+        # append use the same user_prompt string and the next turn
+        # doesn't re-emit the same string verbatim.
         try:
             from agents.graph import runner_graph
             cfg = {"configurable": {"thread_id": session_id}}
             prior_live = list(
                 runner_graph.get_state(cfg).values.get("live_messages") or []
             )
-            runner_graph.update_state(
-                cfg,
-                {
-                    "messages": [HumanMessage(content=user_prompt)],
-                    "live_messages": prior_live + [HumanMessage(content=user_prompt)],
-                },
+            already_present = any(
+                getattr(m, "content", None) == user_prompt
+                and getattr(m, "type", None) == "human"
+                for m in prior_live
             )
+            if not already_present:
+                new_live = prior_live + [HumanMessage(content=user_prompt)]
+                runner_graph.update_state(
+                    cfg,
+                    {
+                        "messages": [HumanMessage(content=user_prompt)],
+                        "live_messages": new_live,
+                    },
+                )
         except Exception:
             pass
     except Exception as e:
