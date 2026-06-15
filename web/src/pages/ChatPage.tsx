@@ -1890,7 +1890,7 @@ export default function ChatPage() {
             <span className="text-border">·</span>
             <button type="button" onClick={() => setInput("/stop")} className="hover:text-accent">/stop</button>
           </div>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
             <textarea
               ref={composerRef}
               value={input}
