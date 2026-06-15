@@ -213,6 +213,12 @@ async def run_turn(
             # Plumbed so node_agent can key the cross-turn
             # maybe_compact / record_llm_input_tokens cache by session.
             "session_id":      session_id,
+            # Fresh todo state for the new turn. The TodoWrite tool
+            # will overwrite `last_todos` after its first call of
+            # this turn. `todo_sync_nudged` resets so the end-of-
+            # task sync gate can fire once on THIS turn if needed.
+            "last_todos":      [],
+            "todo_sync_nudged": False,
         }
         for _ in runner_graph.stream(
             initial_state, config=config, stream_mode="updates",

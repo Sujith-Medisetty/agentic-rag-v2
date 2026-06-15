@@ -1174,12 +1174,148 @@ def node_agent(state: RunnerState) -> dict:
     }
 
 
+def _read_todo_store(session_id: str | None) -> list[dict]:
+    """Read the on-disk todo store for a session.
+
+    Returns the current todo list (empty list if the file is missing,
+    malformed, or there is no session). The TodoWrite tool writes to
+    `<session_state_dir(session_id)>/.clawd-todos.json` (see
+    `tools.utils._todo_store_path` and `server.session_runner.
+    session_state_dir`). Reading the file directly is the only
+    reliable way to know the agent's current plan, since LangGraph
+    tools can't write back into RunnerState from inside a tool call.
+
+    Used by `node_tools` (to capture post-TodoWrite state into
+    `state["last_todos"]`) and by `node_force_todo_sync` (to print
+    the open items in the nudge message).
+    """
+    if not session_id:
+        return []
+    try:
+        from server.session_runner import session_state_dir
+        path = session_state_dir(session_id) / ".clawd-todos.json"
+        if not path.exists():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        # Never let a sync-nudge crash the loop because the todo
+        # file is unreadable — fall back to "no open todos" and
+        # let the agent terminate normally.
+        return []
+
+
+def _capture_todos_from_tool_results(state: RunnerState, tool_messages: list) -> list[dict]:
+    """Return the freshest todo list observed in the just-finished tool batch.
+
+    Walks the tool result messages in order; if any of them is a
+    TodoWrite result (the wrapper returns a `Updated todo list: ...`
+    string), the underlying `todo_write` function already wrote the
+    new list to disk, so a `_read_todo_store` call picks it up. We
+    don't try to parse the string (the JSON is on disk, not in the
+    message); we just trigger the read.
+
+    If no TodoWrite happened in this batch, return whatever was
+    already in `state["last_todos"]` (so the gate has a stable
+    view across turns where TodoWrite isn't called).
+    """
+    if any(getattr(m, "name", "") == "TodoWrite" for m in tool_messages):
+        return _read_todo_store(state.get("session_id"))
+    return list(state.get("last_todos") or [])
+
+
+def node_force_todo_sync(state: RunnerState) -> dict:
+    """Final-turn sync nudge.
+
+    The agent has signalled completion (no tool_calls on its last
+    message) but the todo store still has open items. This is the
+    bug the user has been reporting: the agent finishes the work,
+    sends its summary, and the UI plan panel sits there with
+    `pending` / `in_progress` rows the user has to stare at.
+
+    We inject a hard SystemMessage that lists the open items by
+    name and demands a TodoWrite call before the next reply. We
+    also set `todo_sync_nudged=True` so `should_continue` only
+    fires this gate ONCE per turn — after the nudge, the agent
+    either calls TodoWrite (which updates `last_todos` via
+    `node_tools`) or sends a final message; either way we
+    terminate on the next `should_continue` check.
+
+    The nudge is appended to `live_messages` (not `messages`) so
+    the audit log stays clean — only the working set the LLM sees
+    is mutated. Without this, the audit log would carry a
+    SystemMessage the user never wrote and that the UI would
+    render as a "system" line in the conversation.
+    """
+    last_todos = list(state.get("last_todos") or [])
+    open_items = [t for t in last_todos if t.get("status") in ("pending", "in_progress")]
+    if not open_items:
+        # Edge case: `last_todos` was just emptied by a TodoWrite
+        # in `node_tools`. Nothing to nudge. Just flip the flag
+        # and let `should_continue` route to __end__.
+        return {"todo_sync_nudged": True}
+
+    # Build a precise, scannable list. Showing the agent its own
+    # todo content (not a generic "you have N open todos") is the
+    # single biggest correctness lever — the model recognises its
+    # own plan and either ticks the boxes or admits the items
+    # were dropped/skipped.
+    bullets = "\n".join(
+        f"  - [{t.get('status', '?')}] {t.get('content', '?')}"
+        for t in open_items
+    )
+    nudge = (
+        "FINAL-TURN TODO SYNC (mandatory). Before you finish this "
+        "turn you MUST call TodoWrite to reconcile the following "
+        "open items. For each, set status to `completed` (if you "
+        "actually did it) or remove it from the list (if you "
+        "decided to skip it). DO NOT leave any of these in "
+        "`pending` or `in_progress` when you finish — the user "
+        "watches the plan panel in real time and a stale row means "
+        "they think the work is unfinished.\n\n"
+        f"Open items:\n{bullets}\n\n"
+        "After this TodoWrite call, you may send your final summary "
+        "message and the loop will end."
+    )
+
+    # Mirror to live_messages only — keep the audit log untouched
+    # so the WS feed doesn't show a phantom system line.
+    existing = list(state.get("live_messages") or state.get("messages", []))
+    return {
+        "live_messages": existing + [SystemMessage(content=nudge)],
+        "todo_sync_nudged": True,
+    }
+
+
 def should_continue(state: RunnerState) -> str:
-    """Terminal check: continue while the assistant requests tools."""
+    """Terminal check: continue while the assistant requests tools.
+
+    Force-sync gate: if the assistant is about to return no-tool-calls
+    (i.e. the loop is about to terminate) AND we have a non-empty
+    `last_todos` snapshot with at least one `pending` or `in_progress`
+    item, route to `node_force_todo_sync` instead of `__end__`. The
+    sync node injects a hard SystemMessage asking the agent to call
+    TodoWrite to either complete or drop every open item, then loops
+    back to `node_agent`. After ONE sync nudge we terminate regardless
+    of state — we'd rather end with stale todos than infinite-loop.
+    """
     messages = state.get("messages", [])
     last = messages[-1] if messages else None
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         return "node_tools"
+
+    # Force-sync nudge at task end. Skip if the agent already
+    # synced this turn (last assistant message was the TodoWrite
+    # itself, so last_todos reflects the agent's final state and
+    # re-prompting is pointless). Also skip if the nudger already
+    # fired once this turn — `todo_sync_nudged` flips True in
+    # `node_force_todo_sync` and we honor a single nudge.
+    last_todos = state.get("last_todos") or []
+    nudged = bool(state.get("todo_sync_nudged"))
+    if last_todos and not nudged:
+        open_items = [t for t in last_todos if t.get("status") in ("pending", "in_progress")]
+        if open_items:
+            return "node_force_todo_sync"
     return "__end__"
 
 
@@ -1220,8 +1356,16 @@ def node_tools(state: RunnerState) -> dict:
     new_tool_messages = list(result.get("messages", []))
     if new_tool_messages:
         existing = list(state.get("live_messages") or state.get("messages", []))
+        # Capture fresh todo state right after a TodoWrite call so
+        # `should_continue`'s end-of-task sync gate has the latest
+        # list. The TodoWrite wrapper writes to disk, so the on-disk
+        # file is now authoritative; we read it back here. Falls
+        # through to the prior `last_todos` value if no TodoWrite
+        # happened in this batch.
+        last_todos = _capture_todos_from_tool_results(state, new_tool_messages)
         return {
             **result,
             "live_messages": existing + new_tool_messages,
+            "last_todos": last_todos,
         }
     return result
