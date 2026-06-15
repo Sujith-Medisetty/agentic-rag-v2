@@ -9,15 +9,18 @@
  *                    (comparison tables, pricing cards, FAQ)
  *
  * Pick whichever matches the user's request, or replace both with the
- * real IA. The same nav, theme, and PWA wiring is shared.
+ * real IA.
+ *
+ * STARTER EXAMPLE — page chrome (the top bar with title,
+ * ThemeToggle, InstallButton) lives in `App.tsx`. This component
+ * only renders the feature content INSIDE App.tsx's <main>. The
+ * per-section anchor nav is part of the feature, not page chrome.
  */
-import { Check, Sparkles, X } from "lucide-react";
-import { motion, useReducedMotion } from "framer-motion";
+import { Check, X } from "lucide-react";
+import { motion } from "framer-motion";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ThemeToggle } from "@/components/theme-toggle";
-import InstallButton from "@/components/install-button";
 import { cardIn, fadeUp, hover, stagger, tap } from "@/lib/motion";
 
 const NAV = [
@@ -97,7 +100,7 @@ function scrollToId(id: string) {
 
 function NavLinks() {
   return (
-    <>
+    <nav className="mx-auto flex max-w-5xl flex-wrap items-center gap-1 px-4 py-3 sm:px-6">
       {NAV.map(({ id, label }) => (
         <a
           key={id}
@@ -111,55 +114,14 @@ function NavLinks() {
           {label}
         </a>
       ))}
-    </>
+    </nav>
   );
 }
 
 export default function ProductExample() {
-  const reduce = useReducedMotion();
-
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <motion.header
-        initial={reduce ? false : { y: -20, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-        className="sticky top-0 z-30 hidden border-b border-border/60 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60 md:block"
-      >
-        <nav className="mx-auto flex h-14 max-w-5xl items-center gap-6 px-6">
-          <a
-            href="#top"
-            onClick={(e) => { e.preventDefault(); scrollToId("top"); }}
-            className="inline-flex items-center gap-2 text-sm font-semibold tracking-tight"
-          >
-            <Sparkles className="h-4 w-4 text-accent" />
-            Product
-          </a>
-          <div className="flex gap-1">
-            <NavLinks />
-          </div>
-          <div className="ml-auto flex items-center gap-2">
-            <ThemeToggle />
-            <InstallButton />
-          </div>
-        </nav>
-      </motion.header>
-
-      <motion.header
-        initial={reduce ? false : { y: -20, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-        className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-border/60 bg-background/80 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60 md:hidden"
-      >
-        <span className="inline-flex items-center gap-2 text-sm font-semibold tracking-tight">
-          <Sparkles className="h-4 w-4 text-accent" />
-          Product
-        </span>
-        <div className="flex items-center gap-1">
-          <ThemeToggle />
-          <InstallButton />
-        </div>
-      </motion.header>
+    <>
+      <NavLinks />
 
       <main id="top" className="mx-auto max-w-5xl px-4 sm:px-6">
         {/* Hero */}
@@ -390,6 +352,6 @@ export default function ProductExample() {
           <span className="text-xs">Replace this footer with your own links.</span>
         </div>
       </motion.footer>
-    </div>
+    </>
   );
 }

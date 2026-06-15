@@ -17,6 +17,8 @@ If you're an LLM scaffolding a new app, copy this file and adjust:
 import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from urllib.parse import urlparse
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +28,13 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 # ---- Database setup --------------------------------------------------------
 
+# SQLite URL slash convention (easy to miscount — costs one extra try on
+# the sanity check):
+#   sqlite:///./data/app.db    -> 3 slashes -> RELATIVE path  ("data/app.db")
+#   sqlite:////tmp/foo.db      -> 4 slashes -> ABSOLUTE path  ("/tmp/foo.db")
+#   sqlite:///:memory:         -> special in-memory database
+# One extra or missing slash and SQLAlchemy will treat the path as a
+# database name (and silently create an empty file with that name).
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/app.db")
 engine = create_engine(
     DATABASE_URL,
@@ -35,6 +44,37 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
+
+
+def _ensure_sqlite_parent_dir(url: str) -> None:
+    """For sqlite URLs, create the parent directory of the file path
+    before SQLAlchemy tries to open it. The deploy pipeline already
+    does this, but local dev crashes on first run with
+    `sqlite3.OperationalError: unable to open database file` if the
+    `data/` dir doesn't exist yet.
+    """
+    if not url.startswith("sqlite"):  # postgres/mysql/etc. — leave alone
+        return
+    parsed = urlparse(url)
+    # urlparse("sqlite:///./data/app.db") -> path = "/./data/app.db"
+    # urlparse("sqlite:////tmp/foo.db")   -> path = "//tmp/foo.db"
+    # urlparse("sqlite:///:memory:")      -> path = "/:memory:"  (in-memory, no dir)
+    db_path = parsed.path
+    if not db_path or db_path.startswith(":"):
+        return  # in-memory or empty — nothing to mkdir
+    # Strip the extra leading slash that comes from the 3-slash form
+    # so "/./data/app.db" becomes "./data/app.db" (a real relative path).
+    if db_path.startswith("/") and not db_path.startswith("//"):
+        db_path = db_path.lstrip("/")
+    parent = Path(db_path).expanduser().resolve().parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+
+# Make sure the DB's parent directory exists BEFORE we hand the URL to
+# SQLAlchemy. create_all() below would otherwise create the file in a
+# non-existent dir and crash with a confusing "unable to open database"
+# error. The cost when the dir already exists is one no-op stat().
+_ensure_sqlite_parent_dir(DATABASE_URL)
 
 
 class Item(Base):

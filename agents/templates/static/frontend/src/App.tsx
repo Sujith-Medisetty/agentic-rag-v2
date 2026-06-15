@@ -1,27 +1,32 @@
 import { useEffect } from "react";
-import SectionsExample from "@/components/sections-example";
-// import ProductExample from "@/components/product-example";
+import { Sparkles } from "lucide-react";
+
+import InstallButton from "@/components/install-button";
+import { ThemeToggle } from "@/components/theme-toggle";
+import StarterSections from "@/components/_sections-example.example";
+// import StarterProduct from "@/components/_product-example.example";
 
 /**
- * The agent's real app replaces this file. The template ships TWO
- * example IAs the agent can copy from (or use as-is if they fit):
+ * Page chrome lives here — App.tsx owns the top bar, ThemeToggle,
+ * and InstallButton.
  *
- *   SectionsExample — long-form text sections (Hero / Overview /
- *                    Highlights / Connect). Best for portfolios,
- *                    personal sites, docs fronts, "about me" pages,
- *                    marketing landing pages.
- *
- *   ProductExample  — pricing tiers + feature comparison + FAQ.
- *                    Best for SaaS landings, product launches, B2B
- *                    pitch pages.
- *
- *   (both live in src/components/. Uncomment the import + swap the
- *   return to try the other one.)
- *
- * If the user's request is for a multi-page app (a dashboard, a
- * tool, a game, a productivity app), REPLACE these examples with
- * the right IA for the request — the template can't anticipate
- * every shape.
+ * Why this file is structured this way:
+ *   - The system prompt's CRITICAL rule says page chrome
+ *     (app title, ThemeToggle, InstallButton, header bar) belongs
+ *     to App.tsx and ONLY to App.tsx. A real feature component
+ *     (Calculator, Calendar, Todo, ...) is rendered INSIDE the
+ *     App.tsx <main> and never has to duplicate the chrome.
+ *   - The starter below renders one of the template's example
+ *     layouts (`_sections-example.example.tsx`) inside <main>.
+ *     The agent's real build:
+ *       1. Replaces the import + return body to render their
+ *          feature component.
+ *       2. Optionally uncomments `StarterProduct` to try the
+ *          pricing-tier example instead.
+ *       3. Deletes the .example files when they're done.
+ *   - Per-section anchor nav (Overview / Highlights / Connect, or
+ *     Features / Pricing / FAQ) stays INSIDE the example layout,
+ *     because it's feature content, not page chrome.
  */
 export default function App() {
   // Register the service worker so the browser will surface the
@@ -36,5 +41,32 @@ export default function App() {
       .catch((err) => console.warn("SW registration failed:", err));
   }, []);
 
-  return <SectionsExample />;
+  return (
+    <div className="flex min-h-screen flex-col bg-background text-foreground">
+      <header
+        className="sticky top-0 z-40 flex h-14 items-center gap-4 border-b border-border/60 bg-background/80 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60 sm:px-6"
+        style={{ paddingTop: "env(safe-area-inset-top)" }}
+      >
+        <a
+          href="#top"
+          onClick={(e) => {
+            e.preventDefault();
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+          className="inline-flex items-center gap-2 text-sm font-semibold tracking-tight"
+        >
+          <Sparkles className="h-4 w-4 text-accent" />
+          Ojas
+        </a>
+        <div className="ml-auto flex items-center gap-2">
+          <ThemeToggle />
+          <InstallButton />
+        </div>
+      </header>
+
+      <main className="flex-1">
+        <StarterSections />
+      </main>
+    </div>
+  );
 }

@@ -12,14 +12,17 @@
  * a portfolio, a product page, a startup landing, a docs front, or
  * an "about me" page. The agent should rename them to match whatever
  * the user's request actually is.
+ *
+ * STARTER EXAMPLE — page chrome (the top bar with title,
+ * ThemeToggle, InstallButton) lives in `App.tsx`. This component
+ * only renders the feature content INSIDE App.tsx's <main>. The
+ * per-section anchor nav is part of the feature, not page chrome.
  */
-import { ArrowUpRight, Sparkles } from "lucide-react";
-import { motion, useReducedMotion } from "framer-motion";
+import { ArrowUpRight } from "lucide-react";
+import { motion } from "framer-motion";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { ThemeToggle } from "@/components/theme-toggle";
-import InstallButton from "@/components/install-button";
 import { cardIn, fadeUp, hover, stagger, tap } from "@/lib/motion";
 
 // Each entry: { id, label }. The agent should rename labels to match
@@ -51,13 +54,12 @@ function scrollToId(id: string) {
 }
 
 /**
- * NavLinks — renders the desktop + mobile nav anchor list. Extracted
- * from the body so the desktop and mobile headers stay in sync and
- * the agent can add a section by editing NAV + nothing else.
+ * NavLinks — renders the section anchor list. Extracted so the
+ * section nav and any other place that needs it stay in sync.
  */
 function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   return (
-    <>
+    <nav className="mx-auto flex max-w-5xl flex-wrap items-center gap-1 px-4 py-3 sm:px-6">
       {NAV.map(({ id, label }) => (
         <a
           key={id}
@@ -72,60 +74,14 @@ function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
           {label}
         </a>
       ))}
-    </>
+    </nav>
   );
 }
 
 export default function SectionsExample() {
-  const reduce = useReducedMotion();
-
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      {/* Sticky top nav — desktop */}
-      <motion.header
-        initial={reduce ? false : { y: -20, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-        className="sticky top-0 z-30 hidden border-b border-border/60 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60 md:block"
-      >
-        <nav className="mx-auto flex h-14 max-w-5xl items-center gap-6 px-6">
-          <a
-            href="#top"
-            onClick={(e) => {
-              e.preventDefault();
-              scrollToId("top");
-            }}
-            className="inline-flex items-center gap-2 text-sm font-semibold tracking-tight"
-          >
-            <Sparkles className="h-4 w-4 text-accent" />
-            Ojas
-          </a>
-          <div className="flex gap-1">
-            <NavLinks />
-          </div>
-          <div className="ml-auto flex items-center gap-2">
-            <ThemeToggle />
-            <InstallButton />
-          </div>
-        </nav>
-      </motion.header>
-
-      {/* Mobile top bar */}
-      <motion.header
-        initial={reduce ? false : { y: -20, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-        className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-border/60 bg-background/80 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/60 md:hidden"
-      >
-        <span className="inline-flex items-center gap-2 text-sm font-semibold tracking-tight">
-          <Sparkles className="h-4 w-4 text-accent" />
-          Ojas
-        </span>
-        <div className="flex items-center gap-1">
-          <ThemeToggle />
-          <InstallButton />
-        </div>
-      </motion.header>
+    <>
+      <NavLinks />
 
       <main id="top" className="mx-auto max-w-5xl px-4 sm:px-6">
         {/* Hero */}
@@ -215,7 +171,7 @@ export default function SectionsExample() {
             </div>
             <p className="sm:col-span-2 text-base text-muted-foreground">
               Replace this with a 2-3 sentence pitch: what this is,
-              who it's for, and why the visitor should care. One tight
+              who it&apos;s for, and why the visitor should care. One tight
               paragraph beats a wall of text every time.
             </p>
           </motion.div>
@@ -299,6 +255,6 @@ export default function SectionsExample() {
           <span className="text-xs">Replace this footer with your own links.</span>
         </div>
       </motion.footer>
-    </div>
+    </>
   );
 }
