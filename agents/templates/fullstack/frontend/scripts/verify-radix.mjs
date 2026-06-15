@@ -119,6 +119,35 @@ for (const file of walkTsx(SRC)) {
   }
 }
 
+// Sonner <Toaster /> singleton check. The template mounts the
+// <Toaster /> in main.tsx (the canonical app-root location, so
+// every component can call `toast(...)` from anywhere). If
+// another file also renders a <Toaster />, every toast fires
+// twice (the calculator build on 2026-06-15 hit this). The
+// template CAN have one and only one.
+const toasterFiles = [];
+for (const file of walkTsx(SRC)) {
+  const src = fs.readFileSync(file, "utf8");
+  if (/<Toaster\b/.test(src)) toasterFiles.push(file);
+}
+if (toasterFiles.length === 0) {
+  console.error(
+    "  ✗ No <Toaster /> found in the source. The template mounts the " +
+      "Sonner toaster in main.tsx so any component can call toast(). " +
+      "Don't delete it.",
+  );
+  violations += 1;
+} else if (toasterFiles.length > 1) {
+  for (const f of toasterFiles) {
+    console.error(
+      `  ✗ <Toaster /> in ${path.relative(process.cwd(), f)} — ` +
+        "duplicates the canonical mount in main.tsx. Every toast " +
+        "would fire twice. Remove this one.",
+    );
+    violations += 1;
+  }
+}
+
 if (violations > 0) {
   console.error(
     `\n${violations} Radix invariant violation${violations === 1 ? "" : "s"} found. ` +
