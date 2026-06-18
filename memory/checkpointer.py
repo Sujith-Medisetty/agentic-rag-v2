@@ -45,17 +45,13 @@ AUTO_COMPACT_THRESHOLD_LEGACY_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 CONTEXT_WINDOW_TOKENS = 200_000
 
 CHARS_PER_TOKEN = 4
-# Most-recent messages to keep verbatim when compacting. History is now
-# append-only between compactions (no per-turn mask/strip/truncate), so these
-# kept messages are FULL-size — 8 ≈ the last 3-4 message-sets (user / assistant
-# / tool-result cycles), enough to carry mid-edit context without dragging a
-# long tail behind every compaction. Everything older is folded into the
-# summary (which pins the original request + files touched + errors fixed), so
-# dropping the raw messages doesn't lose the thread. Override via
-# OJAS_PRESERVE_RECENT. (Was 30, tuned for the old masked world; full-size
-# messages make 30 far too heavy.)
-PRESERVE_RECENT = 8
-PRESERVE_RECENT_ENV_VAR = "OJAS_PRESERVE_RECENT"
+# NOTE: there is no "preserve last N messages" knob anymore. Compaction is
+# Claude-Code-style PURE REPLACE — the entire prior conversation is folded into
+# one structured summary and the raw messages are dropped; recency is carried by
+# the summary, the live todo list is re-injected verbatim, and the system prompt
+# is preserved out-of-band. The sole trigger is the token threshold (below);
+# `_compact_messages` no-ops on a ≤1-message history so there's nothing to guard
+# by count. (Removed the old PRESERVE_RECENT / OJAS_PRESERVE_RECENT.)
 
 # Tool-result truncation: bodies over this many chars get collapsed
 # to a one-line pointer. The agent can re-invoke the tool to get the
@@ -87,7 +83,6 @@ COMPACT_PREAMBLE = (
     "of context. The summary below covers the earlier portion of the "
     "conversation.\n\n"
 )
-COMPACT_RECENT_MESSAGES_NOTE = "Recent messages are preserved verbatim."
 COMPACT_DIRECT_RESUME_INSTRUCTION = (
     "Continue the conversation from where it left off without asking the user "
     "any further questions. Resume directly — do not acknowledge the summary, "
@@ -146,20 +141,6 @@ def _auto_compact_threshold() -> int:
             except ValueError:
                 pass
     return DEFAULT_AUTO_COMPACT_INPUT_TOKENS
-
-
-def _preserve_recent() -> int:
-    """How many of the most-recent messages to keep verbatim when compacting.
-    Override at runtime via `OJAS_PRESERVE_RECENT` (e.g. to bump down on
-    especially tight budgets, or up for code-review style sessions where
-    the agent loops over the same diff repeatedly)."""
-    raw = os.getenv(PRESERVE_RECENT_ENV_VAR)
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            pass
-    return PRESERVE_RECENT
 
 
 def _tool_result_truncate_at() -> int:
@@ -571,100 +552,78 @@ def _summarize_messages_heuristic(messages: list) -> str:
 
     return "\n".join(parts) or "Previous conversation."
 
-def _compact_messages(messages: list) -> list:
-    """Summarise old messages, keep recent tail. Returns a new list:
-    `[HumanMessage(summary), ...recent_kept]`. The summary is injected
-    as a HumanMessage (not SystemMessage) so it doesn't produce three
-    consecutive SystemMessages at the start of the next LLM call.
-    """
-    preserve = _preserve_recent()
-    threshold = _auto_compact_threshold()
-    # Bail only when both count AND estimate are small. A 1.8 MB
-    # user-pasted short story is 4 messages but ~450K tokens, so the
-    # length check alone would skip a session that's already over
-    # threshold.
-    if len(messages) <= preserve and _estimate_tokens(messages) < threshold:
-        return messages
+def _render_todo_block(todos: list | None) -> str:
+    """Render the live todo list verbatim, for re-injection after a compaction
+    summary. Returns '' when there are no todos.
 
-    # Drop any stray SystemMessage (the real system prompt is rebuilt
-    # each turn from `system_prompt_pair`).
-    messages = [m for m in messages if not isinstance(m, SystemMessage)]
-    if len(messages) <= preserve and _estimate_tokens(messages) < threshold:
-        return messages
-
-    # Keep the last `preserve` messages verbatim, summarise the rest.
-    # If the list is shorter than `preserve` but still over threshold
-    # (the 4-message / 1.8MB case), cut at least 1 from the front so
-    # the giant message gets replaced with a summary.
-    cut = max(1, len(messages) - preserve) if len(messages) > preserve else 1
-
-    # Walk cut BACKWARDS past tool_result blocks so we don't summarise
-    # an AIMessage while keeping its result, or vice versa. Two shapes
-    # to detect: separate ToolMessage (OpenAI/MiniMax) or list-shaped
-    # AIMessage with a `tool_result` content block (Anthropic).
-    while cut > 0:
-        msg = messages[cut]
-        if isinstance(msg, ToolMessage):
-            cut -= 1
+    The agent normally only ever *sees* its todo list via the TodoWrite tool
+    results in the message history. Pure-replace compaction deletes those, so
+    without this the agent would lose its exact plan (each item's content +
+    status) and have only the summary's prose description of pending work. We
+    re-surface the structured list so the agent keeps working against it —
+    matching how Claude Code keeps the todo list alive across compaction."""
+    if not todos:
+        return ""
+    lines = []
+    for t in todos:
+        if not isinstance(t, dict):
             continue
-        content = msg.content if hasattr(msg, "content") else []
-        if isinstance(content, list) and any(
-            isinstance(b, dict) and b.get("type") == "tool_result"
-            for b in content
-        ):
-            cut -= 1
+        content = (t.get("content") or "").strip()
+        if not content:
             continue
-        break
-
-    # Walk the cut FORWARDS past any leading ToolMessage in the kept tail.
-    # If the kept window starts with a ToolMessage, the AIMessage that
-    # owns it has been summarised away — push the cut forward to keep
-    # both, or `_repair_orphan_tool_calls` will strip the tool_call and
-    # the agent loses context.
-    while cut < len(messages) - 1 and cut > 0:
-        nxt = messages[cut]
-        if isinstance(nxt, ToolMessage):
-            cut += 1
-            continue
-        content = nxt.content if hasattr(nxt, "content") else []
-        if isinstance(content, list) and any(
-            isinstance(b, dict) and b.get("type") == "tool_use"
-            for b in content
-        ):
-            cut += 1
-            continue
-        # Walk past any HumanMessage at the cut boundary so the
-        # most recent user question is always in the kept tail,
-        # not in the summary. Without this, the cut can land on a
-        # HumanMessage (e.g. the user's "what about dark mode?"
-        # sitting right after a long tool-call sequence) and the
-        # summariser absorbs it into a one-line note — the LLM
-        # never sees it as a discrete user turn. Stop when we
-        # land on a non-HumanMessage (an AI response, which is
-        # what should follow a user question in conversation
-        # order).
-        if isinstance(nxt, HumanMessage):
-            cut += 1
-            continue
-        break
-
-    to_summarise = messages[:cut]
-    to_keep = messages[cut:]
-
-    if not to_summarise:
-        return messages
-
-    summary_text = _summarize_messages(to_summarise)
-    continuation = (
-        f"{COMPACT_PREAMBLE}Summary:\n{summary_text.strip()}\n\n"
-        f"{COMPACT_RECENT_MESSAGES_NOTE} {COMPACT_DIRECT_RESUME_INSTRUCTION}"
+        status = (t.get("status") or "pending").strip()
+        lines.append(f"- [{status}] {content}")
+    if not lines:
+        return ""
+    return (
+        "Current todo list (your live plan — preserved across compaction; keep "
+        "updating it with TodoWrite as you make progress):\n" + "\n".join(lines)
     )
 
-    # Bug B fix: inject as HumanMessage, not SystemMessage, so we don't
-    # produce three consecutive SystemMessages at the start of the next
-    # LLM call. The summary is a synthetic "user" turn saying "below is
-    # what we talked about before; please continue."
-    return [HumanMessage(content=continuation)] + to_keep
+
+def _compact_messages(messages: list, todos: list | None = None) -> list:
+    """Summarise the ENTIRE prior conversation into one structured summary
+    message and DISCARD the raw messages — Claude-Code-style "pure replace".
+    Returns `[HumanMessage(summary + todo block)]`.
+
+    The summary becomes the sole carrier of conversation history; recency lives
+    in its 'Current work' / 'Pending tasks' / 'All user messages' sections. Two
+    things that must NOT be lost are preserved out-of-band:
+      - The SYSTEM PROMPT is not in this list at all (it's rebuilt every turn
+        from `system_prompt_pair` and prepended ahead of this message), so it
+        always survives AND stays at the front of the prompt → cache hit.
+      - The LIVE TODO LIST is re-injected verbatim after the summary (see
+        `_render_todo_block`), so the agent keeps its EXACT plan, not just the
+        summary's prose.
+
+    Cache shape: the returned summary message sits right after the (cached)
+    system prompt, so it's the single new region charged once at compaction;
+    from the next turn `[system][summary]` is itself a stable cached prefix.
+    """
+    threshold = _auto_compact_threshold()
+    # Drop any stray SystemMessage (the real system prompt is rebuilt each turn
+    # from `system_prompt_pair`).
+    messages = [m for m in messages if not isinstance(m, SystemMessage)]
+    # Nothing worth compacting: an empty/one-message history that's also under
+    # threshold. (A single 1.8 MB pasted message IS worth compacting, hence the
+    # estimate check rather than count alone.)
+    if len(messages) <= 1 and _estimate_tokens(messages) < threshold:
+        return messages
+
+    summary_text = _summarize_messages(messages)
+    continuation = (
+        f"{COMPACT_PREAMBLE}Summary:\n{summary_text.strip()}\n\n"
+        f"{COMPACT_DIRECT_RESUME_INSTRUCTION}"
+    )
+    todo_block = _render_todo_block(todos)
+    if todo_block:
+        continuation += f"\n\n{todo_block}"
+
+    # Inject as HumanMessage (not SystemMessage) so we don't produce two
+    # consecutive SystemMessages at the start of the next LLM call — the real
+    # system prompt is prepended separately. The summary is a synthetic "user"
+    # turn: "here is everything we did; continue from where we left off."
+    return [HumanMessage(content=continuation)]
 
 
 def record_llm_input_tokens(input_tokens: int, session_id: str | None = None) -> None:
@@ -694,11 +653,16 @@ def _last_llm_input_tokens(session_id: str | None = None) -> int:
     return _LAST_LLM_INPUT_TOKENS.get()
 
 
-def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, bool, dict]:
+def maybe_compact(messages: list, session_id: str | None = None,
+                  todos: list | None = None) -> tuple[list, bool, dict]:
     """Compact the message list NOW if it crosses the auto-compaction
     threshold. Called by the agent loop BEFORE `model.invoke(messages)`
     so the turn that crosses threshold pays for the smaller compacted
     context, not the giant one.
+
+    `todos` is the agent's current todo list (`state["last_todos"]`); it is
+    re-injected verbatim after the summary so the plan survives the pure-replace
+    compaction (the summary alone would only describe it in prose).
 
     Returns `(messages, did_compact, info)`. `info` is the payload for
     the chat-visible `context_compacted` event — `removed`, `kept`,
@@ -709,22 +673,19 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
     # `_estimate_tokens` walks the entire history. After turn 1 the trigger
     # below is the LLM's own reported input_tokens, so the local estimate is
     # usually computed and thrown away. Make it lazy: compute at most once,
-    # and only on the paths that actually need it (turn 1, a tiny-but-huge
-    # history, or the tokens_before baseline when we really compact).
+    # and only on the paths that actually need it (turn 1, or the tokens_before
+    # baseline when we really compact).
     _est_cache: list[int] = []
     def _est() -> int:
         if not _est_cache:
             _est_cache.append(_estimate_tokens(messages))
         return _est_cache[0]
 
-    if len(messages) <= _preserve_recent() and _est() < threshold:
-        return messages, False, {}
-
-    # Primary trigger: the LLM's own reported input_tokens (same number
-    # the chip shows, so chip + trigger stay in lockstep). Local
-    # estimate underestimates by 5-6× (no system prompt, no tool defs,
-    # no JSON envelope), so the LLM-count is the only reliable signal.
-    # Falls back to the local estimate for the very first turn.
+    # Trigger purely on the token threshold (Claude-Code style — no message-count
+    # guard). Primary signal is the LLM's own reported input_tokens (same number
+    # the chip shows, so chip + trigger stay in lockstep). Local estimate
+    # underestimates by 5-6× (no system prompt, no tool defs, no JSON envelope),
+    # so it's only the fallback for the very first turn.
     last_input = _last_llm_input_tokens(session_id)
     if last_input > 0:
         if last_input < threshold:
@@ -733,7 +694,7 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
         return messages, False, {}
 
     tokens_before = _est()
-    compacted = _compact_messages(messages)
+    compacted = _compact_messages(messages, todos)
     removed = len(messages) - len(compacted)
     # "Did the compact shrink the prompt?" Two ways: (a) message count
     # went down (many small messages), or (b) tokens went down (one
@@ -743,15 +704,15 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
     if removed <= 0 and tokens_after >= tokens_before:
         return messages, False, {}
 
-    # First 280 chars of the summary, with the preamble + tail stripped
-    # (both are noise for the chat-visible preview).
+    # First 280 chars of the summary, with the preamble + trailing resume
+    # instruction stripped (both are noise for the chat-visible preview).
     summary_preview = ""
     if compacted and isinstance(compacted[0], HumanMessage):
         first = compacted[0].content if isinstance(compacted[0].content, str) else ""
         if "Summary:" in first:
             first = first.split("Summary:", 1)[1]
-        if "Recent messages are preserved verbatim" in first:
-            first = first.split("Recent messages are preserved verbatim", 1)[0]
+        if COMPACT_DIRECT_RESUME_INSTRUCTION in first:
+            first = first.split(COMPACT_DIRECT_RESUME_INSTRUCTION, 1)[0]
         summary_preview = first.strip()[:280]
 
     info = {
@@ -805,12 +766,11 @@ class CompactingCheckpointer(SqliteSaver):
         """
         messages = checkpoint.get("channel_values", {}).get("messages", [])
 
-        # preserve_recent messages AND the estimate crosses the threshold.
-        if (
-            len(messages) > _preserve_recent()
-            and _estimate_tokens(messages) >= _auto_compact_threshold()
-        ):
-            compacted = _compact_messages(messages)
+        # Over the token threshold → compact. (_compact_messages no-ops on a
+        # ≤1-message history, so no count guard is needed here.)
+        if _estimate_tokens(messages) >= _auto_compact_threshold():
+            todos = checkpoint.get("channel_values", {}).get("last_todos", [])
+            compacted = _compact_messages(messages, todos)
             removed = len(messages) - len(compacted)
             if removed > 0:
                 logging.getLogger(__name__).info(

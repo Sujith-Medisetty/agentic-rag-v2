@@ -1139,7 +1139,12 @@ def _prepare_history(state: RunnerState, session_id: str) -> list:
     from memory.checkpointer import maybe_compact, _auto_compact_threshold
     raw_history = list(state.get("live_messages") or state.get("messages", []))
     history = _repair_orphan_tool_calls(raw_history)
-    history, did_compact, compact_info = maybe_compact(history, session_id=session_id)
+    # Pass the live todo list so it survives the pure-replace compaction
+    # (re-injected verbatim after the summary; otherwise it lives only in the
+    # TodoWrite tool results that compaction discards).
+    history, did_compact, compact_info = maybe_compact(
+        history, session_id=session_id, todos=state.get("last_todos") or [],
+    )
     if did_compact:
         # Chat-visible notification. The post-LLM publish is the single source
         # of truth for the chip, so no `context_update` here (pre-LLM local

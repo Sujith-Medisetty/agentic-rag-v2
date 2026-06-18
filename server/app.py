@@ -2592,42 +2592,48 @@ async def compact_session(
     session_id: str,
     user: dict = Depends(require_user),
 ):
-    _session_or_404(session_id, user)
-    """Manually compact this session's LangGraph message history NOW, instead
-    of waiting for the automatic 100K-token trigger. Useful when responses
-    are getting slow and the user wants a fresh context budget without
-    starting a new session.
+    """Manually compact this session's LLM context NOW, instead of waiting for
+    the automatic token-threshold trigger. Same logic as auto-compaction, just
+    triggered by hand — useful when responses are getting slow and the user
+    wants a fresh context budget without starting a new session.
 
-    Replaces the entire `messages` list in the checkpoint with the compacted
-    version: a SystemMessage summary + the last few messages verbatim. The
-    `add_messages` reducer accepts `RemoveMessage(id=...)` for deletion, so
-    we send removes for every existing message followed by the compacted
-    list -- no orphans, no duplication.
+    Runs the same `_compact_messages` (Claude-Code-style pure-replace: one
+    structured summary + the live todo list re-injected verbatim) and REPLACES
+    the `live_messages` channel — the bounded working set the LLM actually reads
+    each turn. The `messages` audit log and the DB chat transcript are left
+    intact, so the chat history the user sees is unaffected.
     """
+    _session_or_404(session_id, user)
     if _active_turns.get(session_id) and not _active_turns[session_id].done():
         return {"ok": False, "reason": "a turn is in flight -- cancel it first"}
 
     from agents.graph import runner_graph
-    from langchain_core.messages import RemoveMessage
     from memory.checkpointer import _compact_messages
 
     config = {"configurable": {"thread_id": session_id}}
     snapshot = runner_graph.get_state(config)
-    messages = list(snapshot.values.get("messages", []) or [])
-    before = len(messages)
+    # The LLM reads `live_messages` (REPLACE channel); `messages` is only the
+    # append-only audit log / turn-1 fallback. Compact whichever is the current
+    # working set, exactly as node_agent's auto-compact does.
+    source = list(
+        snapshot.values.get("live_messages")
+        or snapshot.values.get("messages", [])
+    )
+    before = len(source)
     if before == 0:
         return {"ok": False, "reason": "no messages to compact"}
 
-    compacted = _compact_messages(messages)
+    # Pass the live todo list so it survives the pure-replace summary, same as
+    # auto-compact. The summary LLM call is blocking, so run it off the event
+    # loop to avoid stalling other requests.
+    todos = snapshot.values.get("last_todos") or []
+    compacted = await asyncio.to_thread(_compact_messages, source, todos)
     if len(compacted) >= before:
         return {"ok": False, "reason": "nothing to compact (history is already small)"}
 
-    removes = [
-        RemoveMessage(id=m.id)
-        for m in messages
-        if getattr(m, "id", None)
-    ]
-    runner_graph.update_state(config, {"messages": removes + compacted})
+    # REPLACE the working set the LLM reads next turn. `live_messages` uses the
+    # default last-write-wins reducer, so a plain assignment replaces it.
+    runner_graph.update_state(config, {"live_messages": compacted})
     return {"ok": True, "before": before, "after": len(compacted)}
 
 @app.get(
