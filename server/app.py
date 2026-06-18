@@ -95,6 +95,7 @@ from server.git_autocommit import get_git_info, push_to_remote
 from server.reporter import WebReporter, get_bus
 from pydantic import BaseModel
 from server.schemas import (
+    AppSettingsResponse, AppSettingsUpdateRequest,
     AuthStatusResponse, DeployRequest, DeployedAppResponse,
     DeployJobStartResponse, DeployJobStatusResponse,
     DeployStateResponse, DeployedAppsBySession,
@@ -5596,6 +5597,43 @@ def admin_user_reset_password(
     except LookupError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
     return {"ok": True}
+
+
+# ============================================================================
+# Global app settings — instance-wide display toggles. GET is readable by any
+# authenticated user (the UI needs the value to render token figures); the
+# PATCH is root-only. Stored in the app_settings KV table.
+# ============================================================================
+
+def _current_app_settings() -> AppSettingsResponse:
+    """Build the settings response from the KV store, applying defaults for
+    any key that has never been written."""
+    return AppSettingsResponse(
+        tokens_show_new_only=db.get_app_setting("tokens_show_new_only", "0") == "1",
+    )
+
+
+@app.get("/api/settings", response_model=AppSettingsResponse)
+def settings_get(_user: dict = Depends(require_user)):
+    """Read the instance-wide display settings. Any signed-in user can read
+    these — the per-call / per-turn token UI needs the value to decide
+    whether to collapse the cached/new split into a new-only `in` figure."""
+    return _current_app_settings()
+
+
+@app.patch("/api/admin/settings", response_model=AppSettingsResponse)
+def admin_settings_update(
+    req: AppSettingsUpdateRequest,
+    _root: dict = Depends(require_root),
+):
+    """Update instance-wide display settings. Root only. Every field is
+    optional — only the keys present in the body are written. Returns the
+    full, current settings so the client can update its cache in one shot."""
+    if req.tokens_show_new_only is not None:
+        db.set_app_setting(
+            "tokens_show_new_only", "1" if req.tokens_show_new_only else "0",
+        )
+    return _current_app_settings()
 
 def _listening_ports_system_wide() -> list[tuple[int, str, int | None]]:
     """Enumerate every TCP port currently in LISTEN on this host, with

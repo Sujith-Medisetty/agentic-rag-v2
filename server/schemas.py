@@ -38,6 +38,22 @@ class LoginResponse(BaseModel):
  token: str
  user: UserResponse
 
+# ---- Global app settings --------------------------------------------------
+
+class AppSettingsResponse(BaseModel):
+    """Instance-wide display/behaviour settings. Readable by any
+    authenticated user (the UI needs them to render); writable only by
+    root via PATCH /api/admin/settings."""
+    # When true, token figures in the per-LLM-call markers and the
+    # per-turn footer show ONLY the "new" (uncached) input tokens as the
+    # `in` value, dropping the "(X cached · Y new)" parenthetical. The
+    # nav-bar running totals and the cost-math breakdown are unaffected.
+    tokens_show_new_only: bool = False
+
+class AppSettingsUpdateRequest(BaseModel):
+    """PATCH body — every field optional, only the ones present are updated."""
+    tokens_show_new_only: bool | None = None
+
 # ---- Projects -------------------------------------------------------------
 
 class ProjectCreateRequest(BaseModel):

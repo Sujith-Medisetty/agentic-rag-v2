@@ -38,6 +38,7 @@ import type {
 import TurnFooter from "@/components/TurnFooter";
 import Markdown from "@/components/Markdown";
 import { formatDuration, formatTokens } from "@/lib/format";
+import { useAppSettings } from "@/lib/appSettings";
 
 // ============================================================================
 // TurnCard
@@ -246,6 +247,10 @@ function LlmCallBlockImpl({
   // positive (i.e. the first call in a session) — uncached + write tokens
   // both count as "new" because they cost the same per token.
   const newTokens = Math.max(0, inputTokens - cacheReadTokens);
+  // Admin "show only new tokens" mode: collapse the in figure to just the
+  // new (uncached) tokens and drop the cached/new parenthetical. The full
+  // breakdown stays in the hover title so the detail is one hover away.
+  const { tokensShowNewOnly } = useAppSettings();
   const titleParts: string[] = [`${inputTokens.toLocaleString()} in`];
   if (cacheReadTokens > 0)     titleParts.push(`${cacheReadTokens.toLocaleString()} cache hits`);
   if (cacheCreationTokens > 0) titleParts.push(`${cacheCreationTokens.toLocaleString()} cache writes`);
@@ -258,24 +263,33 @@ function LlmCallBlockImpl({
         title={`Model call · ${titleParts.join(" · ")}`}
       >
         <span className="font-semibold uppercase tracking-[0.16em]">llm</span>
-        <span className="font-mono text-tx-xs">
-          <span className="text-accent">{formatTokens(inputTokens)}</span>
-          {cacheReadTokens > 0 && (
-            <span
-              className="text-success/80"
-              title={`${cacheReadTokens.toLocaleString()} cache hits`}
-            >
-              {" "}({formatTokens(cacheReadTokens)} cached
-              {newTokens > 0 && <> · <span className="text-text">{formatTokens(newTokens)} new</span></>})
-            </span>
-          )}
-          {cacheReadTokens === 0 && newTokens > 0 && (
-            <span className="text-subtle"> ({formatTokens(newTokens)} new)</span>
-          )}
-          <span className="text-subtle"> in · </span>
-          <span className="text-accent-2">{formatTokens(outputTokens)}</span>
-          <span className="text-subtle"> out</span>
-        </span>
+        {tokensShowNewOnly ? (
+          <span className="font-mono text-tx-xs">
+            <span className="text-accent">{formatTokens(newTokens)}</span>
+            <span className="text-subtle"> in · </span>
+            <span className="text-accent-2">{formatTokens(outputTokens)}</span>
+            <span className="text-subtle"> out</span>
+          </span>
+        ) : (
+          <span className="font-mono text-tx-xs">
+            <span className="text-accent">{formatTokens(inputTokens)}</span>
+            {cacheReadTokens > 0 && (
+              <span
+                className="text-success/80"
+                title={`${cacheReadTokens.toLocaleString()} cache hits`}
+              >
+                {" "}({formatTokens(cacheReadTokens)} cached
+                {newTokens > 0 && <> · <span className="text-text">{formatTokens(newTokens)} new</span></>})
+              </span>
+            )}
+            {cacheReadTokens === 0 && newTokens > 0 && (
+              <span className="text-subtle"> ({formatTokens(newTokens)} new)</span>
+            )}
+            <span className="text-subtle"> in · </span>
+            <span className="text-accent-2">{formatTokens(outputTokens)}</span>
+            <span className="text-subtle"> out</span>
+          </span>
+        )}
       </span>
     </div>
   );

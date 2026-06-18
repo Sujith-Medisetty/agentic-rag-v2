@@ -17,11 +17,18 @@
 import type { TurnSummary } from "@/lib/types";
 import { formatTokens, formatCost, formatDuration, formatCostMath, formatCostMathMultiline } from "@/lib/format";
 import { pricingForModel, MINIMAX_M3_PRICING } from "@/lib/pricing";
+import { useAppSettings } from "@/lib/appSettings";
 
 export default function TurnFooter({ summary }: { summary: TurnSummary }) {
   const totalTok = summary.input_tokens + summary.output_tokens;
   const cached = summary.cache_read_tokens ?? 0;
   const newTokens = Math.max(0, summary.input_tokens - cached);
+  // Admin "show only new tokens" mode: the IN figure shows just the new
+  // (uncached) tokens and the "(X cached · Y new)" parenthetical is dropped.
+  // OUT, COST, Duration, and Tools are unchanged — and the cost-math line
+  // below still itemises the cached tokens (that's where the cache cost is
+  // made auditable). The nav-bar running totals are also unaffected.
+  const { tokensShowNewOnly } = useAppSettings();
   // Pricing is per-model; we don't have it on the wire yet (TODO: send from
   // server), so default to MiniMax-M3. When the server starts emitting a
   // per-turn `pricing` field, this is the line to swap.
@@ -62,15 +69,17 @@ export default function TurnFooter({ summary }: { summary: TurnSummary }) {
             <Divider />
             <Stat
               label="In"
-              value={formatTokens(summary.input_tokens)}
+              value={formatTokens(tokensShowNewOnly ? newTokens : summary.input_tokens)}
               valueClass="text-accent"
               title={
-                cached > 0 || newTokens > 0
-                  ? `${summary.input_tokens.toLocaleString()} in · ${cached.toLocaleString()} cached · ${newTokens.toLocaleString()} new`
-                  : undefined
+                tokensShowNewOnly
+                  ? `${newTokens.toLocaleString()} new (uncached) input tokens`
+                  : cached > 0 || newTokens > 0
+                    ? `${summary.input_tokens.toLocaleString()} in · ${cached.toLocaleString()} cached · ${newTokens.toLocaleString()} new`
+                    : undefined
               }
               after={
-                cached > 0 ? (
+                tokensShowNewOnly ? null : cached > 0 ? (
                   <span className="text-success/80" title={`${cached.toLocaleString()} cache hits`}>
                     {" "}({formatTokens(cached)} cached
                     {newTokens > 0 && <> · <span className="text-text">{formatTokens(newTokens)} new</span></>})

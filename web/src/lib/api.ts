@@ -178,6 +178,33 @@ export const adminApi = {
         body: JSON.stringify({ new_password: newPassword }),
       },
     ),
+  // Update instance-wide display settings (root only). Returns the full
+  // current settings so the caller can refresh its cache in one shot.
+  updateSettings: (patch: AppSettingsUpdate) =>
+    request<AppSettings>("/api/admin/settings", {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+};
+
+// ---- Global app settings -------------------------------------------------
+//
+// Instance-wide display toggles. Readable by any signed-in user (the token
+// UI needs the value to render); only root can change them via the Admin
+// page (adminApi.updateSettings).
+
+export interface AppSettings {
+  // When true, per-call + per-turn-footer token figures show ONLY the
+  // "new" (uncached) input tokens as the `in` value, dropping the
+  // "(X cached · Y new)" parenthetical. Nav-bar totals + cost math are
+  // unaffected.
+  tokens_show_new_only: boolean;
+}
+
+export type AppSettingsUpdate = Partial<AppSettings>;
+
+export const settingsApi = {
+  get: () => request<AppSettings>("/api/settings"),
 };
 
 export const pathsApi = {

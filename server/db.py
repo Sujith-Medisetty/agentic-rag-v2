@@ -143,6 +143,17 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
     last_used_at  INTEGER
 );
 
+-- Global, instance-wide settings. Key/value store (values are TEXT —
+-- callers cast). NOT scoped per-user: these are box-wide toggles that
+-- only the root admin can change but every user's UI reads (e.g. the
+-- "show only new/uncached input tokens" display mode). A KV table keeps
+-- this open-ended so new global toggles don't need a schema migration.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key         TEXT    PRIMARY KEY,
+    value       TEXT    NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
 -- Deployed apps: a session's built dist/ "promoted" to a persistent location
 -- under /opt/ojas-apps/<slug>/. Slug is the public URL component AND now
 -- the subdomain (https://<slug>.<root-domain>/). Lifecycle is tied to
@@ -799,6 +810,31 @@ def revoke_token(token_hash: str) -> None:
     with _connect() as cx:
         cx.execute(
             "DELETE FROM auth_tokens WHERE token_hash = ?", (token_hash,),
+        )
+
+
+# ============================================================================
+# App settings — global, instance-wide toggles (root-controlled, all-user
+# visible). Stored as a key/value table; values are TEXT and the caller
+# casts. See the `app_settings` schema note for why this is a KV store.
+# ============================================================================
+
+def get_app_setting(key: str, default: str | None = None) -> str | None:
+    """Read a single global setting. Returns `default` if unset."""
+    with _connect() as cx:
+        r = cx.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (key,),
+        ).fetchone()
+    return r["value"] if r is not None else default
+
+
+def set_app_setting(key: str, value: str) -> None:
+    """Upsert a single global setting."""
+    with _connect() as cx:
+        cx.execute(
+            "INSERT OR REPLACE INTO app_settings(key, value, updated_at) "
+            "VALUES (?, ?, ?)",
+            (key, value, _now()),
         )
 
 

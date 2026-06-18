@@ -12,6 +12,7 @@ import { authApi, adminApi, deployedAppsApi, ApiError } from "@/lib/api";
 import type {
   AuthUser, AdminProcess, OjasService, DeployedApp,
 } from "@/lib/api";
+import { useAppSettings } from "@/lib/appSettings";
 import { KeyIcon, TrashIcon } from "@/components/icons";
 
 type SourceFilter = "all" | "ojas-main" | "ojas-proxy" | "ojas-deployed" | "ojas-mcp" | "ojas-external";
@@ -24,6 +25,12 @@ export default function Admin() {
   const [apps, setApps] = useState<DeployedApp[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
+
+  // Global display settings (instance-wide, root-controlled). The toggle
+  // below writes them via adminApi.updateSettings and updates the shared
+  // context so every open tab's token UI reflects the change on next render.
+  const { tokensShowNewOnly, apply } = useAppSettings();
+  const [savingSetting, setSavingSetting] = useState(false);
 
   // Resolve current user once. Anyone non-root gets redirected.
   useEffect(() => {
@@ -91,6 +98,19 @@ export default function Admin() {
       setApps(as);
     } catch {
       /* keep last */
+    }
+  };
+
+  const toggleTokensNewOnly = async (next: boolean) => {
+    setSavingSetting(true);
+    try {
+      const updated = await adminApi.updateSettings({ tokens_show_new_only: next });
+      apply(updated);
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : "failed to save setting");
+    } finally {
+      setSavingSetting(false);
     }
   };
 
@@ -226,6 +246,49 @@ export default function Admin() {
           {err}
         </div>
       )}
+
+      {/* ───── Display settings (instance-wide) ─────────────────────── */}
+      <section className="space-y-3">
+        <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-subtle">
+          Display
+        </h2>
+        <p className="text-tx-xs text-muted">
+          Instance-wide toggles. These apply to <span className="text-text">every user's</span> view —
+          only you (root) can change them.
+        </p>
+        <div className="flex items-start justify-between gap-4 rounded-xl border border-border bg-elevated/40 px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-text">
+              Show only new (uncached) input tokens
+            </div>
+            <p className="mt-0.5 text-tx-xs text-muted">
+              When on, each LLM-call marker and the per-turn footer show just the
+              <span className="text-text"> new</span> input tokens as the
+              <span className="font-mono"> in</span> figure — the
+              “(cached · new)” split is hidden. Output, cost, and the cost-math
+              breakdown (which still itemises cached tokens) are unchanged, and the
+              nav-bar running totals stay as-is.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={tokensShowNewOnly}
+            disabled={savingSetting}
+            onClick={() => toggleTokensNewOnly(!tokensShowNewOnly)}
+            title={tokensShowNewOnly ? "Turn off (show full cached · new split)" : "Turn on (show only new tokens)"}
+            className={`relative mt-0.5 inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-50 ${
+              tokensShowNewOnly ? "bg-accent" : "bg-border"
+            }`}
+          >
+            <span
+              className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+                tokensShowNewOnly ? "translate-x-5" : "translate-x-0.5"
+              }`}
+            />
+          </button>
+        </div>
+      </section>
 
       {/* ───── Services (Ojas-owned processes + ports) ──────────────── */}
       <section className="space-y-3">

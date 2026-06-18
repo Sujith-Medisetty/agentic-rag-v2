@@ -8,6 +8,7 @@ import SessionList from "@/pages/SessionList";
 import Admin from "@/pages/Admin";
 import Settings from "@/pages/Settings";
 import { SessionProvider } from "@/lib/sessionContext";
+import { AppSettingsProvider } from "@/lib/appSettings";
 import { GlobalToast } from "@/components/GlobalToast";
 
 // No custom PWA install UI. Users install via the browser's native
@@ -25,7 +26,8 @@ export default function App() {
   return (
     <BrowserRouter>
       <AuthGate>
-        <SessionProvider>
+        <AppSettingsProvider>
+          <SessionProvider>
           <Routes>
             {/* Default landing: sidebar workspace, optionally with a session
                 active via /s/:sessionId. Replaces the old project-list →
@@ -83,7 +85,8 @@ export default function App() {
               itself is rendered ONCE at the App level so it survives
               route changes. */}
           <GlobalToast />
-        </SessionProvider>
+          </SessionProvider>
+        </AppSettingsProvider>
       </AuthGate>
     </BrowserRouter>
   );
