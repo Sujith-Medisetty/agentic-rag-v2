@@ -2996,15 +2996,6 @@ def _detect_dist_candidates(session_id: str) -> list[dict]:
         deduped.append(c)
     return deduped
 
-def _auto_pick_project_dir(session_id: str) -> str | None:
-    """Pick the most likely project_dir for a session: the only candidate
-    if there's exactly one, else None. Returns "" (empty string) for the
-    session root dist/. None means 'ambiguous -- caller must decide'."""
-    cands = _detect_dist_candidates(session_id)
-    if len(cands) == 1:
-        return cands[0]["project_dir"]
-    return None
-
 # /preview/{session_id}/* was removed: it generated temporary URLs tied
 # to a session ID that the user (rightly) found unreliable -- they were
 # half-broken without a service worker scope, and disappeared on session

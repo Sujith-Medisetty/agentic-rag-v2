@@ -54,7 +54,6 @@ _hook_runner: HookRunner = HookRunner()
 _sandbox: SandboxStatus | None = None
 _workspace: str = "."
 _permission_mode: PermissionMode = PermissionMode.FULL_ACCESS
-_task_manager = None # lazily created via _get_task_manager()
 
 # Per-thread micro-cache removed: the plan-mode/heartbeat pre-scans that
 # required it have been removed. EnterPlanMode/ExitPlanMode are now
@@ -74,12 +73,6 @@ def configure_safety(
     _sandbox = sandbox
     _workspace = workspace
     _permission_mode = permission_mode
-def _get_task_manager():
-    global _task_manager
-    if _task_manager is None:
-        from tools.tasks import TaskManager
-        _task_manager = TaskManager()
-    return _task_manager
 # ============================================================================
 # Safety decorator — stacks INSIDE @tool. @tool gives us the BaseTool object;
 # @_safe_tool runs the permission/hook gauntlet on every invocation.
@@ -247,16 +240,6 @@ class ToolSearchInput(BaseModel):
     query: str = Field(description="Free-text query, or 'select:Tool1,Tool2' for exact lookup")
 class PlanModeInput(BaseModel):
     pass # no parameters
-class TaskCreateInput(BaseModel):
-    prompt: str = Field(description="What to track")
-    description: str | None = Field(None, description="Optional longer description")
-class TaskIdInput(BaseModel):
-    task_id: str = Field(description="Task ID returned by TaskCreate")
-class TaskUpdateInput(BaseModel):
-    task_id: str = Field(description="Task ID")
-    message: str = Field(description="Progress message to append to the task's log")
-class TaskListInput(BaseModel):
-    status: str | None = Field(None, description="Filter by status (e.g. running, completed)")
 class AgentToolInput(BaseModel):
     description: str = Field(description="Short description of the delegated task")
     prompt: str = Field(description="Self-contained task prompt — sub-agents have no memory of this conversation")
@@ -1155,69 +1138,9 @@ def ExitPlanMode() -> str:
     Do not call it implicitly to bypass plan mode.
     """
     return "Plan mode OFF. Write/edit/bash tools are now available."
-    return "Plan mode OFF. Write and execute tools available."
-@tool("TaskCreate", args_schema=TaskCreateInput)
-@_safe_tool("TaskCreate")
-def TaskCreate(prompt: str, description: str | None = None) -> str:
-    """Create a long-lived task record (persisted under `.clawd-tasks/`). Distinct from `TodoWrite` — use Tasks for work that spans many turns or sessions, or for tracking outputs from sub-agents.
-    Returns a `task_id`. Status flow: created → running → completed | failed | stopped.
-    """
-    task = _get_task_manager().create(prompt=prompt, description=description or "")
-    return f"Task created: {task.task_id} | {task.status.value}"
-@tool("TaskUpdate", args_schema=TaskUpdateInput)
-@_safe_tool("TaskUpdate")
-def TaskUpdate(task_id: str, message: str) -> str:
-    """Append a progress message to a task's persistent log. Use to leave breadcrumbs (findings, decisions, blockers) on a long-running task."""
-    _get_task_manager().append_output(task_id, message)
-    return f"Task {task_id} updated."
-@tool("TaskGet", args_schema=TaskIdInput)
-@_safe_tool("TaskGet")
-def TaskGet(task_id: str) -> str:
-    """Get full details (status, prompt, history) for a task by `task_id`."""
-    t = _get_task_manager().get(task_id)
-    return f"Task {t.task_id}: {t.status.value}\n{t.prompt}"
-@tool("TaskList", args_schema=TaskListInput)
-def TaskList(status: str | None = None) -> str:
-    """List tasks, optionally filtered by `status` (e.g. `running`, `completed`)."""
-    try:
-        mgr = _get_task_manager()
-        tasks = mgr.list_all(status_filter=status)
-        if not tasks:
-            return "No tasks."
-        lines = [f"Tasks ({len(tasks)}):"]
-        for t in tasks:
-            lines.append(f" [{t.status.value}] {t.task_id}: {t.prompt[:60]}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
-@tool("TaskStop", args_schema=TaskIdInput)
-@_safe_tool("TaskStop")
-def TaskStop(task_id: str) -> str:
-    """Stop a running task. Use when the task is no longer needed or has stalled."""
-    _get_task_manager().stop(task_id)
-    return f"Task {task_id} stopped."
-@tool("TaskOutput", args_schema=TaskIdInput)
-def TaskOutput(task_id: str) -> str:
-    """Get the accumulated output and messages produced by a task."""
-    try:
-        mgr = _get_task_manager()
-        task = mgr.get(task_id)
-        msgs = getattr(task, "messages", []) or getattr(task, "output", []) or []
-        if not msgs:
-            return f"Task {task_id}: no output yet."
-        lines = [f"Task {task_id} output:"]
-        for m in msgs:
-            if isinstance(m, str):
-                lines.append(f" {m}")
-            elif hasattr(m, "content"):
-                lines.append(f" {m.content}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error: {e}"
 UTILITY_TOOLS = [
     TodoWrite, Sleep, AskUserQuestion, SendUserMessage, ToolSearch,
     EnterPlanMode, ExitPlanMode,
-    TaskCreate, TaskUpdate, TaskGet, TaskList, TaskStop, TaskOutput,
 ]
 # ============================================================================
 # READ / WRITE TOOL LISTS
