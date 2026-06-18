@@ -1458,11 +1458,23 @@ class SystemPromptBuilder:
         # block to keep per-turn token cost lean.
         if _is_ojas_workspace(self.project_context):
             sections.append(get_ojas_app_rules_section())
-        # Frontend UI guidance — only included when the workspace actually
-        # contains a frontend (detected in ProjectContext.discover). Saves
-        # ~2k input tokens per turn on backend-only projects.
-        if (self.project_context is not None
-                and self.project_context.is_frontend_project):
+        # Frontend UI guidance. Gated on `_is_ojas_workspace` (stable, path-
+        # based — `/home/ojas/ojas/...`) rather than a live filesystem scan.
+        # Both Ojas templates ship a frontend (static = frontend only;
+        # fullstack = frontend + FastAPI), so the UI rules apply to any app
+        # build; a pure-chat session merely carries ~2k of cached rules it
+        # ignores. The old gate (`is_frontend_project`, a folder scan) was
+        # FALSE on an empty turn-1 workspace and flipped TRUE the instant
+        # `npm create vite` scaffolded — mutating the STATIC (cached) region of
+        # the prompt and busting the prefix cache once per build (~14k fresh
+        # tokens, confirmed via cache-diag SYS-CHANGED@msg0). This gate is
+        # constant for the whole session, so the static prompt stays byte-
+        # identical and the agent gets UI guidance from turn 1 (when it's
+        # choosing how to scaffold). NON-Ojas repos still gate on the
+        # filesystem signal so a backend-only dev repo skips the ~2k of UI rules.
+        if (_is_ojas_workspace(self.project_context)
+                or (self.project_context is not None
+                    and self.project_context.is_frontend_project)):
             sections.append(get_frontend_ui_quality_section())
         if self.include_orchestration:
             sections.append(get_orchestration_section())

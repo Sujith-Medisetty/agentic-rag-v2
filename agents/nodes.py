@@ -455,8 +455,11 @@ def _log_cache_diag(
     try:
         import hashlib
         import logging
-        sys_hash = hashlib.sha1(
-            f"{static_base}\x00{dynamic_suffix}".encode("utf-8", "replace")
+        st_hash = hashlib.sha1(
+            (static_base or "").encode("utf-8", "replace")
+        ).hexdigest()[:12]
+        dyn_hash = hashlib.sha1(
+            (dynamic_suffix or "").encode("utf-8", "replace")
         ).hexdigest()[:12]
         tools_hash = hashlib.sha1(
             ("\x00".join(tool_names)).encode("utf-8", "replace")
@@ -470,8 +473,13 @@ def _log_cache_diag(
         if prev is None:
             verdict_parts.append("first-call(cold)")
         else:
-            if prev["sys"] != sys_hash:
-                verdict_parts.append("SYS-CHANGED")
+            # STATIC-CHANGED is the expensive one (busts the big ~14k cached
+            # system prompt). DYN-CHANGED only busts the small dynamic suffix +
+            # history after it (the static prompt before it stays cached).
+            if prev["st"] != st_hash:
+                verdict_parts.append("STATIC-CHANGED")
+            if prev["dyn"] != dyn_hash:
+                verdict_parts.append("DYN-CHANGED")
             if prev["tools"] != tools_hash:
                 verdict_parts.append("TOOLS-CHANGED")
             # Longest common prefix between this call's history fingerprints
@@ -491,10 +499,10 @@ def _log_cache_diag(
 
         logging.getLogger(__name__).info(
             "cache-diag: in=%d cached=%d fresh=%d (%.0f%% cached) | msgs=%d "
-            "sys=%s tools=%s | %s",
+            "st=%s dyn=%s tools=%s | %s",
             input_total, cache_read, fresh,
             (100.0 * cache_read / input_total) if input_total else 0.0,
-            len(fps), sys_hash, tools_hash, " ".join(verdict_parts),
+            len(fps), st_hash, dyn_hash, tools_hash, " ".join(verdict_parts),
         )
         # Also append to a dedicated file so the line is retrievable even when
         # the host's logging config (uvicorn/systemd) doesn't surface app
@@ -512,12 +520,14 @@ def _log_cache_diag(
                 fh.write(
                     f"{stamp} sid={key[:8]} in={input_total} cached={cache_read} "
                     f"fresh={fresh} ({(100.0*cache_read/input_total) if input_total else 0:.0f}% cached) "
-                    f"msgs={len(fps)} sys={sys_hash} tools={tools_hash} | "
+                    f"msgs={len(fps)} st={st_hash} dyn={dyn_hash} tools={tools_hash} | "
                     f"{' '.join(verdict_parts)}\n"
                 )
         except Exception:
             pass
-        _CACHE_DIAG_PREV[key] = {"sys": sys_hash, "tools": tools_hash, "fps": fps}
+        _CACHE_DIAG_PREV[key] = {
+            "st": st_hash, "dyn": dyn_hash, "tools": tools_hash, "fps": fps,
+        }
     except Exception:
         pass
 
