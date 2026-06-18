@@ -284,6 +284,30 @@ def get_ojas_app_rules_section() -> str:
         "in `backend/main.py`, add routes. PWA bits already in `frontend/public/` "
         "and `install-button.tsx`. Replace `App.tsx`; same `base: './'` rule.",
         "",
+        "### Step 4 — build efficiently (turns cost money — don't burn them)",
+        "",
+        "Every model call re-sends this entire prompt, so each wasted turn has a "
+        "real cost. The template layout documented above is AUTHORITATIVE — treat "
+        "it as ground truth and act on it:",
+        " - Do NOT `ls` or `read_file` the template tree to 'confirm' what's "
+        "there before copying. The files, paths, and primitives are listed above "
+        "— copy the template and start building. Re-deriving the documented "
+        "layout by hand is the single biggest waste of turns on a build.",
+        " - Read a template file ONLY when you're about to modify that specific "
+        "file (e.g. read `App.tsx` right before you `edit_file` it — `edit_file` "
+        "requires a prior read of the file). Reading 'to understand the scaffold' "
+        "is unnecessary; that's what these rules are for.",
+        " - Batch independent operations into ONE turn: issue all the `read_file` "
+        "calls for the files you'll touch together, and any independent `bash` "
+        "checks, in a single message. Sequence only when a later call genuinely "
+        "needs an earlier result.",
+        " - Write each file CORRECT the first time. Do NOT write a file and then "
+        "fire off several follow-up `edit_file` calls to delete unused imports or "
+        "fix lint — get the imports right on the first write, or fold all "
+        "clean-ups into ONE edit.",
+        " - Run `npm run build` / `npm run verify` ONCE when you believe the app "
+        "is done — not speculatively after every file.",
+        "",
         "CRITICAL — REPLACE the starter `App.tsx` AND its `<Dashboard />`. The "
         "fullstack template's `App.tsx` returns `<Dashboard />`, and that "
         "Dashboard fetches `/api/items` — a route your real backend won't "
@@ -634,6 +658,12 @@ def get_using_tools_section() -> str:
         " - Make independent tool calls in the SAME message (parallel) — e.g. "
         "`git status` and `git diff` as two calls in one turn. Only sequence when "
         "a later call depends on an earlier result.",
+        " - Don't burn turns — each turn re-sends the whole prompt, so wasted "
+        "round-trips cost real money. Don't re-read or re-`ls` content already "
+        "shown in this conversation or described in the system prompt; write a "
+        "file correct the first time rather than emitting follow-up edits to fix "
+        "your own imports/lint; and run build/verify once when done, not after "
+        "every file.",
         " - TodoWrite is MANDATORY for 3+ step tasks (see the rule in 'Doing "
         "tasks'): full plan turn 1, flip to `in_progress` before the work, flip "
         "to `completed` in the same turn as the finishing tool, never batch "
@@ -656,9 +686,10 @@ def get_using_tools_section() -> str:
     ])
 
 def get_frontend_ui_quality_section() -> str:
-    """Frontend UI quality rules — included only when the workspace looks like
-    a frontend project (see `_workspace_has_frontend_signals`). The UI is the
-    deliverable; produce production-grade output, not "works but generic".
+    """Frontend UI quality rules — for Ojas workspaces this is gated on
+    `_is_ojas_workspace` (stable, path-based) in build(); non-Ojas repos still
+    gate on `_workspace_has_frontend_signals`. The UI is the deliverable;
+    produce production-grade output, not "works but generic".
 
     Stack / intent / static-vs-fullstack / scaffold / build order / multi-app /
     storage / edit-after-deploy rules now live in the Ojas app rules section
@@ -678,7 +709,15 @@ def get_frontend_ui_quality_section() -> str:
         "`frontend/src/components/ui/` — use them as-is; add any others (select, "
         "tabs, form, command, popover, etc.) with `npx shadcn@latest add <name>` "
         "from `frontend/`.",
-        "- **lucide-react** for icons (no emoji, no text glyphs).",
+        "- **lucide-react** for icons (no emoji, no text glyphs). Import only "
+        "icon names you're confident exist. If a name doesn't resolve, fall back "
+        "to a close existing icon — do NOT trial-and-error names across multiple "
+        "turns or grep through `node_modules` hunting for an export (that burns "
+        "turns for nothing). If you truly must confirm a name, do it with ONE "
+        "`grep` against the installed types "
+        "(`grep -oE 'WordYouWant' frontend/node_modules/lucide-react/dist/lucide-react.d.ts`) "
+        "and move on. Common gotcha: lucide ships `Delete` (the backspace/clear "
+        "glyph) — there is NO `Backspace` export; use `Delete`, `X`, or `Eraser`.",
         "- **sonner** for every toast (success/error/warning) — never inline red "
         "text; the toaster is rendered once from `main.tsx`.",
         "- **react-hook-form** + **zod** (`@hookform/resolvers/zod`) for every "

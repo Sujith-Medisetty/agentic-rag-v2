@@ -53,6 +53,7 @@ import LLMTracePanel from "@/components/LLMTracePanel";
 import TurnCard, { ActiveTurnCard } from "@/components/TurnCard";
 import RunningTotals from "@/components/RunningTotals";
 import { formatDuration, formatTokens } from "@/lib/format";
+import { useAppSettings } from "@/lib/appSettings";
 import { SunIcon, MoonIcon } from "@/components/icons";
 
 // Single source of truth for slash commands. Used by both the inline
@@ -2553,6 +2554,11 @@ function ChatStatusBar({
   currentTurn,
 }: { currentTurn: Turn | null }) {
   const [now, setNow] = useState(() => Date.now());
+  // Admin "show only new tokens" mode — same toggle the per-turn footer and
+  // the per-call LLM markers honour. When on, the live In figure collapses to
+  // just the new (uncached) tokens and the "(X cached)" parenthetical is hidden,
+  // so the running strip matches what the completed turn footer will show.
+  const { tokensShowNewOnly } = useAppSettings();
   useEffect(() => {
     if (!currentTurn?.isStreaming) return;
     const id = setInterval(() => setNow(Date.now()), 250);
@@ -2573,6 +2579,7 @@ function ChatStatusBar({
   const liveCacheRead = currentTurn.blocks.reduce((acc, b) => {
     return b.kind === "llm_call" ? acc + (b.cacheReadTokens ?? 0) : acc;
   }, 0);
+  const liveNew = Math.max(0, totalIn - liveCacheRead);
   // Live cost is intentionally NOT shown here — the server's authoritative
   // per-component cost lands in turn_summary, and pricing client-side risks
   // drift from the server's MODEL_PRICING table. The per-turn footer and
@@ -2612,14 +2619,19 @@ function ChatStatusBar({
               <StatItem
                 label="In"
                 value={
-                  liveCacheRead > 0
-                    ? `${formatTokens(totalIn)} (${formatTokens(liveCacheRead)} cached)`
-                    : formatTokens(totalIn)
+                  tokensShowNewOnly
+                    ? formatTokens(liveNew)
+                    : liveCacheRead > 0
+                      ? `${formatTokens(totalIn)} (${formatTokens(liveCacheRead)} cached)`
+                      : formatTokens(totalIn)
                 }
                 valueClass="text-accent"
-                title={liveCacheRead > 0
-                  ? `${totalIn.toLocaleString()} in · ${liveCacheRead.toLocaleString()} cache hits · ${(totalIn - liveCacheRead).toLocaleString()} new`
-                  : `${totalIn.toLocaleString()} in`}
+                title={
+                  tokensShowNewOnly
+                    ? `${liveNew.toLocaleString()} new (uncached) input tokens`
+                    : liveCacheRead > 0
+                      ? `${totalIn.toLocaleString()} in · ${liveCacheRead.toLocaleString()} cache hits · ${liveNew.toLocaleString()} new`
+                      : `${totalIn.toLocaleString()} in`}
               />
               <StatItem label="Out" value={formatTokens(totalOut)} valueClass="text-accent-2" />
             </>
