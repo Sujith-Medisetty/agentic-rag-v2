@@ -94,6 +94,47 @@ COMPACT_DIRECT_RESUME_INSTRUCTION = (
     "do not recap what was happening, and do not preface with continuation text."
 )
 
+# Set OJAS_COMPACT_LLM_SUMMARY=0 to force the deterministic heuristic summary
+# (no extra LLM call). Default is the LLM summary (true Claude-Code behaviour).
+COMPACT_LLM_SUMMARY_ENV_VAR = "OJAS_COMPACT_LLM_SUMMARY"
+# Per-message caps when rendering the transcript fed to the summariser LLM.
+# Tool results (file dumps, command output) are the bulk of the bytes and the
+# least useful verbatim, so they get the tightest cap; assistant reasoning is
+# the most useful, so it gets the most room.
+_SUMMARY_TOOL_RESULT_CAP = 1500
+_SUMMARY_AI_TEXT_CAP     = 6000
+_SUMMARY_USER_TEXT_CAP   = 4000
+
+# The Claude-Code compaction prompt: an explicit 8-section structure so the
+# summary carries INTENT + decisions + files/code + errors+fixes + pending
+# work, not just a vague paragraph. The next turn reads this in place of the
+# raw messages, so anything omitted here is genuinely forgotten.
+COMPACT_SUMMARY_SYSTEM_PROMPT = (
+    "You are summarising a coding-assistant conversation that is about to be "
+    "truncated for context. Your summary REPLACES the omitted messages — the "
+    "assistant will rely on it alone to keep working, so it must be detailed "
+    "and faithful. Do not invent anything; only record what is in the "
+    "transcript. Write the summary under these exact numbered headings:\n\n"
+    "1. Primary request and intent — what the user ultimately wants, in their "
+    "own framing, including every explicit instruction and constraint.\n"
+    "2. Key technical concepts, decisions, and rationale — the approaches "
+    "chosen and WHY (the reasoning, trade-offs, and rejected alternatives).\n"
+    "3. Files and code sections — every file created or edited, with the path "
+    "and a precise description of what changed and why. Include key code/"
+    "signatures where they matter for continuing the work.\n"
+    "4. Errors encountered and how they were fixed — pair each error with its "
+    "resolution and any user feedback on it.\n"
+    "5. Problem solving — what has been solved and any ongoing troubleshooting.\n"
+    "6. All user messages — list every non-tool message from the user verbatim "
+    "or near-verbatim, in order. This preserves intent and is critical.\n"
+    "7. Pending tasks and next steps — what remains, with enough detail to "
+    "resume without re-deriving it.\n"
+    "8. Current work — exactly what was happening at the moment of truncation "
+    "(the file, function, or command in flight).\n\n"
+    "Be specific and concrete (real paths, names, values). Omit a heading only "
+    "if it genuinely has no content. Output only the summary."
+)
+
 def _auto_compact_threshold() -> int:
     """Auto-compaction token threshold. New var takes precedence over the
     legacy CLAUDE_CODE_* alias for backward compatibility."""
@@ -301,8 +342,108 @@ def _estimate_tokens(messages: list) -> int:
             total += _estimate_block_tokens(content if isinstance(content, str) else str(content))
     return total
 
+def _llm_summary_enabled() -> bool:
+    raw = os.getenv(COMPACT_LLM_SUMMARY_ENV_VAR)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _render_transcript(messages: list) -> str:
+    """Flatten the messages being compacted into a plain-text transcript for
+    the summariser LLM. Tool results are truncated hard (they're the bulk of
+    the bytes and least useful verbatim); assistant reasoning gets the most
+    room. Robust to both content shapes — string content (OpenAI/MiniMax) and
+    list-of-blocks content (Anthropic)."""
+    def _text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            out = []
+            for b in content:
+                if isinstance(b, dict):
+                    if b.get("type") == "text":
+                        out.append(str(b.get("text", "")))
+                    elif b.get("type") == "tool_use":
+                        out.append(f"[calls {b.get('name','?')}({json.dumps(b.get('input', {}), default=str)[:300]})]")
+                    elif b.get("type") == "tool_result":
+                        out.append(str(b.get("content", ""))[:_SUMMARY_TOOL_RESULT_CAP])
+                else:
+                    out.append(str(b))
+            return "\n".join(out)
+        return str(content)
+
+    lines: list[str] = []
+    for msg in messages:
+        cls = type(msg).__name__
+        content = msg.content if hasattr(msg, "content") else str(msg)
+        body = _text(content).strip()
+        if cls == "HumanMessage":
+            if body:
+                lines.append(f"User: {body[:_SUMMARY_USER_TEXT_CAP]}")
+        elif cls == "AIMessage":
+            if body:
+                lines.append(f"Assistant: {body[:_SUMMARY_AI_TEXT_CAP]}")
+            for tc in (getattr(msg, "tool_calls", None) or []):
+                name = (tc.get("name") if isinstance(tc, dict) else None) or "?"
+                args = (tc.get("args") if isinstance(tc, dict) else None) or {}
+                lines.append(f"Assistant → tool {name}({json.dumps(args, default=str)[:300]})")
+        elif cls == "ToolMessage":
+            name = getattr(msg, "name", "tool") or "tool"
+            lines.append(f"Tool[{name}] result: {body[:_SUMMARY_TOOL_RESULT_CAP]}")
+    return "\n\n".join(lines)
+
+
+def _summarize_messages_llm(messages: list) -> str:
+    """LLM-generated structured summary (the Claude-Code approach). Makes one
+    non-streaming, tool-free model call with COMPACT_SUMMARY_SYSTEM_PROMPT.
+    Raises on any failure so the caller can fall back to the heuristic — this
+    function never silently returns a degraded summary."""
+    transcript = _render_transcript(messages)
+    if not transcript.strip():
+        raise ValueError("empty transcript")
+    # Lazy import to avoid a circular import (agents.nodes imports maybe_compact
+    # from this module at load time).
+    from agents.nodes import _get_llm
+    llm = _get_llm(streaming=False, thinking=False)
+    resp = llm.invoke([
+        SystemMessage(content=COMPACT_SUMMARY_SYSTEM_PROMPT),
+        HumanMessage(content="Here is the conversation to summarise:\n\n" + transcript),
+    ])
+    text = resp.content if isinstance(resp.content, str) else _render_transcript([resp])
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty LLM summary")
+    return text
+
+
 def _summarize_messages(messages: list) -> str:
-    """Build a rich text summary of the messages being compacted.
+    """Summary of the messages being compacted. Uses the LLM (true Claude-Code
+    behaviour: rich, structured, captures intent + decisions + files + fixes)
+    when enabled, and falls back to the deterministic heuristic extractor on
+    any error (no langchain, network failure, timeout) or when disabled via
+    OJAS_COMPACT_LLM_SUMMARY=0."""
+    if _llm_summary_enabled():
+        try:
+            summary = _summarize_messages_llm(messages)
+            # The on-disk fix log is the uncapped edit trail; point at it so a
+            # long session's full history is always one Read away even though
+            # the summary itself is necessarily lossy.
+            return (
+                summary
+                + "\n\nFix trail: see `.ojas-fixlog.md` in the workspace for "
+                "one-line summaries of every `edit_file` call (auto-appended, "
+                "survives compaction)."
+            )
+        except Exception as exc:  # noqa: BLE001 — any failure → heuristic fallback
+            logging.getLogger(__name__).warning(
+                "LLM compaction summary failed (%s); using heuristic fallback", exc
+            )
+    return _summarize_messages_heuristic(messages)
+
+
+def _summarize_messages_heuristic(messages: list) -> str:
+    """Deterministic, LLM-free fallback summary of the messages being compacted.
 
     Preserves what matters for the agent to keep working without re-reading
     every file it just touched:
