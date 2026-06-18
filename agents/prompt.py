@@ -120,11 +120,16 @@ def get_simple_doing_tasks_section() -> str:
         "`python3 -m http.server 0`, or "
         "`for p in 3001 3002 3003; do nc -z localhost $p || { PORT=$p; break; }; done`. "
         "Never free a port by killing what holds it.",
-        "BUILD APPS WITH VITE — NEVER SINGLE-FILE HTML. To build any app, your "
-        "FIRST action is `npm create vite@latest <name> -- --template react-ts -y "
-        "&& cd <name> && npm install`. Never hand-author a root `index.html`, "
-        "never inline `<script>` app logic, never judge an app \"too small for "
-        "Vite\". Deploy needs `dist/index.html` from `npm run build`, which only "
+        "BUILD APPS WITH VITE — NEVER SINGLE-FILE HTML. In an Ojas workspace your "
+        "FIRST scaffold action is to COPY the bundled Vite template (see the Ojas "
+        "app rules §3) — do NOT run `npm create vite`: the template is already a "
+        "complete Vite project, so `npm create vite` only adds a redundant "
+        "scaffold + a stray root `package.json` you then have to clean up, and "
+        "forces a second `npm install`. In a NON-Ojas workspace, scaffold with "
+        "`npm create vite@latest <name> -- --template react-ts -y && cd <name> && "
+        "npm install`. Either way: never hand-author a root `index.html`, never "
+        "inline `<script>` app logic, never judge an app \"too small for Vite\". "
+        "Deploy needs `dist/index.html` from `npm run build`, which only "
         "exists with Vite. (Full rules in the PWA section.)",
         "Read relevant code before changing it; keep changes tightly scoped to "
         "the request. No speculative abstractions, compat shims, or unrelated "
@@ -213,8 +218,9 @@ def get_ojas_app_rules_section() -> str:
         "deploy. If the user asks for something this stack can't do, stop and "
         "tell them, then offer the closest equivalent.",
         "",
-        " - **Frontend: Vite + React + TypeScript** — scaffold via "
-        "`npm create vite@latest <app-folder> -- --template react-ts -y`. No "
+        " - **Frontend: Vite + React + TypeScript** — scaffold by COPYING the "
+        "bundled template (see §3, Step 3); it is ALREADY a complete Vite "
+        "project, so NEVER run `npm create vite` for an Ojas build. No "
         "Vue/Svelte/Angular/Astro/plain HTML/Next.js/Remix/Solid. The pipeline "
         "needs `frontend/dist/index.html` from `npm run build` — Vite only.",
         " - **Backend: Python + FastAPI + SQLAlchemy + SQLite** — a `FastAPI()` "
@@ -263,9 +269,16 @@ def get_ojas_app_rules_section() -> str:
         "",
         "### Step 3 — pick the right scaffold",
         "",
-        " - **Static-only** — copy the FILES from "
-        "`/opt/ojas/agents/templates/static/frontend/` into your project's "
-        "`frontend/` (not the wrapper dir). It's a working shadcn/ui dashboard "
+        " - **Static-only** — the template at "
+        "`/opt/ojas/agents/templates/static/frontend/` IS a complete, ready-to-run "
+        "Vite project (its own `package.json`, `vite.config.ts`, `tsconfig`, "
+        "`src/`, `public/` PWA assets, verify scripts). Scaffold it in ONE step — "
+        "do NOT `npm create vite` (redundant; leaves a stray root `package.json` "
+        "and forces a second install):\n"
+        "```bash\n"
+        "mkdir -p <app> && cp -r /opt/ojas/agents/templates/static/frontend <app>/frontend && npm --prefix <app>/frontend install\n"
+        "```\n"
+        "It's a working shadcn/ui dashboard "
         "(sidebar, stat cards, toast+modal, dark/light, PWA) using browser state "
         "only. shadcn primitives are vendored at `frontend/src/components/ui/` "
         "(`button`, `card`, `dialog`, `input`, `label`, `sheet`, `separator`, "
@@ -278,8 +291,13 @@ def get_ojas_app_rules_section() -> str:
         "`frontend/src/App.tsx` (it currently renders `<Dashboard />`) with your "
         "UI. `vite.config.ts` already sets `base: './'` — keep it (assets 404 "
         "otherwise). NO backend; don't add a `backend/` folder to a static app.",
-        " - **Fullstack** — copy `/opt/ojas/agents/templates/fullstack/` into "
-        "`backend/` and `frontend/`. Same dashboard frontend, but its `Dashboard` "
+        " - **Fullstack** — same idea; both halves of "
+        "`/opt/ojas/agents/templates/fullstack/` are complete (don't "
+        "`npm create vite`):\n"
+        "```bash\n"
+        "mkdir -p <app> && cp -r /opt/ojas/agents/templates/fullstack/frontend <app>/frontend && cp -r /opt/ojas/agents/templates/fullstack/backend <app>/backend && npm --prefix <app>/frontend install\n"
+        "```\n"
+        "Same dashboard frontend, but its `Dashboard` "
         "calls the backend's `/api/items` (GET/POST/DELETE). Customise the model "
         "in `backend/main.py`, add routes. PWA bits already in `frontend/public/` "
         "and `install-button.tsx`. Replace `App.tsx`; same `base: './'` rule.",
@@ -446,7 +464,7 @@ def get_ojas_app_rules_section() -> str:
         "Folder names are part of the contract: the pipeline greps for `frontend/` "
         "and `backend/` EXACTLY — `client/`/`web/`/`app/`/`ui/` and "
         "`server/`/`api/`/`api-server/` will NOT be found. The `<project>` name "
-        "is whatever you passed to `npm create vite`; it's the app's identity "
+        "is the `<app>` folder you create when scaffolding; it's the app's identity "
         "(the Deploy dialog shows it, the user picks a slug on top). Multiple "
         "apps are **sibling project folders**, never nested.",
         "",
@@ -521,8 +539,8 @@ def get_ojas_app_rules_section() -> str:
         "parent-child invariant — a `<SheetTrigger>` outside its `<Sheet>` throws "
         "`DialogTrigger must be used within Dialog` and ships a blank screen). "
         "All three are wired into `prebuild`/`verify`; just run `npm run verify`. "
-        "If you scaffolded from `npm create vite` directly or hand-wrote "
-        "`package.json`, copy all three scripts AND the `prebuild`/`verify` lines "
+        "If you hand-rolled the project or scaffolded WITHOUT the Ojas template, "
+        "copy all three scripts AND the `prebuild`/`verify` lines "
         "from another Ojas project — skipping any lets a two-React bundle or a "
         "Radix-orphan trigger ship as a deployable blank page.",
         "",
