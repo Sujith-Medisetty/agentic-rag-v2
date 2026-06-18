@@ -513,6 +513,13 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
             if result.exit_code != 0:
                 parts.append(f"[exit code: {result.exit_code}]")
             out = "\n".join(parts) or "(no output)"
+            # The sandboxed result has no return_code_interpretation field;
+            # synthesise the "exit_code:N" marker on failure so the smart-
+            # truncate below applies its failure-aware head/tail weighting
+            # (it detects failure via `.startswith("exit_code:")`).
+            return_code_interp = (
+                f"exit_code:{result.exit_code}" if result.exit_code != 0 else None
+            )
         else:
             raw = execute_bash(BashInput(
                 command=command, timeout=timeout,
@@ -524,6 +531,7 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
             if raw.return_code_interpretation:
                 parts.append(f"[{raw.return_code_interpretation}]")
             out = "\n".join(parts) or "(no output)"
+            return_code_interp = raw.return_code_interpretation
         _hook_runner.post_tool_use("bash", json.dumps(inp), out[:500])
         # Smart head+tail truncation with failure-aware weights and a
         # session-scoped spill file. The bash tool's old head-only 16 KB
@@ -538,7 +546,7 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
         #   - Full output is spilled to /tmp/ojas-bash/<sid>/... and
         #     the marker tells the LLM exactly how to `grep` or
         #     `sed -n 'N,Mp'` a middle slice out of it.
-        return _smart_truncate_bash_output(out, raw.return_code_interpretation)
+        return _smart_truncate_bash_output(out, return_code_interp)
     except Exception as e:
         _hook_runner.post_tool_failure("bash", json.dumps(inp), str(e))
         return f"Error: {e}"

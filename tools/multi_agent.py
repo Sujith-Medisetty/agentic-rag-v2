@@ -23,6 +23,8 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+from tools.utils import now_secs, slugify
+
 # ---------------------------------------------------------------------------
 # Constants (mirror lib.rs)
 # ---------------------------------------------------------------------------
@@ -131,14 +133,13 @@ def resolve_agent_model(model: str | None) -> str:
     return DEFAULT_AGENT_MODEL
 
 def _slugify_agent_name(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return slug[:32]
+    return slugify(name, max_len=32, allow_underscore=False)
 
 def _agent_store_dir() -> Path:
     return Path(os.getenv("CLAWD_AGENT_STORE", ".clawd-agents"))
 
 def _now_secs() -> int:
-    return int(time.time())
+    return now_secs()
 
 def _iso8601_now() -> str:
     return str(_now_secs())

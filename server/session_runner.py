@@ -754,7 +754,7 @@ async def _call_llm_for_title(prompt: str) -> str | None:
         print(f"[auto-rename] LLM title OK in {time.monotonic()-t0:.2f}s: {cleaned!r}", file=sys.stderr, flush=True)
         return cleaned
     except _asyncio.TimeoutError:
-        print(f"[auto-rename] LLM title-suggestion timed out ({_AUTO_RENAME_LLM_TIMEOUT_S}s)", file=_sys.stderr, flush=True)
+        print(f"[auto-rename] LLM title-suggestion timed out ({_AUTO_RENAME_LLM_TIMEOUT_S}s)", file=sys.stderr, flush=True)
         return None
     except Exception as e:
         print(f"[auto-rename] LLM title-suggestion error after {time.monotonic()-t0:.2f}s: {e}", file=sys.stderr, flush=True)

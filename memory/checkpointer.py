@@ -174,11 +174,12 @@ def _tool_result_truncate_at() -> int:
     return TOOL_RESULT_TRUNCATE_AT_CHARS
 
 
-def _truncate_tool_result(content) -> str:
+def _truncate_tool_result(content):
     """Replace an oversized tool result body with a one-line pointer.
     Non-string content (lists, dicts) is returned unchanged — those are
     typically structured tool output (diffs, JSON) that should not be
-    silently truncated."""
+    silently truncated. Returns a `str` for string input, otherwise the
+    original object untouched (hence no return annotation)."""
     if not isinstance(content, str):
         return content
     limit = _tool_result_truncate_at()
@@ -705,8 +706,18 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
     chars of the injected summary).
     """
     threshold = _auto_compact_threshold()
-    est = _estimate_tokens(messages)
-    if len(messages) <= _preserve_recent() and est < threshold:
+    # `_estimate_tokens` walks the entire history. After turn 1 the trigger
+    # below is the LLM's own reported input_tokens, so the local estimate is
+    # usually computed and thrown away. Make it lazy: compute at most once,
+    # and only on the paths that actually need it (turn 1, a tiny-but-huge
+    # history, or the tokens_before baseline when we really compact).
+    _est_cache: list[int] = []
+    def _est() -> int:
+        if not _est_cache:
+            _est_cache.append(_estimate_tokens(messages))
+        return _est_cache[0]
+
+    if len(messages) <= _preserve_recent() and _est() < threshold:
         return messages, False, {}
 
     # Primary trigger: the LLM's own reported input_tokens (same number
@@ -718,10 +729,10 @@ def maybe_compact(messages: list, session_id: str | None = None) -> tuple[list, 
     if last_input > 0:
         if last_input < threshold:
             return messages, False, {}
-    elif est < threshold:
+    elif _est() < threshold:
         return messages, False, {}
 
-    tokens_before = est
+    tokens_before = _est()
     compacted = _compact_messages(messages)
     removed = len(messages) - len(compacted)
     # "Did the compact shrink the prompt?" Two ways: (a) message count

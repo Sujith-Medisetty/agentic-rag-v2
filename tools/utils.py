@@ -6,10 +6,40 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Small shared helpers (single source of truth — previously duplicated across
+# tools/multi_agent.py and server/db.py)
+# ---------------------------------------------------------------------------
+
+def now_secs() -> int:
+    """Current Unix time, whole seconds."""
+    return int(time.time())
+
+
+def slugify(text: str, *, max_len: int = 40, allow_underscore: bool = True) -> str:
+    """Lowercase, collapse non-slug chars to single hyphens, trim, and cap
+    length. Returns '' for empty/garbage input so callers can fall back to a
+    default like 'app'.
+
+    allow_underscore=True keeps `_` and `-` (deployed-app slugs); False maps
+    everything non-alphanumeric to `-` (agent names). The two branches are
+    byte-for-byte equal to the original `_slugify` / `_slugify_agent_name`
+    implementations they replaced.
+    """
+    s = (text or "").strip().lower()
+    if allow_underscore:
+        s = re.sub(r"[^a-z0-9_-]+", "-", s)
+        s = re.sub(r"-{2,}", "-", s).strip("-_")
+    else:
+        s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s[:max_len]
 
 
 # ---------------------------------------------------------------------------

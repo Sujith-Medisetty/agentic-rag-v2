@@ -117,8 +117,8 @@ async def lifespan(app: FastAPI):
     await _configure_runtime_singletons()
     _register_ojas_services()
     _reconcile_deployed_apps_on_boot()
-    _start_deploy_job_sweeper()
-    _start_delete_job_sweeper()
+    _start_job_sweeper("deploy", _deploy_jobs, _deploy_jobs_lock)
+    _start_job_sweeper("delete", _delete_jobs, _delete_jobs_lock)
     yield
 
 def _reconcile_deployed_apps_on_boot() -> None:
@@ -2023,32 +2023,40 @@ class _DeployJob:
 _deploy_jobs: dict[str, _DeployJob] = {}
 _deploy_jobs_lock = _threading.Lock()
 
-def _deploy_job_or_404(job_id: str, session_id: str, user: dict) -> _DeployJob:
-    """Lookup + ownership check. 404s if missing OR not owned by caller
-    (not 403, to avoid leaking other users' job ids). Mirrors the
-    _session_or_404 / _deployed_app_or_404 ownership rules."""
-    with _deploy_jobs_lock:
-        job = _deploy_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "deploy job not found")
-    if user["role"] != "root" and job.user_id != user["id"]:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "deploy job not found")
-    if job.session_id != session_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "deploy job not found")
+def _job_or_404(jobs: dict, lock, job_id: str, parent_attr: str,
+                parent_id: str, user: dict, label: str):
+    """Lookup + ownership check for an in-memory job registry. 404s if the
+    job is missing, not owned by the caller, or not under the expected
+    parent (404 not 403, to avoid leaking other users' job ids). Shared by
+    the deploy- and delete-job lookups; `parent_attr` is the job field that
+    must equal `parent_id` ("session_id" for deploy, "target_id" for delete)."""
+    with lock:
+        job = jobs.get(job_id)
+    if (job is None
+            or (user["role"] != "root" and job.user_id != user["id"])
+            or getattr(job, parent_attr) != parent_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"{label} not found")
     return job
 
 
-async def _sweep_completed_deploy_jobs() -> None:
-    """Periodic background task: drop completed deploy jobs from the
-    in-memory registry after a 5-minute TTL. Necessary so the dict
-    doesn't grow unbounded for users who deploy many apps in one
-    session. The TTL is generous (5 min) so a re-poll by the user
-    (e.g. they navigate back to the chat 30 seconds after the modal
-    closed) still sees the canonical result before the entry is swept.
+def _deploy_job_or_404(job_id: str, session_id: str, user: dict) -> _DeployJob:
+    return _job_or_404(
+        _deploy_jobs, _deploy_jobs_lock, job_id, "session_id", session_id,
+        user, "deploy job",
+    )
 
-    Without this TTL the registry would only ever lose entries when
-    the next deploy overwrote them (since job_id is a fresh UUID
-    per-deploy, that's never). Bounded memory in practice."""
+
+async def _sweep_completed_jobs(jobs: dict, lock, label: str) -> None:
+    """Periodic background task: drop completed jobs from an in-memory job
+    registry after a 5-minute TTL. Necessary so the dict doesn't grow
+    unbounded (job_id is a fresh UUID per request, so entries are otherwise
+    never reclaimed). The TTL is generous so a user re-poll shortly after a
+    modal closes still sees the canonical result before the entry is swept.
+
+    Shared by the deploy- and delete-job registries; `label` distinguishes
+    the log line. Tolerates the race where completed_at is None (task crashed
+    before the terminal-state hook ran) by also sweeping terminal-status jobs
+    whose updated_at is older than the TTL."""
     COMPLETED_TTL_SECONDS = 300
     SWEEP_INTERVAL_SECONDS = 60
     while True:
@@ -2058,33 +2066,32 @@ async def _sweep_completed_deploy_jobs() -> None:
             return
         cutoff = int(time.time()) - COMPLETED_TTL_SECONDS
         stale_ids: list[str] = []
-        with _deploy_jobs_lock:
-            for jid, job in _deploy_jobs.items():
-                # Only sweep jobs that are in a terminal state AND have
-                # been terminal for at least the TTL. We tolerate the
-                # race where job.completed_at is None (task crashed
-                # before _set_terminal ran) by also sweeping status
-                # in {succeeded, failed, cancelled} with no completion
-                # time set, as long as updated_at is old.
+        with lock:
+            for jid, job in jobs.items():
                 if job.completed_at is not None and job.completed_at < cutoff:
                     stale_ids.append(jid)
                 elif job.status in ("succeeded", "failed", "cancelled") and \
                      job.completed_at is None and job.updated_at < cutoff:
                     stale_ids.append(jid)
         for jid in stale_ids:
-            with _deploy_jobs_lock:
-                _deploy_jobs.pop(jid, None)
+            with lock:
+                jobs.pop(jid, None)
         if stale_ids:
-            print(f"[ojas] swept {len(stale_ids)} stale deploy job(s) (TTL {COMPLETED_TTL_SECONDS}s)")
+            print(f"[ojas] swept {len(stale_ids)} stale {label} job(s) (TTL {COMPLETED_TTL_SECONDS}s)")
 
 
-def _start_deploy_job_sweeper() -> asyncio.Task:
-    """Spawn the periodic sweeper. Idempotent — only one instance runs
-    at a time per backend process. Called once from lifespan()."""
-    if getattr(_start_deploy_job_sweeper, "_task", None) is not None:
-        return _start_deploy_job_sweeper._task  # type: ignore[return-value]
-    task = asyncio.create_task(_sweep_completed_deploy_jobs())
-    _start_deploy_job_sweeper._task = task  # type: ignore[attr-defined]
+_job_sweeper_tasks: dict[str, asyncio.Task] = {}
+
+
+def _start_job_sweeper(label: str, jobs: dict, lock) -> asyncio.Task:
+    """Spawn the periodic completed-job sweeper for a registry. Idempotent
+    per label — only one instance runs at a time per backend process.
+    Called once each from lifespan()."""
+    existing = _job_sweeper_tasks.get(label)
+    if existing is not None:
+        return existing
+    task = asyncio.create_task(_sweep_completed_jobs(jobs, lock, label))
+    _job_sweeper_tasks[label] = task
     return task
 
 
@@ -2162,18 +2169,10 @@ _delete_jobs_lock = _threading.Lock()
 
 
 def _delete_job_or_404(job_id: str, target_id: str, user: dict) -> _DeleteJob:
-    """Lookup + ownership check. 404s if missing OR not owned by caller
-    (not 403, to avoid leaking other users' job ids). Mirrors the
-    _deploy_job_or_404 ownership rule."""
-    with _delete_jobs_lock:
-        job = _delete_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "delete job not found")
-    if user["role"] != "root" and job.user_id != user["id"]:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "delete job not found")
-    if job.target_id != target_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "delete job not found")
-    return job
+    return _job_or_404(
+        _delete_jobs, _delete_jobs_lock, job_id, "target_id", target_id,
+        user, "delete job",
+    )
 
 
 def _init_delete_job_steps(job: _DeleteJob, step_count: int) -> None:
@@ -2586,41 +2585,6 @@ def _load_sessions_for_project_delete(project_id: str, user_id: str) -> list[dic
         # the end will still drop the row.
         return []
     return sessions
-
-
-async def _sweep_completed_delete_jobs() -> None:
-    """Periodic background task: drop completed delete jobs after a
-    5-minute TTL. Mirrors _sweep_completed_deploy_jobs."""
-    COMPLETED_TTL_SECONDS = 300
-    SWEEP_INTERVAL_SECONDS = 60
-    while True:
-        try:
-            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
-        except asyncio.CancelledError:
-            return
-        cutoff = int(time.time()) - COMPLETED_TTL_SECONDS
-        stale_ids: list[str] = []
-        with _delete_jobs_lock:
-            for jid, djob in _delete_jobs.items():
-                if djob.completed_at is not None and djob.completed_at < cutoff:
-                    stale_ids.append(jid)
-                elif djob.status in ("succeeded", "failed", "cancelled") and \
-                     djob.completed_at is None and djob.updated_at < cutoff:
-                    stale_ids.append(jid)
-        for jid in stale_ids:
-            with _delete_jobs_lock:
-                _delete_jobs.pop(jid, None)
-        if stale_ids:
-            print(f"[ojas] swept {len(stale_ids)} stale delete job(s) (TTL {COMPLETED_TTL_SECONDS}s)")
-
-
-def _start_delete_job_sweeper() -> asyncio.Task:
-    """Spawn the periodic sweeper. Idempotent."""
-    if getattr(_start_delete_job_sweeper, "_task", None) is not None:
-        return _start_delete_job_sweeper._task  # type: ignore[return-value]
-    task = asyncio.create_task(_sweep_completed_delete_jobs())
-    _start_delete_job_sweeper._task = task  # type: ignore[attr-defined]
-    return task
 
 
 @app.post("/api/sessions/{session_id}/compact")

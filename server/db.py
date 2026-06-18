@@ -25,6 +25,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from tools.utils import now_secs, slugify
+
 
 def server_db_path() -> Path:
     p = Path.home() / ".agentic-rag" / "server.db"
@@ -359,7 +361,7 @@ def _connect() -> Iterator[sqlite3.Connection]:
 
 
 def _now() -> int:
-    return int(time.time())
+    return now_secs()
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -1024,17 +1026,11 @@ def clear_ojas_services_with_pid() -> int:
 # Deployed apps — promoted session builds living at /opt/ojas-apps/<slug>/
 # ============================================================================
 
-import re as _re
-
-
 def _slugify(text: str) -> str:
     """Lowercase, drop non-alphanumeric (except - and _), collapse repeated
     hyphens. Returns '' for empty/garbage input so callers can fall back
     to a default like 'app'."""
-    s = (text or "").strip().lower()
-    s = _re.sub(r"[^a-z0-9_-]+", "-", s)
-    s = _re.sub(r"-{2,}", "-", s).strip("-_")
-    return s[:40]   # cap length so URLs stay tidy
+    return slugify(text, max_len=40, allow_underscore=True)
 
 
 class DeployedSlugTaken(RuntimeError):

@@ -323,10 +323,14 @@ def _git_signature(workspace: str) -> tuple:
             return (sig, 0, 0)  # not a git repo — cache is fine
         head = gitdir / "HEAD"
         idx  = gitdir / "index"
-        sig.append(str(head.stat().st_mtime_ns) if head.exists() else "0")
-        sig.append(str(head.stat().st_size)      if head.exists() else "0")
-        sig.append(str(idx.stat().st_mtime_ns)  if idx.exists()  else "0")
-        sig.append(str(idx.stat().st_size)      if idx.exists()  else "0")
+        # One stat() per file instead of two (mtime + size from the same
+        # stat result); these run on every cache-staleness check.
+        head_st = head.stat() if head.exists() else None
+        idx_st  = idx.stat()  if idx.exists()  else None
+        sig.append(str(head_st.st_mtime_ns) if head_st else "0")
+        sig.append(str(head_st.st_size)     if head_st else "0")
+        sig.append(str(idx_st.st_mtime_ns)  if idx_st  else "0")
+        sig.append(str(idx_st.st_size)      if idx_st  else "0")
     except Exception:
         pass
     return tuple(sig)
@@ -414,8 +418,11 @@ _CACHE_DIAG_PREV: dict[str, dict] = {}
 
 
 def _cache_diag_enabled() -> bool:
-    return (os.getenv("OJAS_CACHE_DIAG", "1").strip().lower()
-            not in ("0", "false", "no", "off", ""))
+    # Opt-in. The per-turn cost (hashing the prompt + fingerprinting every
+    # message in history) is only worth paying when actively debugging a
+    # prompt-cache miss. Off by default; set OJAS_CACHE_DIAG=1 to enable.
+    return (os.getenv("OJAS_CACHE_DIAG", "0").strip().lower()
+            in ("1", "true", "yes", "on"))
 
 
 def _message_fingerprint(m) -> str:
@@ -1083,68 +1090,61 @@ def _strip_old_thinking(messages: list[BaseMessage]) -> list[BaseMessage]:
     return out
 
 
-def node_agent(state: RunnerState) -> dict:
-    """One model call = one
+def _handle_budget_pause(pause: dict) -> dict:
+    """Emit the pause notice and return the no-message state update that routes
+    should_continue → END at a clean, checkpointed boundary. Re-running the same
+    thread_id resumes from here with a fresh budget — no crash, no lost work."""
+    from agents.reporter import get_reporter
+    try:
+        get_reporter().tool_done("budget", f"paused: {pause['detail']}", error=False)
+    except Exception:
+        pass
+    # No "messages" update ⇒ last message stays a ToolMessage/Human ⇒ END.
+    return {"paused": True, "pause_reason": pause}
 
-    Before each call we consult the per-invocation run budget. If a budget is hit
-    (iterations / tokens / wall-clock / stall) we PAUSE gracefully: return without
-    a new assistant message so should_continue routes to END at a clean,
-    checkpointed boundary (tool results already delivered). Re-running the same
-    thread_id resumes from here with a fresh budget — no crash, no lost work.
-    """
-    # Plumb session_id from state into the local scope so we can pass
-    # it to maybe_compact / record_llm_input_tokens. See the comment
-    # in agents/state.py for why this is needed.
-    session_id = state.get("session_id") or ""
-    pause = _run_budget.check()
-    if pause is not None:
-        from agents.reporter import get_reporter
-        try:
-            get_reporter().tool_done("budget", f"paused: {pause['detail']}", error=False)
-        except Exception:
-            pass
-        # No "messages" update ⇒ last message stays a ToolMessage/Human ⇒ END.
-        return {"paused": True, "pause_reason": pause}
 
-    iterations = int(state.get("iterations", 0)) + 1
-
-    # Assemble the system prompt once, then reuse for the rest of the run
-    #.
-    # Build the system prompt as a (static, dynamic) pair so MiniMax's
-    # automatic prefix cache hits on the static part. We accept either form
-    # from state (legacy `system_prompt` string OR the new pair) and rebuild
-    # if absent / stale.
+def _resolve_system_prompt_pair(state: RunnerState) -> tuple[str, str]:
+    """Return the (static_base, dynamic_suffix) system-prompt pair, reused for
+    the whole run so MiniMax's automatic prefix cache hits on the static part.
+    Accepts either form from state (legacy `system_prompt` string OR the new
+    pair) and rebuilds if absent/stale."""
     cached = state.get("system_prompt_pair")
     if isinstance(cached, (list, tuple)) and len(cached) == 2:
-        static_base, dynamic_suffix = cached
-    else:
-        # Legacy fallback: older checkpoints stored a single string under
-        # `system_prompt`. We rebuild the pair and trust render_split's
-        # backward-compat path (it returns the whole prompt as static
-        # if the boundary marker is missing).
-        legacy = state.get("system_prompt")
-        if isinstance(legacy, str) and legacy:
-            static_base = legacy
-            dynamic_suffix = ""
-        else:
-            static_base, dynamic_suffix = _build_system_prompt(state)
+        return cached[0], cached[1]
+    # Legacy fallback: older checkpoints stored a single string under
+    # `system_prompt`. Rebuild the pair and trust render_split's backward-compat
+    # path (it returns the whole prompt as static if the boundary is missing).
+    legacy = state.get("system_prompt")
+    if isinstance(legacy, str) and legacy:
+        return legacy, ""
+    return _build_system_prompt(state)
 
-    # LLM input source: `live_messages` (per-turn post-compact working
-    # set) if set, else `messages` (append-only accumulator). On the
-    # first turn of a session `live_messages` is unset.
+
+def _prepare_history(state: RunnerState, session_id: str) -> list:
+    """Build the LLM input history: take `live_messages` (per-turn post-compact
+    working set) if set else `messages` (append-only accumulator), repair any
+    orphaned tool calls, then auto-compact BEFORE the LLM call so the turn that
+    crosses the threshold pays for the smaller compacted context, not the giant
+    one.
+
+    History is APPEND-ONLY between compactions — we deliberately do NOT
+    mask/strip/truncate the middle every turn. Those per-turn rewrites changed
+    bytes partway through the prompt, busting the provider's prefix cache from
+    the first changed message onward (the "cache keeps missing" symptom). With
+    append-only history the whole prior prompt is served from cache and only the
+    newest message is billed fresh; total size is bounded by maybe_compact (one
+    infrequent cache reset). (`mask_old_observations` / `_strip_old_thinking` /
+    `_truncate_live_history` are kept defined for tests/back-compat, not applied.)
+    """
+    from memory.checkpointer import maybe_compact, _auto_compact_threshold
     raw_history = list(state.get("live_messages") or state.get("messages", []))
     history = _repair_orphan_tool_calls(raw_history)
-
-    # Auto-compact BEFORE the LLM call (turn that crosses threshold pays
-    # for the smaller compacted context, not the giant one). The `put()`
-    # safety net only fires on restart or paths that bypass the loop.
-    from memory.checkpointer import maybe_compact, _auto_compact_threshold
     history, did_compact, compact_info = maybe_compact(history, session_id=session_id)
     if did_compact:
-        # Chat-visible notification. No `context_update` here — the
-        # post-LLM publish below is the single source of truth for the
-        # chip (pre-LLM local estimates have drifted from the provider's
-        # real number in the past and made the chip bounce).
+        # Chat-visible notification. The post-LLM publish is the single source
+        # of truth for the chip, so no `context_update` here (pre-LLM local
+        # estimates have drifted from the provider's real number and made the
+        # chip bounce).
         try:
             from agents.reporter import get_reporter
             get_reporter().context_compacted(
@@ -1157,121 +1157,47 @@ def node_agent(state: RunnerState) -> dict:
             )
         except Exception:
             pass
+    return history
 
-    # History is APPEND-ONLY between compactions. We deliberately do NOT
-    # mask/strip/truncate the middle of the history on every turn anymore.
-    # Those per-turn rewrites changed bytes partway through the prompt, which
-    # busted the provider's prefix cache from the first changed message onward
-    # — turning cheap cache_read tokens into full-price fresh tokens on every
-    # turn (the exact "cache keeps missing" symptom). With append-only history
-    # the whole prior prompt is served from cache and only the newest message
-    # is billed fresh. Total context size is bounded by `maybe_compact` above
-    # (one infrequent cache reset), not by nibbling at the middle each turn.
-    # (`mask_old_observations` / `_strip_old_thinking` / `_truncate_live_history`
-    # are kept defined for tests/back-compat but are no longer applied here.)
 
-    # NOTE: we no longer publish a pre-LLM `context_update` here. The
-    # local estimate (`_estimate_msg_tokens(history)`) drifts from the
-    # real `input_tokens` Anthropic reports (no system prompt in the
-    # local count, `len//4` rounding error, etc.) — publishing both
-    # made the chip bounce between two different numbers within a
-    # single turn. The post-LLM publish below (using the provider's
-    # authoritative `input_tokens` from `usage_metadata`) is the only
-    # source of truth. The chip stays at its last real value during
-    # the API call, which is fine.
-
-    # Build the messages list: [static SystemMessage, dynamic SystemMessage,
-    # ...history]. Two SystemMessages in a row is the cleanest way to expose
-    # the static/dynamic split to providers that prefix-cache on identical
-    # prefixes — the second message busts the cache for the dynamic part
-    # only.
+def _assemble_messages(static_base: str, dynamic_suffix: str,
+                       history: list) -> list[BaseMessage]:
+    """[static SystemMessage, dynamic SystemMessage, *history]. Two
+    SystemMessages in a row exposes the static/dynamic split to providers that
+    prefix-cache on identical prefixes — the second message busts the cache for
+    the dynamic part only."""
     messages: list[BaseMessage] = []
     if static_base:
         messages.append(SystemMessage(content=static_base))
     if dynamic_suffix:
         messages.append(SystemMessage(content=dynamic_suffix))
     messages.extend(history)
+    return messages
 
-    llm = _get_llm().bind_tools(get_all_tools() + _mcp_tools)
-    ai = _stream_model_call(llm, messages)
-    _run_budget.record(ai)
 
-    # Publish the context-used value to the chip. The chip's
-    # percentage label uses the NEW (uncached + writes) tokens,
-    # NOT the cache-inflated total — so the percentage stays
-    # meaningful as a "fill level" indicator relative to the
-    # auto-compact threshold. For a "hi" turn on a session
-    # running at 99.8% cache hit rate, the chip shows ~0%
-    # (only 136 new tokens) instead of 154% (which is the
-    # total prompt including the cache-served static system
-    # prompt). The auto-compact trigger uses the same number,
-    # so chip and trigger stay in lockstep — when the chip
-    # goes red (>=100% of threshold), auto-compact fires.
-    #
-    # The tooltip still shows the total + cache split so the
-    # user can see "X new, Y cached" if they hover.
-    #
-    # Different providers report tokens with different
-    # semantics:
-    #   - Anthropic native: `input_tokens` is the UNCACHED
-    #     portion only; cache fields are reported separately.
-    #   - OpenAI standard + MiniMax-M3: `input_tokens` is
-    #     the TOTAL prompt (uncached + cache_read +
-    #     cache_creation combined). Cache fields live in
-    #     `input_token_details.cache_read` /
-    #     `cache_creation` (or `prompt_tokens_details.
-    #     cached_tokens` for vanilla OpenAI).
-    #
-    # We compute the NEW number by SUBTRACTING cache fields
-    # when they're present (OpenAI / MiniMax shape), or
-    # using `input_tokens` as-is if the provider didn't
-    # surface them (Anthropic shape).
-    #
-    # (Earlier the chip used the total prompt number; that
-    # gave 154% for a "hi" turn whose actual new content was
-    # only 136 tokens, which the user found misleading —
-    # "154% is not correct right" — because a session
-    # genuinely under the auto-compact ceiling should show a
-    # calm chip, not a screaming red one.)
-    # The chip shows the TOTAL prompt size the model was given
-    # — same number the user sees in the LLM call stats ("In 78k").
-    # The auto-compact trigger uses the same number, so chip and
-    # trigger stay in lockstep. The cache fields are surfaced in
-    # the tooltip so the user can see how much of that 78k is
-    # genuinely new content vs cache-served prefix.
-    #
-    # Provider semantics (verified live against MiniMax M3):
-    #   `usage.input_tokens` is the TOTAL prompt — uncached +
-    #   cache_read + cache_creation combined. The cache fields
-    #   (`input_token_details.cache_read` /
-    #   `input_token_details.cache_creation`) are SUBSETS of
-    #   `input_tokens`, NOT separate additions. We must NOT
-    #   add them on top — that would double-count (e.g. 78k
-    #   total + 77k cache = 155k, then chip shows 311% of 50k
-    #   threshold for a turn whose actual prompt was 78k).
-    #
-    # The same shape is used by OpenAI standard (`prompt_tokens`,
-    # `prompt_tokens_details.cached_tokens`). On Anthropic
-    # native, `input_tokens` is the UNCACHED portion only and
-    # cache fields are reported separately as
-    # `cache_read_input_tokens` / `cache_creation_input_tokens`.
-    # We don't have a runtime way to know which provider we're
-    # talking to; the heuristic is "if cache fields are present
-    # AND they don't exceed `input_tokens`, the provider is
-    # reporting the total in `input_tokens`". (Anthropic's
-    # cache fields can exceed `input_tokens` because the
-    # report is structured differently — but for OpenAI /
-    # MiniMax, the cache fields are always < input_tokens.)
+def _publish_context_usage(ai, session_id: str) -> None:
+    """Publish the context-used value to the chip and feed the auto-compact
+    trigger, using the provider's authoritative `input_tokens`.
+
+    The chip shows the TOTAL prompt size (same "In 78k" the user sees in the LLM
+    stats); the auto-compact trigger uses the same number so chip and trigger
+    stay in lockstep. Cache fields are surfaced in the tooltip.
+
+    Provider semantics (verified live against MiniMax M3): `usage.input_tokens`
+    is the TOTAL prompt — uncached + cache_read + cache_creation combined. The
+    cache fields are SUBSETS of `input_tokens`, NOT separate additions, so we
+    must not add them on top (that double-counts: e.g. 78k total + 77k cache
+    would show 311% of a 50k threshold for a 78k prompt). Same shape for OpenAI
+    standard (`prompt_tokens` / `prompt_tokens_details.cached_tokens`). On
+    Anthropic native, `input_tokens` is the UNCACHED portion only and cache
+    fields are reported separately; we clamp cache fields to `input_tokens` so
+    the tooltip breakdown stays sensible across shapes."""
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import _auto_compact_threshold, record_llm_input_tokens
         _usage = getattr(ai, "usage_metadata", None) or {}
         _input_total = int(_usage.get("input_tokens", 0) or 0)
         _cache_creation, _cache_read = _extract_cache_fields(_usage)
-        # Sanity clamp: if the cache fields exceed `input_tokens`,
-        # they're probably from a different reporting shape and
-        # would double-count. Cap them at `input_tokens` so the
-        # breakdown in the tooltip stays sensible.
         if _cache_read > _input_total:
             _cache_read = _input_total
         if _cache_creation > _input_total:
@@ -1286,19 +1212,20 @@ def node_agent(state: RunnerState) -> dict:
                 cache_creation=_cache_creation,
                 input_total=_input_total,
             )
-            # Auto-compact trigger uses the same total number.
-            # Auto-compact trigger uses the same total. `session_id` keys
-            # the cross-turn module dict — without it the per-context
-            # ContextVar would reset to 0 next turn and the trigger
+            # session_id keys the cross-turn module dict — without it the
+            # per-context ContextVar would reset to 0 next turn and the trigger
             # would never fire.
             record_llm_input_tokens(_input_total, session_id=session_id)
     except Exception:
         pass
 
-    # Per-call cache verdict (log-only; OJAS_CACHE_DIAG=0 to silence). Tells us
-    # on the next run WHICH thing busted the cache on a low-cache_read turn:
-    # our system prompt, our tool order, or a history-prefix divergence — vs a
-    # stable prefix (→ the miss is provider-side, not our code).
+
+def _emit_cache_diag(ai, session_id: str, static_base: str,
+                     dynamic_suffix: str, messages: list) -> None:
+    """Per-call cache verdict (log-only; opt-in via OJAS_CACHE_DIAG=1). Tells us
+    WHICH thing busted the cache on a low-cache_read turn: our system prompt,
+    our tool order, or a history-prefix divergence — vs a stable prefix (→ the
+    miss is provider-side, not our code)."""
     try:
         _tool_names = [getattr(t, "name", type(t).__name__)
                        for t in (get_all_tools() + _mcp_tools)]
@@ -1318,10 +1245,37 @@ def node_agent(state: RunnerState) -> dict:
     except Exception:
         pass
 
+
+def node_agent(state: RunnerState) -> dict:
+    """One model call = one node invocation.
+
+    Before each call we consult the per-invocation run budget. If a budget is
+    hit (iterations / tokens / wall-clock / stall) we PAUSE gracefully: return
+    without a new assistant message so should_continue routes to END at a clean,
+    checkpointed boundary (tool results already delivered). Re-running the same
+    thread_id resumes from here with a fresh budget — no crash, no lost work.
+    """
+    session_id = state.get("session_id") or ""
+    pause = _run_budget.check()
+    if pause is not None:
+        return _handle_budget_pause(pause)
+
+    iterations = int(state.get("iterations", 0)) + 1
+    static_base, dynamic_suffix = _resolve_system_prompt_pair(state)
+    history = _prepare_history(state, session_id)
+    messages = _assemble_messages(static_base, dynamic_suffix, history)
+
+    llm = _get_llm().bind_tools(get_all_tools() + _mcp_tools)
+    ai = _stream_model_call(llm, messages)
+    _run_budget.record(ai)
+
+    _publish_context_usage(ai, session_id)
+    _emit_cache_diag(ai, session_id, static_base, dynamic_suffix, messages)
+
     # Persist the post-process history as the LLM input for the NEXT turn.
-    # Two channels: `messages` (add_messages reducer — append-only audit
-    # log) and `live_messages` (REPLACE reducer — the LLM only ever
-    # reads this, so it stays bounded by the auto-compact threshold).
+    # Two channels: `messages` (add_messages reducer — append-only audit log)
+    # and `live_messages` (REPLACE reducer — the LLM only ever reads this, so
+    # it stays bounded by the auto-compact threshold).
     return {
         "messages": [ai],
         "live_messages": list(history) + [ai],
