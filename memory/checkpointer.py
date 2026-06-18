@@ -45,13 +45,16 @@ AUTO_COMPACT_THRESHOLD_LEGACY_ENV_VAR = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 CONTEXT_WINDOW_TOKENS = 200_000
 
 CHARS_PER_TOKEN = 4
-# Most-recent messages to keep verbatim when compacting. 4 was too small
-# (the agent lost the thread of mid-edit context); 80 was too large
-# (each edit_file tool_call embeds a 1-3KB new_string arg, so 80
-# messages could be 80K+ tokens — bigger than the threshold itself, and
-# the compact stopped actually reducing anything). 30 ≈ 2-3 turns is
-# the sweet spot: post-mask/strip/truncate, ~15-30K tokens.
-PRESERVE_RECENT = 30
+# Most-recent messages to keep verbatim when compacting. History is now
+# append-only between compactions (no per-turn mask/strip/truncate), so these
+# kept messages are FULL-size — 8 ≈ the last 3-4 message-sets (user / assistant
+# / tool-result cycles), enough to carry mid-edit context without dragging a
+# long tail behind every compaction. Everything older is folded into the
+# summary (which pins the original request + files touched + errors fixed), so
+# dropping the raw messages doesn't lose the thread. Override via
+# OJAS_PRESERVE_RECENT. (Was 30, tuned for the old masked world; full-size
+# messages make 30 far too heavy.)
+PRESERVE_RECENT = 8
 PRESERVE_RECENT_ENV_VAR = "OJAS_PRESERVE_RECENT"
 
 # Tool-result truncation: bodies over this many chars get collapsed
@@ -318,16 +321,23 @@ def _summarize_messages(messages: list) -> str:
         "files_touched":    set(),
         "tools_used":       [],
     }
+    first_user_msg: str | None = None
     last_user_msg: str | None = None
 
     for msg in messages:
         cls = type(msg).__name__
         content = msg.content if hasattr(msg, "content") else str(msg)
 
-        # Keep only the most recent HumanMessage verbatim — earlier user asks
-        # are summarised by being the source of all the work that followed.
+        # Track the FIRST real user request (the goal) and the most recent one.
+        # Skip a prior compaction's continuation block (it starts with
+        # COMPACT_PREAMBLE) so we pin the actual original ask, not a summary of
+        # a summary — this is how the goal survives across repeated compactions.
         if cls == "HumanMessage" and isinstance(content, str) and content.strip():
-            last_user_msg = content.strip()
+            text = content.strip()
+            if not text.startswith(COMPACT_PREAMBLE.strip()[:40]):
+                if first_user_msg is None:
+                    first_user_msg = text
+                last_user_msg = text
             continue
 
         if cls == "AIMessage":
@@ -369,10 +379,15 @@ def _summarize_messages(messages: list) -> str:
                 sections["test_results"].append(f"{name}: {snippet}")
 
     parts: list[str] = []
-    if last_user_msg:
+    if first_user_msg:
         parts.append(
-            f"User's most recent request that was summarised (the very latest "
-            f"is in the kept tail below, verbatim):\n  {last_user_msg[:500]}"
+            f"Original request (the goal — keep building toward this):\n"
+            f"  {first_user_msg[:600]}"
+        )
+    if last_user_msg and last_user_msg != first_user_msg:
+        parts.append(
+            f"\nMost recent request that was summarised (the very latest is in "
+            f"the kept tail below, verbatim):\n  {last_user_msg[:500]}"
         )
     if sections["edits_made"]:
         parts.append("\nFiles edited:")

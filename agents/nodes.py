@@ -1002,7 +1002,7 @@ def node_agent(state: RunnerState) -> dict:
     # Auto-compact BEFORE the LLM call (turn that crosses threshold pays
     # for the smaller compacted context, not the giant one). The `put()`
     # safety net only fires on restart or paths that bypass the loop.
-    from memory.checkpointer import maybe_compact, mask_old_observations, _auto_compact_threshold
+    from memory.checkpointer import maybe_compact, _auto_compact_threshold
     history, did_compact, compact_info = maybe_compact(history, session_id=session_id)
     if did_compact:
         # Chat-visible notification. No `context_update` here — the
@@ -1022,20 +1022,17 @@ def node_agent(state: RunnerState) -> dict:
         except Exception:
             pass
 
-    # Collapse old tool results to a stub so the prefix cache doesn't
-    # re-send the entire previous history on every turn. The agent can
-    # always re-invoke the tool for the fresh body.
-    history = mask_old_observations(history)
-
-    # Strip old thinking/reasoning blocks — they re-ship every turn via
-    # the prefix cache and are the largest single contributor to
-    # per-turn cost on long sessions.
-    history = _strip_old_thinking(history)
-
-    # Truncate oversized ToolMessage bodies + heavy AIMessage tool_call
-    # args. Tool calls (path + args) on the preceding AIMessage stay
-    # verbatim — the agent's intent is what matters.
-    history = _truncate_live_history(history)
+    # History is APPEND-ONLY between compactions. We deliberately do NOT
+    # mask/strip/truncate the middle of the history on every turn anymore.
+    # Those per-turn rewrites changed bytes partway through the prompt, which
+    # busted the provider's prefix cache from the first changed message onward
+    # — turning cheap cache_read tokens into full-price fresh tokens on every
+    # turn (the exact "cache keeps missing" symptom). With append-only history
+    # the whole prior prompt is served from cache and only the newest message
+    # is billed fresh. Total context size is bounded by `maybe_compact` above
+    # (one infrequent cache reset), not by nibbling at the middle each turn.
+    # (`mask_old_observations` / `_strip_old_thinking` / `_truncate_live_history`
+    # are kept defined for tests/back-compat but are no longer applied here.)
 
     # NOTE: we no longer publish a pre-LLM `context_update` here. The
     # local estimate (`_estimate_msg_tokens(history)`) drifts from the
