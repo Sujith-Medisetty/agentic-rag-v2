@@ -328,8 +328,12 @@ def get_ojas_app_rules_section() -> str:
         "fire off several follow-up `edit_file` calls to delete unused imports or "
         "fix lint — get the imports right on the first write, or fold all "
         "clean-ups into ONE edit.",
-        " - Run `npm run build` / `npm run verify` ONCE when you believe the app "
-        "is done — not speculatively after every file.",
+        " - Run `npm run build` / `npm run verify` when you believe the app is "
+        "done — NOT speculatively after every file while you're still building. "
+        "If it reports a failure, fix the cause and run it AGAIN; repeat until "
+        "it's green (a green verify is the done-bar — see the PWA section). The "
+        "fail→fix→re-verify loop is required; what's wasteful is running it "
+        "prematurely or twice in a row with no change in between.",
         "",
         "CRITICAL — REPLACE the starter `App.tsx` AND its `<Dashboard />`. The "
         "fullstack template's `App.tsx` returns `<Dashboard />`, and that "
