@@ -305,18 +305,23 @@ def get_ojas_app_rules_section() -> str:
         "### Step 4 — build efficiently (turns cost money — don't burn them)",
         "",
         "Every model call re-sends this entire prompt, so each wasted turn has a "
-        "real cost. The template layout documented above is AUTHORITATIVE — treat "
-        "it as ground truth and act on it:",
-        " - Do NOT `ls` or `read_file` the template tree to 'confirm' what's "
-        "there before copying. The files, paths, and primitives are listed above "
-        "— copy the template and start building. Re-deriving the documented "
-        "layout by hand is the single biggest waste of turns on a build.",
-        " - Read a template file ONLY when you're about to modify that specific "
-        "file (e.g. read `App.tsx` right before you `edit_file` it — `edit_file` "
-        "requires a prior read of the file). Reading 'to understand the scaffold' "
-        "is unnecessary; that's what these rules are for.",
+        "real cost. The point is to cut BLIND turns, not necessary ones — read "
+        "with purpose, just don't survey:",
+        " - Reading IS expected when it has a purpose, and MORE so the more "
+        "complex the app. Read a file before you `edit_file` it (required — "
+        "`edit_file` needs a prior read), and read any file whose exact contract "
+        "you need to build correctly: `App.tsx` for the router + page chrome "
+        "wiring, a `ui/` primitive before you use its props in a non-obvious way, "
+        "`index.css` for the theme tokens, or an example page "
+        "(`pages/home.tsx`) / the dashboard to mirror its patterns. For a complex "
+        "or multi-page app, reading those few files is the RIGHT call, not waste.",
+        " - What's wasteful is BLIND surveying — `ls`-ing the whole template tree "
+        "or opening files one-by-one just to 'confirm' the layout that's already "
+        "documented above, and re-reading something already shown this turn. The "
+        "layout above is authoritative: don't re-derive it by hand, read with a "
+        "specific question in mind, and never read the same file twice.",
         " - Batch independent operations into ONE turn: issue all the `read_file` "
-        "calls for the files you'll touch together, and any independent `bash` "
+        "calls for the files you need together, and any independent `bash` "
         "checks, in a single message. Sequence only when a later call genuinely "
         "needs an earlier result.",
         " - Write each file CORRECT the first time. Do NOT write a file and then "
@@ -677,8 +682,10 @@ def get_using_tools_section() -> str:
         "`git status` and `git diff` as two calls in one turn. Only sequence when "
         "a later call depends on an earlier result.",
         " - Don't burn turns — each turn re-sends the whole prompt, so wasted "
-        "round-trips cost real money. Don't re-read or re-`ls` content already "
-        "shown in this conversation or described in the system prompt; write a "
+        "round-trips cost real money. Don't RE-read a file or re-`ls` a path you "
+        "already saw this conversation, and don't re-derive by hand a layout fact "
+        "the system prompt already states — but DO read a file the first time when "
+        "you need its real contents or contract. Write a "
         "file correct the first time rather than emitting follow-up edits to fix "
         "your own imports/lint; and run build/verify once when done, not after "
         "every file.",
