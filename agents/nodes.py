@@ -396,6 +396,132 @@ def _build_system_prompt(state: RunnerState) -> tuple[str, str]:
     return (static, dynamic)
 
 # ---------------------------------------------------------------------------
+# Cache diagnostics — pinpoint WHY a turn missed the provider's prefix cache.
+#
+# Set OJAS_CACHE_DIAG=0 to silence. For every LLM call we log a one-line
+# verdict comparing this call's outgoing prompt against the PREVIOUS call's:
+#   - cached / fresh token split (from usage_metadata)
+#   - whether [static][dynamic] changed (→ a prompt-rebuild bug)
+#   - whether the bound tools changed (→ tool-ordering bug)
+#   - the longest common message-prefix length vs last call (→ where history
+#     diverged; if it covers all of last call's messages, our prefix is stable
+#     and a low cache_read is PROVIDER-SIDE, not our code)
+# So on the next run, a miss (like the 22k-fresh file-write turn) tells us
+# immediately which of those three it was.
+# ---------------------------------------------------------------------------
+
+_CACHE_DIAG_PREV: dict[str, dict] = {}
+
+
+def _cache_diag_enabled() -> bool:
+    return (os.getenv("OJAS_CACHE_DIAG", "1").strip().lower()
+            not in ("0", "false", "no", "off", ""))
+
+
+def _message_fingerprint(m) -> str:
+    """Stable short hash of one message's wire-relevant bytes (type + content
+    + tool_calls). Two messages with the same fingerprint serialize to the
+    same prefix bytes, so the provider's cache should treat them identically."""
+    import hashlib
+    cls = type(m).__name__
+    content = getattr(m, "content", "")
+    try:
+        content_s = content if isinstance(content, str) else json.dumps(content, default=str, sort_keys=True)
+    except Exception:
+        content_s = str(content)
+    tcs = ""
+    if getattr(m, "tool_calls", None):
+        try:
+            tcs = json.dumps(
+                [(tc.get("name"), tc.get("id"), tc.get("args")) for tc in m.tool_calls],
+                default=str, sort_keys=True,
+            )
+        except Exception:
+            tcs = str(m.tool_calls)
+    h = hashlib.sha1(f"{cls}\x00{content_s}\x00{tcs}".encode("utf-8", "replace"))
+    return h.hexdigest()[:12]
+
+
+def _log_cache_diag(
+    *, session_id: str, static_base: str, dynamic_suffix: str,
+    tool_names: list[str], messages: list, cache_read: int,
+    cache_creation: int, input_total: int,
+) -> None:
+    """Emit the per-call cache verdict and stash this call's fingerprints for
+    the next call to diff against. Never raises — diagnostics must not break a
+    turn."""
+    if not _cache_diag_enabled():
+        return
+    try:
+        import hashlib
+        import logging
+        sys_hash = hashlib.sha1(
+            f"{static_base}\x00{dynamic_suffix}".encode("utf-8", "replace")
+        ).hexdigest()[:12]
+        tools_hash = hashlib.sha1(
+            ("\x00".join(tool_names)).encode("utf-8", "replace")
+        ).hexdigest()[:12]
+        fps = [_message_fingerprint(m) for m in messages]
+        fresh = max(0, input_total - cache_read - cache_creation)
+
+        key = session_id or "_default"
+        prev = _CACHE_DIAG_PREV.get(key)
+        verdict_parts: list[str] = []
+        if prev is None:
+            verdict_parts.append("first-call(cold)")
+        else:
+            if prev["sys"] != sys_hash:
+                verdict_parts.append("SYS-CHANGED")
+            if prev["tools"] != tools_hash:
+                verdict_parts.append("TOOLS-CHANGED")
+            # Longest common prefix between this call's history fingerprints
+            # and the previous call's.
+            common = 0
+            for a, b in zip(prev["fps"], fps):
+                if a != b:
+                    break
+                common += 1
+            prev_len = len(prev["fps"])
+            if common >= prev_len:
+                verdict_parts.append(f"prefix-stable(+{len(fps) - common}new)")
+            else:
+                verdict_parts.append(
+                    f"PREFIX-DIVERGED@msg{common}/{prev_len}"
+                )
+
+        logging.getLogger(__name__).info(
+            "cache-diag: in=%d cached=%d fresh=%d (%.0f%% cached) | msgs=%d "
+            "sys=%s tools=%s | %s",
+            input_total, cache_read, fresh,
+            (100.0 * cache_read / input_total) if input_total else 0.0,
+            len(fps), sys_hash, tools_hash, " ".join(verdict_parts),
+        )
+        # Also append to a dedicated file so the line is retrievable even when
+        # the host's logging config (uvicorn/systemd) doesn't surface app
+        # INFO logs. Path override: OJAS_CACHE_DIAG_FILE.
+        try:
+            from pathlib import Path
+            from datetime import datetime, timezone
+            diag_path = os.getenv("OJAS_CACHE_DIAG_FILE") or str(
+                Path.home() / ".agent" / "cache-diag.log"
+            )
+            p = Path(diag_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    f"{stamp} sid={key[:8]} in={input_total} cached={cache_read} "
+                    f"fresh={fresh} ({(100.0*cache_read/input_total) if input_total else 0:.0f}% cached) "
+                    f"msgs={len(fps)} sys={sys_hash} tools={tools_hash} | "
+                    f"{' '.join(verdict_parts)}\n"
+                )
+        except Exception:
+            pass
+        _CACHE_DIAG_PREV[key] = {"sys": sys_hash, "tools": tools_hash, "fps": fps}
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
 # Streaming display + token accounting for one model call
 # ---------------------------------------------------------------------------
 
@@ -1156,6 +1282,29 @@ def node_agent(state: RunnerState) -> dict:
             # ContextVar would reset to 0 next turn and the trigger
             # would never fire.
             record_llm_input_tokens(_input_total, session_id=session_id)
+    except Exception:
+        pass
+
+    # Per-call cache verdict (log-only; OJAS_CACHE_DIAG=0 to silence). Tells us
+    # on the next run WHICH thing busted the cache on a low-cache_read turn:
+    # our system prompt, our tool order, or a history-prefix divergence — vs a
+    # stable prefix (→ the miss is provider-side, not our code).
+    try:
+        _tool_names = [getattr(t, "name", type(t).__name__)
+                       for t in (get_all_tools() + _mcp_tools)]
+        _u = getattr(ai, "usage_metadata", None) or {}
+        _it = int(_u.get("input_tokens", 0) or 0)
+        _cc, _cr = _extract_cache_fields(_u)
+        if _cr > _it:
+            _cr = _it
+        if _cc > _it:
+            _cc = _it
+        _log_cache_diag(
+            session_id=session_id, static_base=static_base,
+            dynamic_suffix=dynamic_suffix, tool_names=_tool_names,
+            messages=messages, cache_read=_cr, cache_creation=_cc,
+            input_total=_it,
+        )
     except Exception:
         pass
 
