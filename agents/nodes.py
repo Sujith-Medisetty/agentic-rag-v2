@@ -22,6 +22,7 @@ from __future__ import annotations
 from datetime import date
 import json
 import platform
+import threading
 import time
 
 import os
@@ -52,7 +53,13 @@ _model: str = "MiniMax-M3"
 _thinking: bool = False
 _thinking_budget: int = 10_000
 _mcp_tools: list = []  # extra LangChain tools loaded from MCP servers
-_token_counter = None
+# Per-session TokenCounter. Previously a single process-wide singleton,
+# which made concurrent sessions' per-turn `before/after` diffs in
+# session_runner.run_turn() include each other's LLM calls — inflating
+# per-turn and session totals 3-9x. Now keyed by session_id so each
+# session owns its own counter and diffs are naturally correct.
+_token_counters: dict = {}
+_token_counters_lock = threading.Lock()
 
 
 def configure_model(
@@ -65,16 +72,17 @@ def configure_model(
     thinking settings. (Iteration/token/time limits are the per-invocation run
     budget — see reset_run_budget.)
 
-    Also drops the cached TokenCounter so the next get_token_counter() call
-    rebuilds it against the NEW model. Without this, a model change in the
-    same process would silently misprice every turn (the cached counter
-    still prices under the old model name)."""
-    global _provider, _model, _thinking, _thinking_budget, _token_counter
+    Also drops the cached TokenCounters so the next get_token_counter() call
+    rebuilds them against the NEW model. Without this, a model change in the
+    same process would silently misprice every turn (the cached counters
+    still price under the old model name)."""
+    global _provider, _model, _thinking, _thinking_budget
     _provider = (provider or "anthropic").lower()
     _model = model
     _thinking = thinking
     _thinking_budget = thinking_budget
-    _token_counter = None  # force rebuild on next get_token_counter() call
+    with _token_counters_lock:
+        _token_counters.clear()  # force rebuild on next get_token_counter() call
 
 
 def configure_tools(extra_tools: list | None = None) -> None:
@@ -116,9 +124,10 @@ class _RunBudget:
         self.start: float | None = None
         self._last_sig: str | None = None
         self._repeat_streak = 0
+        self.session_id: str = ""  # set in reset(); used by _tokens_used()
 
     def reset(self, *, max_iters: int, max_tokens: int, max_seconds: int,
-              no_progress_limit: int) -> None:
+              no_progress_limit: int, session_id: str = "") -> None:
         self.max_iters = max(0, int(max_iters or 0))
         self.max_tokens = max(0, int(max_tokens or 0))
         self.max_seconds = max(0, int(max_seconds or 0))
@@ -127,6 +136,7 @@ class _RunBudget:
         self.start = time.monotonic()
         self._last_sig = None
         self._repeat_streak = 0
+        self.session_id = session_id or ""
 
     @classmethod
     def _tool_signature(cls, ai: AIMessage) -> str | None:
@@ -146,7 +156,7 @@ class _RunBudget:
         return "|".join(parts)
 
     def _tokens_used(self) -> int:
-        tc = get_token_counter()
+        tc = get_token_counter(self.session_id)
         if not tc:
             return 0
         cum = tc.cumulative
@@ -204,24 +214,36 @@ _t_call_start: float = 0.0
 
 def reset_run_budget(
     *, max_iters: int = 0, max_tokens: int = 0, max_seconds: int = 0,
-    no_progress_limit: int = 8,
+    no_progress_limit: int = 8, session_id: str = "",
 ) -> None:
     """Called once per invocation (main._run_graph) before streaming the graph."""
     _run_budget.reset(
         max_iters=max_iters, max_tokens=max_tokens, max_seconds=max_seconds,
-        no_progress_limit=no_progress_limit,
+        no_progress_limit=no_progress_limit, session_id=session_id,
     )
 
 
-def get_token_counter():
-    global _token_counter
-    if _token_counter is None:
-        try:
-            from memory.token_counter import TokenCounter
-            _token_counter = TokenCounter(model=_model)
-        except Exception:
-            pass
-    return _token_counter
+def get_token_counter(session_id: str):
+    """Return the per-session TokenCounter, creating one on first use.
+
+    The lock guards the get-or-create race between the event-loop thread
+    (which calls this at the top and bottom of run_turn to compute the
+    per-turn diff) and the executor thread (which calls it from
+    `_stream_model_call` to record live token usage). Without the lock,
+    a concurrent get-or-create could lose tokens: two callers see no
+    entry, both create new counters, only one is stored, and the other
+    caller's `record()` calls land in a counter nobody will ever read.
+    """
+    with _token_counters_lock:
+        tc = _token_counters.get(session_id)
+        if tc is None:
+            try:
+                from memory.token_counter import TokenCounter
+                tc = TokenCounter(model=_model)
+            except Exception:
+                return None
+            _token_counters[session_id] = tc
+        return tc
 
 
 def _get_llm(
@@ -607,7 +629,7 @@ class _ThinkingTagSplitter:
         return 0
 
 
-def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage:
+def _stream_model_call(llm_with_tools, messages: list[BaseMessage], session_id: str = "") -> AIMessage:
     """Stream one model call: forward text chunks + tool announcements
     through the reporter, return the aggregated assistant message. Also
     records the full request/response to the per-session trace store
@@ -697,7 +719,7 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage]) -> AIMessage
     # record token usage + publish a live delta so the UI's per-turn
     # counter ticks (instead of waiting for the end-of-turn summary).
     try:
-        tc = get_token_counter()
+        tc = get_token_counter(session_id)
         usage = getattr(ai, "usage_metadata", None)
         if tc and usage:
             from memory.token_counter import TokenUsage
@@ -1271,7 +1293,7 @@ def node_agent(state: RunnerState) -> dict:
     messages = _assemble_messages(static_base, dynamic_suffix, history)
 
     llm = _get_llm().bind_tools(get_all_tools() + _mcp_tools)
-    ai = _stream_model_call(llm, messages)
+    ai = _stream_model_call(llm, messages, session_id=session_id)
     _run_budget.record(ai)
 
     _publish_context_usage(ai, session_id)

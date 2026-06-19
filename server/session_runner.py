@@ -112,7 +112,7 @@ async def run_turn(
     # Token snapshot BEFORE the turn (works for both success + error paths).
     # Lazy import so this file can be imported in tests without langchain.
     from agents.nodes import get_token_counter
-    tc = get_token_counter()
+    tc = get_token_counter(session_id)
     before = tc.cumulative if tc else None
     # Keep the full CostEstimate (not just .total) so we can emit per-component
     # cost sub-totals — the UI uses them to show "cost of in vs cost of out"
@@ -180,6 +180,7 @@ async def run_turn(
             max_tokens=0,         # token/time budgets are off by default in web mode
             max_seconds=0,
             no_progress_limit=8,
+            session_id=session_id,
         )
         config = {
             "configurable": {"thread_id": session_id},
@@ -327,7 +328,7 @@ async def run_turn(
     # ALWAYS publish turn_summary — success OR failure. Token diff covers
     # whatever the model actually consumed before this turn ended (zero if
     # it crashed before the first model call).
-    tc_after = get_token_counter()
+    tc_after = get_token_counter(session_id)
     after = tc_after.cumulative if tc_after else None
     cost_after = tc_after.cost() if tc_after else None
     turn_in   = (after.input_tokens          - before.input_tokens)          if before and after else 0
