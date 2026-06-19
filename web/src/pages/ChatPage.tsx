@@ -112,6 +112,13 @@ export default function ChatPage() {
 
   const [turns, setTurns] = useState<Turn[]>([]);
   const [currentTurn, setCurrentTurn] = useState<Turn | null>(null);
+  // Live mirror of `currentTurn` so the WS `turn_summary` handler can read
+  // it synchronously (refs don't trigger re-renders and always hold the
+  // latest value). Used by the turn_summary case to build the finished
+  // turn outside the `setCurrentTurn` updater — see that handler's comment
+  // for the full reason. Updated by the effect just below.
+  const currentTurnRef = useRef<Turn | null>(null);
+  useEffect(() => { currentTurnRef.current = currentTurn; }, [currentTurn]);
   const [plan, setPlan] = useState<TodoItem[]>([]);
   const [git, setGit] = useState<GitInfo | null>(null);
   const [pushing, setPushing] = useState(false);
@@ -788,12 +795,26 @@ export default function ChatPage() {
           cache_write_tokens: Number(p.cache_write_tokens ?? 0),
           cost_usd:           Number(p.cost_usd ?? 0),
         };
-        setCurrentTurn((curr) => {
-          if (!curr) return null;
-          const finished: Turn = { ...curr, summary, isStreaming: false };
+        // Read the current turn from the ref instead of the updater
+        // function. The previous version called `setTurns(...)` from
+        // INSIDE the `setCurrentTurn(updater)` — a side-effect inside a
+        // state updater. In some React 18 batching / concurrent paths
+        // (notably when the WS delivers several events in quick
+        // succession and the user has already submitted the NEXT prompt,
+        // replacing currentTurn optimistically) the inner setTurns could
+        // run against a `ts` that had already been re-initialised by a
+        // separate effect, dropping the finished turn on the floor.
+        // Symptom: the just-finished turn vanished from the chat
+        // immediately after the user submitted the next message; only a
+        // hard refresh (which rebuilds `turns` from the events table)
+        // brought it back. Snapshot via ref, then commit both updates
+        // side-by-side so neither depends on the other.
+        const live = currentTurnRef.current;
+        if (live) {
+          const finished: Turn = { ...live, summary, isStreaming: false };
           setTurns((ts) => [...ts, finished]);
-          return null;
-        });
+        }
+        setCurrentTurn(null);
         // Re-poll detected-dist right after the turn ends so the
         // build-ready banner appears under the new turn (the agent
         // just finished writing files, the dist is fresh). Cheap
