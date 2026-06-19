@@ -4161,7 +4161,21 @@ async def _run_deploy_job(
     try:
         # 0. validate
         _set_step(0, "running")
-        # 0a. dist quality -- reject bundles that contain two copies of
+        # 0a. session todo list -- refuse deploy when the agent's own
+        #     TodoList shows unfinished tasks. Catches the failure mode
+        #     where the agent stopped mid-build (budget pause, stall
+        #     detector, model timeout, transient API error) without
+        #     completing its plan. The user would otherwise click
+        #     Deploy and get an app that renders the StarterDashboard
+        #     because App.tsx was never overwritten, or a half-built
+        #     UI with stubs. No-op when the session never used
+        #     TodoWrite (scaffold-only / static-only flow).
+        try:
+            _validate_session_todos(job.session_id)
+        except Exception as todo_err:
+            _set_step(0, "failed", str(todo_err)[:200])
+            raise
+        # 0b. dist quality -- reject bundles that contain two copies of
         #     React. Symptom at runtime: "Cannot read properties of null
         #     (reading 'useContext')" and a blank <div id="root">. Cause:
         #     the agent ran `npm install` from outside the project and
@@ -4724,6 +4738,85 @@ def _maybe_rebuild_stale_dist(project_abs):
     return ("rebuilt",
             f"dist was stale ({stale_culprit} newer than dist/index.html); "
             f"auto-rebuilt with npm run build (exit 0, {dist_index.stat().st_size} bytes)")
+
+
+def _validate_session_todos(session_id: str) -> None:
+    """Reject deploys from sessions where the agent's TodoList has
+    unfinished items. Catches the failure mode where the agent stops
+    mid-build (budget pause, stall detector, model timeout, transient
+    API error) without completing its plan — the user clicks Deploy
+    and gets an app that renders the StarterDashboard because App.tsx
+    was never overwritten.
+
+    The session's todo list is the agent's own contract with itself:
+    it called TodoWrite to commit to a plan, so leaving items
+    `pending` / `in_progress` at deploy time means the plan was NOT
+    completed — even if some files were written to disk. The build
+    may compile, but the user-facing app will be half-built.
+
+    The check is permissive about static-only apps and templates that
+    never call TodoWrite: if `clawd-todos.json` doesn't exist (or is
+    empty), there is no plan to validate, so we allow deploy. This
+    matches the FreshCart-at-deploy behavior for the scaffold flow.
+
+    Raises _IncompleteBuildError with a numbered list of unfinished
+    items so the deploy UI can show the user exactly what the agent
+    didn't get to.
+    """
+    import json
+
+    class _IncompleteBuildError(Exception):
+        pass
+
+    try:
+        todos_path = Path.home() / ".agent" / "sessions" / session_id / "clawd-todos.json"
+        if not todos_path.is_file():
+            # No TodoList ever written — scaffold / static-only flow.
+            # The other gates (feature-completeness, build-freshness,
+            # dist quality) still catch the actual build issues.
+            return
+        try:
+            data = json.loads(todos_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # Corrupt / unreadable todo file — don't block deploy on a
+            # storage bug. The other gates will catch the real issues.
+            return
+        if not isinstance(data, list):
+            return
+        open_items = [
+            t for t in data
+            if isinstance(t, dict)
+            and t.get("status") in ("pending", "in_progress")
+        ]
+        if not open_items:
+            return
+        # Build a numbered list, distinguishing the two statuses so
+        # the user can see what was *started* vs what was *never
+        # attempted*. Order is preserved as in the original file.
+        lines = []
+        for i, t in enumerate(open_items, 1):
+            content = (t.get("content") or "(no description)").strip()
+            status = t.get("status", "pending")
+            lines.append(f"  {i}. [{status}] {content}")
+        raise _IncompleteBuildError(
+            f"Build incomplete: {len(open_items)} of {len(data)} planned "
+            "task(s) are not done. The agent stopped before finishing its "
+            "plan — usually a budget pause (stall detector / timeout / "
+            "token cap) or a transient API error. The current build may "
+            "compile but will render an unfinished app (StarterDashboard "
+            "if App.tsx was never overwritten). Unfinished tasks:\n"
+            + "\n".join(lines)
+            + "\n\nFix: send the agent another message in this session "
+            "asking it to finish the open tasks. Or click Resume if the "
+            "Ojas UI offers it. After the todos are all `completed`, "
+            "redeploy."
+        )
+
+    # Re-raise so the caller (deploy step 0) translates to step=failed.
+    # Wrap in a fresh exception so the deploy job's generic Exception
+    # catch sees a string error, not a wrapped class.
+    except _IncompleteBuildError:
+        raise
 
 
 def _do_copy_dist(*, dist, dist_target, slug) -> None:
