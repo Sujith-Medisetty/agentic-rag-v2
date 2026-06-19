@@ -388,12 +388,32 @@ def _run_foreground(command: str, timeout_ms: int | None) -> BashOutput:
 
 
 def _timeout_output(command: str, timeout_ms: int) -> BashOutput:
-    """Structured timeout payload routed through the telemetry channel."""
+    """Structured timeout payload routed through the telemetry channel.
+
+    The stderr string is the LLM-facing message — formatted as an explicit
+    `Error:` result with recovery options, because a plain "command exceeded
+    timeout" string caused the LLM to treat the kill as a completed
+    no-output run and end the turn with a summary. The `Error:` prefix
+    triggers the is_error check at agents/nodes.py:1458 (so the UI shows
+    it red), and the embedded recovery options + "do NOT send a final
+    summary" line give the LLM an unambiguous next step.
+    """
     is_test = _is_test_command(command)
     rci = "test.hung" if is_test else "timeout"
+    hint = (
+        f"Error: Command timed out after {timeout_ms} ms "
+        f"(was killed before completing).\n\n"
+        f"This is NOT a successful result — the work did not happen. "
+        f"Do NOT send a final summary message as if the task is done.\n\n"
+        f"Recovery options (pick one on your next turn):\n"
+        f"  (a) Retry with a longer timeout: bash(..., timeout=600000)\n"
+        f"  (b) Run in background: bash(..., run_in_background=true) then poll\n"
+        f"  (c) Take a different approach: break the command into smaller steps\n\n"
+        f"Command that timed out: `{command[:200]}`"
+    )
     return BashOutput(
         stdout="",
-        stderr=f"Command exceeded timeout of {timeout_ms} ms",
+        stderr=hint,
         interrupted=True,
         no_output_expected=True,
         return_code_interpretation=rci,

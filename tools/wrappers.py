@@ -509,7 +509,17 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
             result = execute_sandboxed(command, _sandbox, timeout_sec)
             parts = []
             if result.stdout: parts.append(result.stdout)
-            if result.stderr: parts.append(f"[stderr]\n{result.stderr}")
+            if result.stderr:
+                # If stderr is already an explicit `Error:` message (e.g. the
+                # timeout output from tools/bash.py:_timeout_output), skip
+                # the `[stderr]` prefix so the `Error:` stays at the head of
+                # the rendered ToolMessage — that's what the is_error check
+                # in agents/nodes.py:1458 looks for, and what makes the UI
+                # render the result red instead of as a silent success.
+                if result.stderr.startswith("Error:"):
+                    parts.append(result.stderr)
+                else:
+                    parts.append(f"[stderr]\n{result.stderr}")
             if result.exit_code != 0:
                 parts.append(f"[exit code: {result.exit_code}]")
             out = "\n".join(parts) or "(no output)"
@@ -527,7 +537,17 @@ def bash(command: str, timeout: int | None = None, run_in_background: bool = Fal
             ))
             parts = []
             if raw.stdout: parts.append(raw.stdout)
-            if raw.stderr: parts.append(f"[stderr]\n{raw.stderr}")
+            if raw.stderr:
+                # If stderr is already an explicit `Error:` message (e.g. the
+                # timeout output from tools/bash.py:_timeout_output), skip
+                # the `[stderr]` prefix so the `Error:` stays at the head of
+                # the rendered ToolMessage — that's what the is_error check
+                # in agents/nodes.py:1458 looks for, and what makes the UI
+                # render the result red instead of as a silent success.
+                if raw.stderr.startswith("Error:"):
+                    parts.append(raw.stderr)
+                else:
+                    parts.append(f"[stderr]\n{raw.stderr}")
             if raw.return_code_interpretation:
                 parts.append(f"[{raw.return_code_interpretation}]")
             out = "\n".join(parts) or "(no output)"

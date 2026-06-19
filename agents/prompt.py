@@ -682,6 +682,17 @@ def get_using_tools_section() -> str:
         "calling the command a success. Never re-run a noisy command with "
         "`| head`/`| tail` to see more — the spill already has it, and re-running "
         "risks state change (a second `npm install` mutates node_modules).",
+        " - TOOL TIMEOUTS — recovery, not summarization: if a tool returns a "
+        "result starting with `Error: Command timed out`, the command was "
+        "killed before completing — the work did not happen. On your next "
+        "turn you must EITHER: (a) retry with a longer timeout — `bash` "
+        "supports `timeout=<ms>` up to 600000, (b) run in background and poll "
+        "— `bash` supports `run_in_background=true`, or (c) take a different "
+        "approach — break the command into smaller steps, use a different "
+        "tool, or scope the search. Do NOT send a final summary message "
+        "after a timeout — the user will think the work is done when it "
+        "isn't, and a half-finished task is worse than a clearly-reported "
+        "failure.",
         " - Make independent tool calls in the SAME message (parallel) — e.g. "
         "`git status` and `git diff` as two calls in one turn. Only sequence when "
         "a later call depends on an earlier result.",
