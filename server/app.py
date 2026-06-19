@@ -4209,8 +4209,38 @@ async def _run_deploy_job(
         dist_target = target / "static" if is_fullstack else target
         dist_target.mkdir(parents=True, exist_ok=True)
 
-        # 2. copy_dist
+        # 2. copy_dist — preceded by a server-side auto-rebuild if the
+        #    agent forgot to run `npm run build` after editing src/.
+        #    The freshness check is read-only and fast; the rebuild only
+        #    fires when src is actually newer than dist, so a clean
+        #    re-deploy pays ~0 cost. Catches the #1 reported deploy bug:
+        #    "I marked the task complete but the deployed URL still shows
+        #    the StarterDashboard." The agent-side freshness gate in
+        #    prompt.py + check-build-freshness.py is the primary defense;
+        #    this is the safety net that fires even when the agent skips
+        #    the gate.
         _set_step(2, "running")
+        try:
+            rebuild_status, rebuild_msg = await loop.run_in_executor(
+                None,
+                lambda: _maybe_rebuild_stale_dist(project_abs),
+            )
+            # Surface the rebuild status in the step message — the UI
+            # checklist shows the message next to "Copying build to
+            # /opt/ojas-apps". For "fresh" we keep the message short
+            # (it's the normal path, don't clutter the UI).
+            if rebuild_status == "rebuilt":
+                _set_step(2, "running",
+                          "auto-rebuilding stale dist/index.html before copy")
+                logger.info("[deploy %s] %s", slug, rebuild_msg)
+            elif rebuild_status in ("no_frontend", "no_src"):
+                # Either the agent scaffolded without a Vite project, or
+                # there's no src yet — copy_dist's own logic will raise
+                # a clear "no dist/" error below if needed.
+                pass
+        except Exception as e:
+            _set_step(2, "failed", str(e)[:200])
+            raise
         try:
             await loop.run_in_executor(None, lambda: _do_copy_dist(
                 dist=_session_preview_dir(job.session_id, project_dir=project_dir),
@@ -4555,6 +4585,145 @@ def _validate_dist_quality(dist: Path | None) -> None:
                         "verify:render` (the templates ship a smoke "
                         "test that catches this) and re-deploy.",
                     )
+
+
+def _maybe_rebuild_stale_dist(project_abs):
+    """Last-line-of-defence auto-rebuild for the most common deploy bug.
+
+    Pattern it prevents: the agent edits `frontend/src/App.tsx`, marks its
+    TodoList task complete, reports "Done!" to the user — but never re-runs
+    `npm run build`. The deployed `dist/` still contains the original
+    scaffold's StarterDashboard bundle, and the user reloads to see "Could
+    not reach the backend: This is the template's starter example (it calls
+    /api/items)." The agent-side freshness gate in prompt.py +
+    check-build-freshness.py catches this BEFORE deploy; this function is
+    the server-side safety net that catches it even if the agent forgot
+    BOTH steps.
+
+    Walks `<project>/src/` (or `<project>/frontend/src/` for the fullstack
+    layout) and compares the newest source mtime to `dist/index.html`
+    mtime. If src is newer — OR dist doesn't exist at all but src does —
+    runs `npm run build` synchronously in the frontend dir. Returns a
+    (status, message) tuple for the deploy job to surface in the UI; raises
+    RuntimeError on build failure (caller translates to step=failed).
+
+    NOT done here (intentional): `npm install`. If node_modules is missing,
+    `npm run build` will fail with ENOENT — that's the agent's job, not
+    ours. We don't want to silently trigger a multi-minute install on every
+    deploy.
+
+    Returns:
+        ("fresh",     msg) — dist already up to date; no rebuild needed
+        ("rebuilt",   msg) — dist was stale; we ran npm run build, it worked
+        ("no_frontend", msg) — no project path or no Vite project; skip
+        ("no_src",    msg) — neither src/ nor dist/; agent hasn't built yet
+    """
+    import os, subprocess
+
+    if project_abs is None:
+        return ("no_frontend", "no project path resolved; skipping rebuild check")
+
+    # Resolve the frontend dir. Fullstack: <project>/frontend. Static-only:
+    # prefer <project>/frontend if it has a package.json (matches the
+    # standard layout), fall back to <project> itself (some legacy scaffolds
+    # put package.json at the root).
+    candidates = [project_abs / "frontend", project_abs]
+    frontend = None
+    for c in candidates:
+        if (c / "package.json").is_file() and (c / "src").is_dir():
+            frontend = c
+            break
+    if frontend is None:
+        return ("no_frontend",
+                f"no Vite project under {project_abs} (looked for frontend/ "
+                "and root with package.json+src); skipping rebuild check")
+
+    src_dir = frontend / "src"
+    dist_index = frontend / "dist" / "index.html"
+
+    # Newest source mtime (skip node_modules and the dist/ subtree itself).
+    SKIP = {"node_modules", ".git", "dist", "build", ".cache", ".vite"}
+    newest_src = 0.0
+    newest_path = ""
+    for dirpath, dirnames, filenames in os.walk(src_dir):
+        dirnames[:] = [d for d in dirnames if d not in SKIP]
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in {".ts", ".tsx", ".jsx", ".js", ".mjs", ".css",
+                           ".scss", ".html", ".svg"}:
+                continue
+            fp = os.path.join(dirpath, fn)
+            try:
+                mt = os.path.getmtime(fp)
+                if mt > newest_src:
+                    newest_src = mt
+                    newest_path = os.path.relpath(fp, frontend)
+            except OSError:
+                continue
+
+    if dist_index.is_file():
+        dist_mtime = dist_index.stat().st_mtime
+        if newest_src <= dist_mtime:
+            return ("fresh",
+                    f"dist/index.html is fresh "
+                    f"(newest src mtime={newest_src:.0f}, "
+                    f"dist mtime={dist_mtime:.0f})")
+        # Stale: rebuild.
+        stale_culprit = newest_path or "(unknown source file)"
+    else:
+        # No dist yet — but src exists, so try building. This lets the agent
+        # scaffold a project, edit src, and deploy in one shot without ever
+        # running npm run build locally.
+        stale_culprit = newest_path or "src/"
+        dist_mtime = 0
+
+    # Run npm run build. Use a generous timeout — Vite can take 30–60s on a
+    # cold project with many modules. We deliberately use --prefix to avoid
+    # the cwd-not-persisting-in-bash bug (see prompt.py "Install discipline").
+    try:
+        proc = subprocess.run(
+            ["npm", "--prefix", str(frontend), "run", "build"],
+            cwd=str(frontend),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"npm run build timed out after 300s in {frontend}. "
+            "Check for infinite loops in src/, missing dependencies, or a "
+            "stuck prebuild script. Fix the project and redeploy."
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "`npm` not found on PATH — the deploy host is missing Node.js. "
+            "Re-run install.sh on the Ojas VM, or run npm run build inside "
+            f"{frontend} manually before redeploying."
+        )
+
+    if proc.returncode != 0:
+        # Surface the last few lines of stderr — that's where Vite / tsc /
+        # esbuild report the actual error. Cap so we don't blow the
+        # deploy_progress message field.
+        err_tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-8:]
+        err_msg = "\n".join(err_tail)[:400]
+        raise RuntimeError(
+            f"auto-rebuild of stale dist failed (npm run build exited "
+            f"{proc.returncode}). Stale source: {stale_culprit}.\n"
+            f"Last output:\n{err_msg}"
+        )
+
+    # Verify the rebuild actually produced a new dist/index.html. Vite can
+    # exit 0 with a broken config and write nothing useful.
+    if not dist_index.is_file():
+        raise RuntimeError(
+            f"npm run build exited 0 but {dist_index} is still missing. "
+            "Check vite.config.ts outDir / build.outDir settings."
+        )
+
+    return ("rebuilt",
+            f"dist was stale ({stale_culprit} newer than dist/index.html); "
+            f"auto-rebuilt with npm run build (exit 0, {dist_index.stat().st_size} bytes)")
 
 
 def _do_copy_dist(*, dist, dist_target, slug) -> None:

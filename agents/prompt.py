@@ -503,6 +503,40 @@ def get_ojas_app_rules_section() -> str:
         "means you hit the single-file-HTML trap — start over with the Vite "
         "scaffold.",
         "",
+        "**Build freshness gate (HARD rule — DO NOT skip).** This is the most "
+        "common reason users see a stale StarterDashboard after you report "
+        "\"done\": you edited `frontend/src/App.tsx` (or any other source file), "
+        "marked your TodoList task complete, told the user \"Done!\" — but you "
+        "never re-ran `npm run build`. The deployed `dist/` still contains the "
+        "scaffold's old bundle, and the user reloads to see the StarterDashboard. "
+        "The prompt rule above (\"exit 0 AND dist/index.html must exist\") is too "
+        "weak: it checks the file exists, not that it's CURRENT. The server now "
+        "auto-rebuilds stale dist on deploy (last-line-of-defence), but you must "
+        "catch it yourself FIRST. Before calling `TaskUpdate completed` on ANY "
+        "frontend edit task, ALL must hold:\n",
+        "  1. `npm --prefix <abs/frontend> run build` exited 0.\n",
+        "  2. `python3 /opt/ojas/agents/scripts/check-build-freshness.py <abs/frontend>` exited 0. This walks `frontend/src/` and compares the newest mtime to `frontend/dist/index.html` — if any `.tsx`/`.ts`/`.css`/`.html`/etc. is newer than the bundle, it exits 1 with the exact culprit file and the fix command. Treat a non-zero exit as \"the edit is NOT done.\"\n",
+        "  3. `python3 /opt/ojas/agents/scripts/check-feature-completeness.py <abs/frontend>` exited 0. This is the UPSTREAM gate — it catches the agent claiming done when the SCREENS THEMSELVES are unfinished (stubs, missing pages, broken routes, dead imports). It parses `src/App.tsx` and `src/pages/*.tsx` to verify every page is imported, routed, has a default export, and has substantive body content (no `return <div>TODO</div>` placeholders). Exit 1 means the build is half-done — fix every reported issue before declaring done.\n",
+        "  4. `curl -sk https://<slug>.<OJAS_APPS_ROOT_DOMAIN>/api/<your-route>` returns real data, OR `npm run verify:render` exits 0 if you can't reach the URL yet.\n",
+        "Failure mode this prevents: you write src/App.tsx, mark the task "
+        "complete, say \"Done!\", the user clicks Deploy, the public URL still "
+        "shows the StarterDashboard because dist/ is stale. The user has "
+        "reported this exact failure mode multiple times — see "
+        "`memory/ojas-false-completion-pattern.md`. The freshness script is the "
+        "single-command fix: run it before every `TaskUpdate completed` on a "
+        "frontend task. If it exits 1, do NOT mark the task complete — run "
+        "`npm run build`, re-run the script, then mark complete.\n",
+        "\n",
+        "Failure mode Layer 3 (feature-completeness) catches that the "
+        "freshness gate CANNOT: you wrote 5 of the 8 screens the user asked "
+        "for, left 3 as stubs (`return <div>TODO</div>`), marked complete, "
+        "said \"Done!\". The build compiles fine, dist/ is fresh — but the "
+        "user clicks a link to the missing screen and gets a placeholder. "
+        "Layer 3 prevents this by listing every page file vs every route vs "
+        "every import and flagging any inconsistency. Run it BEFORE Layer 2 "
+        "even — if Layer 3 fails, you have unfinished work; Layer 2's build "
+        "check is the wrong tool to discover that.",
+        "",
         "**Don't bind the backend to 0.0.0.0** — use 127.0.0.1 (Caddy proxies to "
         "localhost). The systemd unit sets this; for a local test use "
         "`--host 127.0.0.1`.",
