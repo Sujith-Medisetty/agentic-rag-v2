@@ -109,28 +109,17 @@ async def run_turn(
     if not bus.is_bound():
         bus.bind_loop(loop)
 
-    # Token snapshot BEFORE the turn (works for both success + error paths).
-    # Lazy import so this file can be imported in tests without langchain.
-    from agents.nodes import get_token_counter
-    tc = get_token_counter()
-    before = tc.cumulative if tc else None
-    # Keep the full CostEstimate (not just .total) so we can emit per-component
-    # cost sub-totals — the UI uses them to show "cost of in vs cost of out"
-    # and the cache-savings split without re-pricing on the client.
-    cost_before = tc.cost() if tc else None
-
-    # Tool-count snapshot — LangGraph keeps cumulative message history across
-    # turns (same thread_id), so we diff before vs. after to get "tools used
-    # in THIS turn" rather than "tools used in the whole session".
-    tools_before = 0
-    try:
-        from agents.graph import runner_graph
-        _state_before = runner_graph.get_state({
-            "configurable": {"thread_id": session_id},
-        }).values
-        tools_before = _count_tool_uses(_state_before.get("messages", []) or [])
-    except Exception:
-        pass
+    # Token snapshots are captured INSIDE `_drive()` (see below), not here at
+    # the top of `run_turn`. The `tc` counter is a process-wide singleton
+    # shared across every concurrent session — capturing `before` here would
+    # race with other sessions' `_drive`s queued behind this one in the
+    # single-threaded executor: their LLM calls would land in `tc` between
+    # our `before` snapshot and our `_drive` actually starting, making
+    # `after - before` include tokens that were never this turn's. The
+    # executor runs drives strictly sequentially, so the snapshot taken as
+    # the first action inside `_drive` is guaranteed to be immediately
+    # before this turn's LLM calls (and nothing else's).
+    _drive_snapshots: dict = {}
 
     iters = 0
     turn_failed = False
@@ -141,6 +130,37 @@ async def run_turn(
         Raises whatever the graph raised — we let it propagate so the outer
         try/except in run_turn can synthesize the right end-of-turn events
         from a single place."""
+        # Snapshot the token counter AT THE TOP of `_drive` — i.e. as soon as
+        # the single-threaded executor starts running this turn. See the
+        # block comment above for why this isn't done in `run_turn` itself.
+        # Lazy import so this file can be imported in tests without langchain.
+        from agents.nodes import get_token_counter
+        _tc = get_token_counter()
+        if _tc is not None:
+            _drive_snapshots["before"] = _tc.cumulative
+            # Keep the full CostEstimate (not just .total) so we can emit
+            # per-component cost sub-totals — the UI uses them to show
+            # "cost of in vs cost of out" and the cache-savings split
+            # without re-pricing on the client.
+            _drive_snapshots["cost_before"] = _tc.cost()
+
+        # Tool-count snapshot. LangGraph keeps cumulative message history
+        # across turns (same thread_id), so we diff before vs. after to get
+        # "tools used in THIS turn" rather than "tools used in the whole
+        # session". Done here (inside `_drive`) for symmetry with the token
+        # snapshot, even though LangGraph state is per-thread and doesn't
+        # suffer the same cross-session race.
+        _tools_before = 0
+        try:
+            from agents.graph import runner_graph as _rg
+            _state_before = _rg.get_state({
+                "configurable": {"thread_id": session_id},
+            }).values
+            _tools_before = _count_tool_uses(_state_before.get("messages", []) or [])
+        except Exception:
+            pass
+        _drive_snapshots["tools_before"] = _tools_before
+
         from agents.graph import runner_graph
         from agents.nodes import reset_run_budget
 
@@ -327,9 +347,19 @@ async def run_turn(
     # ALWAYS publish turn_summary — success OR failure. Token diff covers
     # whatever the model actually consumed before this turn ended (zero if
     # it crashed before the first model call).
+    #
+    # The `before` / `cost_before` snapshots were captured INSIDE `_drive`
+    # (see the snapshot block at the top of `_drive`) and stashed in
+    # `_drive_snapshots` so the executor boundary didn't race them against
+    # other concurrent sessions sharing the same process-wide counter.
+    # If `_drive` raised before reaching the snapshot, both stay absent
+    # and the diff falls back to 0 — correct behaviour for a turn that
+    # crashed before its first model call.
     tc_after = get_token_counter()
     after = tc_after.cumulative if tc_after else None
     cost_after = tc_after.cost() if tc_after else None
+    before = _drive_snapshots.get("before")
+    cost_before = _drive_snapshots.get("cost_before")
     turn_in   = (after.input_tokens          - before.input_tokens)          if before and after else 0
     turn_out  = (after.output_tokens         - before.output_tokens)         if before and after else 0
     turn_cr   = (after.cache_read_tokens     - before.cache_read_tokens)     if before and after else 0
@@ -347,6 +377,7 @@ async def run_turn(
     # `tools_used` should be the count of tool invocations in THIS turn, not
     # cumulative across the session. ToolMessages-in-state diff is the most
     # reliable signal (iter count over-counts by 1 for the final no-tool turn).
+    tools_before = _drive_snapshots.get("tools_before", 0)
     tool_count = max(0, iters - 1)  # fallback if state lookup fails
     try:
         from agents.graph import runner_graph
