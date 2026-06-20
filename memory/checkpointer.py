@@ -100,10 +100,16 @@ _SUMMARY_TOOL_RESULT_CAP = 1500
 _SUMMARY_AI_TEXT_CAP     = 6000
 _SUMMARY_USER_TEXT_CAP   = 4000
 
-# The Claude-Code compaction prompt: an explicit 8-section structure so the
-# summary carries INTENT + decisions + files/code + errors+fixes + pending
+# The Claude-Code compaction prompt: an explicit 7-section structure so the
+# summary carries INTENT + decisions + files/code + errors+fixes + in-flight
 # work, not just a vague paragraph. The next turn reads this in place of the
 # raw messages, so anything omitted here is genuinely forgotten.
+#
+# Pending tasks are intentionally NOT a section here — `_compact_messages`
+# appends the verbatim todo list right after this summary, so any prose
+# description of pending work would risk contradicting the live list and
+# misleading the next turn. The summariser must describe current work, not
+# queue work.
 COMPACT_SUMMARY_SYSTEM_PROMPT = (
     "You are summarising a coding-assistant conversation that is about to be "
     "truncated for context. Your summary REPLACES the omitted messages — the "
@@ -122,10 +128,11 @@ COMPACT_SUMMARY_SYSTEM_PROMPT = (
     "5. Problem solving — what has been solved and any ongoing troubleshooting.\n"
     "6. All user messages — list every non-tool message from the user verbatim "
     "or near-verbatim, in order. This preserves intent and is critical.\n"
-    "7. Pending tasks and next steps — what remains, with enough detail to "
-    "resume without re-deriving it.\n"
-    "8. Current work — exactly what was happening at the moment of truncation "
-    "(the file, function, or command in flight).\n\n"
+    "7. Current work — exactly what was happening at the moment of truncation "
+    "(the file, function, or command in flight). Do NOT list pending tasks, "
+    "next steps, or what remains to be done — the current todo list is "
+    "appended verbatim right after this summary, and any prose description "
+    "of pending work risks contradicting the live list.\n\n"
     "Be specific and concrete (real paths, names, values). Omit a heading only "
     "if it genuinely has no content. Output only the summary."
 )
@@ -581,14 +588,49 @@ def _render_todo_block(todos: list | None) -> str:
     )
 
 
+def _load_todos_from_disk() -> list | None:
+    """Read the live todo list from `.clawd-todos.json` on disk. Returns
+    `None` when the file is missing or unreadable.
+
+    Why disk over `state["last_todos"]`: `todo_write()` updates the on-disk
+    file on EVERY call (tools/utils.py:104-105), so the disk snapshot is
+    strictly fresher than the in-memory one, which only refreshes when
+    TodoWrite lands in the latest tool batch (agents/nodes.py:1359). Using
+    disk makes the re-injected todo block match what the UI panel is
+    displaying, even when the agent has done many turns of work between
+    TodoWrite calls.
+
+    When all todos are completed, `todo_write` unlinks the file
+    (tools/utils.py:98-102) and we return `None` — callers fall back to the
+    in-memory list, which is also empty in that case.
+    """
+    # Lazy import: avoid pulling tools.utils into the checkpointer import
+    # graph; this function only runs on the compact path.
+    from tools.utils import _todo_store_path
+    try:
+        path = _todo_store_path()
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return None
+        return data
+    except Exception:
+        # Malformed JSON, permission error, anything — fall back silently.
+        # Never let a todo-read failure break compaction.
+        return None
+
+
 def _compact_messages(messages: list, todos: list | None = None) -> list:
     """Summarise the ENTIRE prior conversation into one structured summary
     message and DISCARD the raw messages — Claude-Code-style "pure replace".
     Returns `[HumanMessage(summary + todo block)]`.
 
     The summary becomes the sole carrier of conversation history; recency lives
-    in its 'Current work' / 'Pending tasks' / 'All user messages' sections. Two
-    things that must NOT be lost are preserved out-of-band:
+    in its 'Current work' and 'All user messages' sections. Pending tasks are
+    intentionally NOT summarised here — they are re-injected verbatim below as
+    a single source of truth. Two things that must NOT be lost are preserved
+    out-of-band:
       - The SYSTEM PROMPT is not in this list at all (it's rebuilt every turn
         from `system_prompt_pair` and prepended ahead of this message), so it
         always survives AND stays at the front of the prompt → cache hit.
@@ -615,7 +657,16 @@ def _compact_messages(messages: list, todos: list | None = None) -> list:
         f"{COMPACT_PREAMBLE}Summary:\n{summary_text.strip()}\n\n"
         f"{COMPACT_DIRECT_RESUME_INSTRUCTION}"
     )
-    todo_block = _render_todo_block(todos)
+    # Disk is authoritative at compact time — todo_write() updates the file
+    # on every call (tools/utils.py:104), so the disk snapshot matches what
+    # the UI panel shows. The in-memory `todos` argument only refreshes
+    # when TodoWrite lands in the latest tool batch, so it can lag many
+    # turns behind. Fall back to the in-memory list only when disk is
+    # missing (e.g., all todos completed → todo_write unlinked it).
+    effective_todos = _load_todos_from_disk()
+    if effective_todos is None:
+        effective_todos = todos
+    todo_block = _render_todo_block(effective_todos)
     if todo_block:
         continuation += f"\n\n{todo_block}"
 
