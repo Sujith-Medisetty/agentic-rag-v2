@@ -12,7 +12,8 @@
     "verify:deps": "node scripts/check-deps.mjs",
     "verify:radix": "node scripts/verify-radix.mjs",
     "verify:render": "node scripts/verify-render.mjs",
-    "verify": "npm run verify:deps && npm run verify:radix && npm run build && npm run verify:render"
+    "verify:browser": "node scripts/verify-browser.mjs",
+    "verify": "npm run verify:deps && npm run verify:radix && npm run build && npm run verify:render && npm run verify:browser"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.1.0",
@@ -45,6 +46,7 @@
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",
     "autoprefixer": "^10.4.20",
+    "playwright": "^1.49.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.16",
     "typescript": "^5.6.0",

@@ -357,6 +357,26 @@ def get_ojas_app_rules_section() -> str:
         "speculatively mid-build). If it fails, fix the cause and re-run; repeat "
         "until green. A green verify is the done-bar.",
         "",
+        "After `npm run verify` is green, run `npm run verify:browser`. This is "
+        "the end-to-end browser smoke test (Playwright): it boots the built app "
+        "+ backend, opens every route in headless Chromium, clicks every visible "
+        "button, fills and submits every form, records every console error and "
+        "network failure, checks that any non-empty /api/* response has its data "
+        "visible in the rendered DOM (catches \"API returns data but UI drops "
+        "it\"), and verifies every route actually renders content (a 200 with an "
+        "empty `<main>` is a blank screen — error boundary returned null, list "
+        "with no items and no empty state, routing bug). Auth forms (signup / "
+        "login) are detected by their email+password field combo and filled with "
+        "TEST_CREDS generated once per run — the SAME credentials are reused "
+        "across the run, so a signup submit followed by a login submit exercises "
+        "the SAME account. Playwright's context persists cookies and localStorage "
+        "across navigations, so a successful login carries forward to protected "
+        "routes automatically. If it fails, fix the ROOT CAUSE (not the test — "
+        "the test is right, your app is wrong), re-run `npm run verify`, then "
+        "`npm run verify:browser`. Repeat until both are green. Do not declare "
+        "done with either failing. The first run may print a one-time `npx "
+        "playwright install chromium` hint — do that, then re-run.",
+        "",
         "CRITICAL — REPLACE the starter `App.tsx` AND its `<Dashboard />`. The "
         "fullstack template's `App.tsx` returns `<Dashboard />`, and that "
         "Dashboard fetches `/api/items` — a route your real backend won't "
@@ -586,16 +606,20 @@ def get_ojas_app_rules_section() -> str:
         "pipeline chains `verify:deps` → `build` → `verify:render`; "
         "`npm run verify` is the only command that proves the app works.",
         "",
-        "Both templates ship three guards under `frontend/scripts/`: "
+        "Both templates ship four guards under `frontend/scripts/`: "
         "`check-deps.mjs` (two-React duplicate-hoist), `verify-render.mjs` "
         "(render smoke test), `verify-radix.mjs` (Radix Trigger/Content "
         "parent-child invariant — `<SheetTrigger>` outside its `<Sheet>` throws "
-        "`DialogTrigger must be used within Dialog` and ships a blank screen). "
-        "All three are wired into `prebuild`/`verify`. If you hand-rolled the "
-        "project or scaffolded WITHOUT the Ojas template, copy all three "
+        "`DialogTrigger must be used within Dialog` and ships a blank screen), "
+        "and `verify-browser.mjs` (Playwright end-to-end test: every route "
+        "loads, every button responds, every form submits, no console errors, "
+        "no network 4xx/5xx, every route renders actual content — a 200 with an "
+        "empty `<main>` fails the gate). "
+        "All four are wired into `prebuild`/`verify`. If you hand-rolled the "
+        "project or scaffolded WITHOUT the Ojas template, copy all four "
         "scripts AND the `prebuild`/`verify` lines from another Ojas project — "
-        "skipping any lets a two-React bundle or a Radix-orphan trigger ship "
-        "as a deployable blank page.",
+        "skipping any of them lets a broken handler, dead import, two-React "
+        "bundle, or Radix-orphan trigger ship as a deployable broken app.",
         "",
         "### 5.7 Backend bind address",
         "",
