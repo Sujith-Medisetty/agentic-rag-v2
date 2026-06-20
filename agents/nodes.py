@@ -22,10 +22,29 @@ from __future__ import annotations
 from datetime import date
 import json
 import platform
+import sys
 import threading
 import time
 
 import os
+
+# ---------------------------------------------------------------------------
+# LLM stream debug logging — opt-in via AGENT_LLM_DEBUG=1.
+#
+# When enabled, _stream_with_idle_timeout prints one line per chunk and
+# one line per state transition (start / watchdog fire / done / error) to
+# stderr. Filter in journalctl with:
+#   journalctl -u ojas-backend | grep '[llm-stream]'
+#
+# Zero overhead when disabled (one env-var lookup at import time).
+# ---------------------------------------------------------------------------
+_LLM_DBG = os.getenv("AGENT_LLM_DEBUG", "").lower() in ("1", "true", "yes")
+_LLM_TAG = "[llm-stream]"
+
+
+def _llm_dbg(msg: str) -> None:
+    if _LLM_DBG:
+        print(f"{_LLM_TAG} {msg}", file=sys.stderr, flush=True)
 
 from langchain_core.messages import (
     AIMessage, AIMessageChunk, SystemMessage, BaseMessage, ToolMessage,
@@ -665,6 +684,9 @@ class _ThinkingTagSplitter:
 #                                    seconds (default 90). Detects mid-stream socket
 #                                    pauses that the 300s httpx total timeout would
 #                                    otherwise wait N minutes to catch.
+#   AGENT_LLM_DEBUG                 set to 1 to log every LLM-stream chunk + state
+#                                    transition to stderr (filter with
+#                                    `grep '[llm-stream]'`). Zero overhead when off.
 def _get_retryable_exceptions() -> tuple:
     """Lazy-load transient-error classes from installed provider SDKs.
     A provider that isn't installed is silently skipped (its classes
@@ -720,35 +742,73 @@ def _stream_with_idle_timeout(stream_iter, idle_timeout_s: float):
     import threading as _threading
 
     q: "_queue.Queue[tuple]" = _queue.Queue(maxsize=1024)
+    _start_t = time.monotonic()
+    _llm_dbg(f"START idle_timeout_s={idle_timeout_s} stream={type(stream_iter).__name__}")
 
     def _producer() -> None:
         try:
             for chunk in stream_iter:
+                if _LLM_DBG:
+                    _c = getattr(chunk, "content", None)
+                    _ctype = type(_c).__name__
+                    if isinstance(_c, str):
+                        _clen = len(_c)
+                    elif isinstance(_c, list):
+                        _clen = f"list[{len(_c)}]"
+                    elif _c is None:
+                        _clen = "None"
+                    else:
+                        _clen = "?"
+                    _tc = getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None)
+                    _tn = len(_tc) if _tc else 0
+                    _t = time.monotonic() - _start_t
+                    _llm_dbg(
+                        f"t={_t:8.2f}s chunk content_type={_ctype} content_len={_clen} "
+                        f"tool_chunks={_tn} qsize={q.qsize()}"
+                    )
                 q.put(("chunk", chunk))
         except BaseException as e:  # noqa: BLE001 — any exception type surfaces to consumer
+            _t = time.monotonic() - _start_t
+            _llm_dbg(f"t={_t:8.2f}s producer EXC {type(e).__name__}: {e!r}")
             q.put(("error", e))
         finally:
+            _t = time.monotonic() - _start_t
+            _llm_dbg(f"t={_t:8.2f}s producer DONE")
             q.put(("done", None))
 
     t = _threading.Thread(target=_producer, daemon=True, name="ojas-llm-stream")
     t.start()
+    _chunk_count = 0
 
     while True:
         try:
             kind, payload = q.get(timeout=idle_timeout_s)
         except _queue.Empty:
+            _t = time.monotonic() - _start_t
+            _llm_dbg(
+                f"t={_t:8.2f}s WATCHDOG FIRED idle_timeout_s={idle_timeout_s} "
+                f"producer_alive={t.is_alive()} qsize={q.qsize()} chunks_seen={_chunk_count}"
+            )
             raise TimeoutError(
                 f"LLM stream idle for {idle_timeout_s}s — no chunk received"
             )
 
         if kind == "done":
+            _t = time.monotonic() - _start_t
+            _llm_dbg(
+                f"t={_t:8.2f}s CONSUMER DONE chunks={_chunk_count} "
+                f"producer_alive={t.is_alive()} qsize={q.qsize()}"
+            )
             return
         if kind == "error":
+            _t = time.monotonic() - _start_t
+            _llm_dbg(f"t={_t:8.2f}s CONSUMER RAISE {type(payload).__name__}: {payload!r}")
             # Re-raise the producer's exception verbatim — it'll flow
             # through the retry layer's `except retryable as e:` arm
             # if it matches; otherwise it bubbles uncaught.
             raise payload
 
+        _chunk_count += 1
         yield payload
 
 
