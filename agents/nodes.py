@@ -629,6 +629,244 @@ class _ThinkingTagSplitter:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# LLM retry-on-transient-error
+# ---------------------------------------------------------------------------
+# The chat client already enforces a wall-clock timeout via
+# `AGENT_LLM_TIMEOUT_SECS` (default 300s), so a hung provider raises
+# TimeoutError cleanly. What was MISSING before: any try/except around
+# the streaming call, so a single timeout killed the turn (the audit
+# noted "provider hang raises uncaught → uvicorn 500"). This layer
+# catches transient errors and retries once before bubbling up.
+#
+# Retried (safe — same request, idempotent):
+#   - TimeoutError, ConnectionError
+#   - anthropic.APITimeoutError / APIConnectionError / RateLimitError
+#   - openai.{APITimeoutError,APIConnectionError,RateLimitError}
+#
+# NOT retried (would mask a bug):
+#   - 4xx / BadRequestError / Auth errors / OutputGuardException /
+#     ValueError — those will never succeed on retry.
+#
+# Per-tool failures (bash, git, web, etc.) are NOT retried here — the
+# tool surfaces its timeout as a structured error string to the LLM and
+# the LLM decides what to do. Auto-retrying a bash / write_file could
+# re-run a side-effecting command.
+#
+# File tools (read_file/write_file/edit_file/grep/glob) intentionally
+# have NO timeout and NO retry — a stuck NFS mount or 10 MB file on slow
+# disk can hang the worker, but the cost of a false-positive timeout
+# (cancelling a 20 s legitimate read) is worse than the rare hang.
+#
+# Env knobs:
+#   AGENT_LLM_RETRY_ATTEMPTS        total attempts incl. initial (default 2 = 1 retry)
+#   AGENT_LLM_RETRY_BACKOFF_S       seconds to sleep before the retry (default 2.0)
+#   AGENT_LLM_STREAM_IDLE_TIMEOUT_S raise TimeoutError if no chunk arrives within N
+#                                    seconds (default 90). Detects mid-stream socket
+#                                    pauses that the 300s httpx total timeout would
+#                                    otherwise wait N minutes to catch.
+def _get_retryable_exceptions() -> tuple:
+    """Lazy-load transient-error classes from installed provider SDKs.
+    A provider that isn't installed is silently skipped (its classes
+    won't appear in the retry tuple)."""
+    classes: list = [TimeoutError, ConnectionError]
+    try:
+        from anthropic import (
+            APITimeoutError as _Ato,
+            APIConnectionError as _Acn,
+            RateLimitError as _Arl,
+        )
+        classes += [_Ato, _Acn, _Arl]
+    except ImportError:
+        pass
+    try:
+        from openai import (
+            APITimeoutError as _Oto,
+            APIConnectionError as _Ocn,
+            RateLimitError as _Orl,
+        )
+        classes += [_Oto, _Ocn, _Orl]
+    except ImportError:
+        pass
+    return tuple(classes)
+
+
+def _stream_with_idle_timeout(stream_iter, idle_timeout_s: float):
+    """Wrap a sync stream iterator with an idle-timeout watchdog.
+
+    Sync streams can't be timed out cleanly with `asyncio.wait_for` (the
+    iterator isn't a coroutine) and `signal.alarm` doesn't interrupt
+    blocking network IO across threads. So we run the iterator in a
+    daemon worker thread that pushes chunks onto a `queue.Queue`; the
+    main thread pulls with `queue.get(timeout=idle_timeout_s)` and
+    raises `TimeoutError` if no chunk arrives within the window.
+
+    The watchdog catches ALL three hang shapes that the bare httpx
+    `Timeout(total=...)` misses:
+      1. Socket silently stops sending chunks mid-stream (TCP window
+         exhaustion, server-side stall, dropped connection that hasn't
+         yet surfaced as an exception).
+      2. Provider keeps the HTTP connection open but stops emitting
+         tokens (model deadlocked server-side, queue backed up).
+      3. LangChain internal generator wedged before reaching the SDK.
+
+    Note on the orphan worker: we can't actually cancel the underlying
+    httpx request from the consumer side. When the consumer raises
+    TimeoutError, the worker keeps pulling until the socket dies
+    naturally (the 300s httpx total timeout will eventually fire). The
+    worker is a daemon, so it dies with the agent loop process.
+    """
+    import queue as _queue
+    import threading as _threading
+
+    q: "_queue.Queue[tuple]" = _queue.Queue(maxsize=1024)
+
+    def _producer() -> None:
+        try:
+            for chunk in stream_iter:
+                q.put(("chunk", chunk))
+        except BaseException as e:  # noqa: BLE001 — any exception type surfaces to consumer
+            q.put(("error", e))
+        finally:
+            q.put(("done", None))
+
+    t = _threading.Thread(target=_producer, daemon=True, name="ojas-llm-stream")
+    t.start()
+
+    while True:
+        try:
+            kind, payload = q.get(timeout=idle_timeout_s)
+        except _queue.Empty:
+            raise TimeoutError(
+                f"LLM stream idle for {idle_timeout_s}s — no chunk received"
+            )
+
+        if kind == "done":
+            return
+        if kind == "error":
+            # Re-raise the producer's exception verbatim — it'll flow
+            # through the retry layer's `except retryable as e:` arm
+            # if it matches; otherwise it bubbles uncaught.
+            raise payload
+
+        yield payload
+
+
+def _stream_with_retry(
+    llm_with_tools,
+    messages: list,
+    reporter,
+    *,
+    max_attempts: int,
+    backoff_s: float,
+    idle_timeout_s: float,
+    retryable: tuple,
+):
+    """Stream the LLM response, retrying on transient errors.
+
+    Each attempt gets a fresh `aggregate`, `announced` set, and
+    `splitter` so a failed attempt's partial state doesn't bleed into
+    the next attempt. On retryable failure, surfaces a one-line notice
+    to the UI via `reporter.assistant_text`, sleeps `backoff_s`, then
+    re-streams from scratch.
+
+    The idle-timeout watchdog (`_stream_with_idle_timeout`) sits inside
+    the retry loop so a mid-stream socket pause triggers `TimeoutError`
+    on the same attempt — the retry layer catches it identically to a
+    total-timeout from httpx. Without the watchdog, a stream that
+    stops emitting at second 5 wouldn't surface until the 300s httpx
+    total budget expired.
+
+    Returns `(aggregate, splitter)` on success.
+    Raises `RuntimeError` (wrapping the last provider exception) when
+    all attempts fail.
+    """
+    last_err: Exception | None = None
+
+    for attempt in range(max_attempts):
+        # Per-attempt state. Critical to reset these so a retry doesn't
+        # concatenate partial output from a failed attempt with chunks
+        # from the next attempt.
+        aggregate = None
+        announced: set[str] = set()
+        splitter = _ThinkingTagSplitter()
+
+        def _emit_text(t: str) -> None:
+            if not t:
+                return
+            for channel, piece in splitter.feed(t):
+                if channel == "thinking":
+                    reporter.thinking_text(piece, done=False)
+                else:
+                    reporter.assistant_text(piece, done=False)
+
+        try:
+            # Idle-timeout watchdog sits INSIDE the retry loop so a
+            # mid-stream socket pause raises TimeoutError on the current
+            # attempt — caught by the same `except retryable as e` arm
+            # below, retried once, then bubbles.
+            stream_iter = _stream_with_idle_timeout(
+                llm_with_tools.stream(messages), idle_timeout_s,
+            )
+            for chunk in stream_iter:
+                aggregate = chunk if aggregate is None else aggregate + chunk
+
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    _emit_text(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "text":
+                            t = block.get("text", "")
+                            if t:
+                                _emit_text(t)
+                        elif btype == "thinking":
+                            t = block.get("thinking") or block.get("text") or ""
+                            if t:
+                                reporter.thinking_text(t, done=False)
+
+                for tc in getattr(aggregate, "tool_calls", None) or []:
+                    tcid = tc.get("id") or tc.get("name", "")
+                    if tc.get("name") and tcid not in announced:
+                        announced.add(tcid)
+                        args = tc.get("args", {}) or {}
+                        target = (
+                            args.get("path") or args.get("command")
+                            or args.get("query") or args.get("pattern")
+                            or args.get("url") or args.get("action") or ""
+                        )
+                        reporter.tool_start(tc["name"], str(target)[:70])
+
+            return aggregate, splitter  # success — exit retry loop
+
+        except retryable as e:
+            last_err = e
+            if attempt + 1 >= max_attempts:
+                # Out of retries — re-raise as a more informative error.
+                # The wrapping makes the failure mode obvious in the
+                # agent trace (was a hidden provider exception before).
+                raise RuntimeError(
+                    f"LLM call failed after {max_attempts} attempt(s): "
+                    f"{type(e).__name__}: {e}"
+                ) from e
+            # Notify UI before backing off. Best-effort — never let the
+            # notification itself fail the retry.
+            try:
+                reporter.assistant_text(
+                    f"\n\n[LLM {type(e).__name__} — retrying in {backoff_s:.1f}s]\n\n",
+                    done=False,
+                )
+            except Exception:
+                pass
+            time.sleep(backoff_s)
+
+    # Defensive — the for-loop above always either returns or raises.
+    raise RuntimeError(f"LLM call failed: {last_err}")
+
+
 def _stream_model_call(llm_with_tools, messages: list[BaseMessage], session_id: str = "") -> AIMessage:
     """Stream one model call: forward text chunks + tool announcements
     through the reporter, return the aggregated assistant message. Also
@@ -643,58 +881,29 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage], session_id: 
     global _t_call_start
     _t_call_start = time.monotonic()
 
-    aggregate: AIMessageChunk | None = None
-    announced: set[str] = set()
-    splitter = _ThinkingTagSplitter()
+    # Retry config. `AGENT_LLM_RETRY_ATTEMPTS` defaults to 2 = 1 retry,
+    # matching the user-facing knob ("retries to 1"). Backoff is fixed
+    # at `AGENT_LLM_RETRY_BACKOFF_S` seconds (default 2s) — the failed
+    # attempt is reported inline to the UI before the sleep so the
+    # user sees something is happening.
+    max_attempts = max(1, int(os.getenv("AGENT_LLM_RETRY_ATTEMPTS", "2")))
+    backoff_s = max(0.0, float(os.getenv("AGENT_LLM_RETRY_BACKOFF_S", "2.0")))
+    # Idle-timeout watchdog (default 90s). Catches mid-stream socket
+    # pauses that the 300s httpx total timeout would otherwise wait
+    # minutes to surface. Set to a very large value to effectively
+    # disable (e.g. 86400 for a 24h ceiling).
+    idle_timeout_s = max(1.0, float(os.getenv("AGENT_LLM_STREAM_IDLE_TIMEOUT_S", "90")))
+    retryable = _get_retryable_exceptions()
 
-    def _emit_text(t: str) -> None:
-        if not t:
-            return
-        for channel, piece in splitter.feed(t):
-            if channel == "thinking":
-                reporter.thinking_text(piece, done=False)
-            else:
-                reporter.assistant_text(piece, done=False)
-
-    for chunk in llm_with_tools.stream(messages):
-        aggregate = chunk if aggregate is None else aggregate + chunk
-
-        # Stream text chunks to the UI via reporter. Two content shapes:
-        #   - str  : OpenAI-compatible providers (incl. MiniMax) — routed
-        #            through the <think> splitter so reasoning stays separate.
-        #   - list : Anthropic block format — already typed; map type=text
-        #            into assistant_text and type=thinking into thinking_text.
-        content = chunk.content
-        if isinstance(content, str) and content:
-            _emit_text(content)
-        elif isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type")
-                if btype == "text":
-                    t = block.get("text", "")
-                    if t:
-                        # Even Anthropic occasionally returns raw <think> tags
-                        # if a sub-tool prompted the model that way — keep the
-                        # splitter on for safety.
-                        _emit_text(t)
-                elif btype == "thinking":
-                    t = block.get("thinking") or block.get("text") or ""
-                    if t:
-                        reporter.thinking_text(t, done=False)
-
-        # announce tool calls as soon as they have a name (dedupe by id)
-        for tc in getattr(aggregate, "tool_calls", None) or []:
-            tcid = tc.get("id") or tc.get("name", "")
-            if tc.get("name") and tcid not in announced:
-                announced.add(tcid)
-                args = tc.get("args", {}) or {}
-                target = (
-                    args.get("path") or args.get("command") or args.get("query")
-                    or args.get("pattern") or args.get("url") or args.get("action") or ""
-                )
-                reporter.tool_start(tc["name"], str(target)[:70])
+    aggregate, splitter = _stream_with_retry(
+        llm_with_tools,
+        messages,
+        reporter,
+        max_attempts=max_attempts,
+        backoff_s=backoff_s,
+        idle_timeout_s=idle_timeout_s,
+        retryable=retryable,
+    )
 
     # Drain anything still in the splitter buffer (e.g. trailing text with
     # no closing tag) so we don't silently swallow the tail of a response.
