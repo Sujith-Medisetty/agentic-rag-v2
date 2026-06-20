@@ -1361,94 +1361,6 @@ def _capture_todos_from_tool_results(state: RunnerState, tool_messages: list) ->
     return list(state.get("last_todos") or [])
 
 
-# Tools that change workspace state. Read-only tools (read_file,
-# WebFetch, WebSearch, Agent, AgentStatus, TodoWrite itself,
-# AskUserQuestion, SendUserMessage, ToolSearch, plan-mode) are
-# exempt because they don't affect task state.
-_WRITE_TOOLS = {"write_file", "edit_file", "bash"}
-# Multi-action tools: only certain sub-actions change state; we
-# inspect the `action` arg at runtime.
-_GIT_WRITE_ACTIONS = {"commit", "push"}
-_GITHUB_WRITE_ACTIONS = {"create_pr"}
-
-
-def enforce_todo_pairing(state: RunnerState) -> dict | None:
-    """Pre-flight TodoWrite pairing gate.
-
-    Runs once per assistant batch (before ToolNode.invoke). If any
-    write/exec tool is in the batch but no TodoWrite is bundled AND
-    no task is currently in_progress in `state.last_todos`, the write
-    tools are blocked and synthetic error ToolMessages are returned
-    so the LLM self-corrects on the next turn.
-
-    Makes the master-key rule B in the system prompt truthful — the
-    prompt claims the backend enforces pairing, and now it actually
-    does. The LLM is told "the backend enforces this"; this function
-    is that backend.
-
-    Returns None to let the batch proceed, or a dict like
-    {"messages": [ToolMessage, ...]} when tools were intercepted.
-    """
-    messages = state.get("messages", [])
-    if not messages:
-        return None
-
-    last_ai = None
-    for m in reversed(messages):
-        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
-            last_ai = m
-            break
-    if last_ai is None:
-        return None
-
-    tool_calls = list(last_ai.tool_calls or [])
-    if not tool_calls:
-        return None
-
-    blocked: list[dict] = []
-    has_todowrite = False
-    for tc in tool_calls:
-        name = tc.get("name", "")
-        args = tc.get("args", {}) or {}
-        if name == "TodoWrite":
-            has_todowrite = True
-            continue
-        if name in _WRITE_TOOLS:
-            blocked.append(tc)
-            continue
-        if name == "git" and args.get("action") in _GIT_WRITE_ACTIONS:
-            blocked.append(tc)
-            continue
-        if name == "github" and args.get("action") in _GITHUB_WRITE_ACTIONS:
-            blocked.append(tc)
-            continue
-
-    if not blocked:
-        return None
-
-    last_todos = state.get("last_todos") or []
-    has_in_progress = any(t.get("status") == "in_progress" for t in last_todos)
-
-    if has_todowrite or has_in_progress:
-        return None
-
-    synthetic = []
-    for tc in blocked:
-        synthetic.append(
-            ToolMessage(
-                content=(
-                    "BLOCKED by TodoWrite pairing gate. This is a write/exec "
-                    "tool call but no TodoWrite is in this batch and no task "
-                    "is currently in_progress. Bundle a TodoWrite call in the "
-                    "SAME batch (flip the relevant task to in_progress) and retry."
-                ),
-                tool_call_id=tc["id"],
-                name=tc.get("name", ""),
-            )
-        )
-    return {"messages": synthetic}
-
-
 def node_force_todo_sync(state: RunnerState) -> dict:
     """Final-turn sync nudge.
 
@@ -1549,25 +1461,6 @@ def node_tools(state: RunnerState) -> dict:
     tool wrapper) and append the results."""
     from agents.reporter import get_reporter
     reporter = get_reporter()
-
-    # TodoWrite pairing gate: block write/exec tools when no TodoWrite
-    # is paired and no task is currently in_progress. Synthetic
-    # ToolMessages flow back to the LLM as a self-correction signal so
-    # it retries with the right pairing on its next turn. Skipped when
-    # the batch already includes TodoWrite or a task is already in
-    # progress — those are the cases the LLM got right.
-    intercepted = enforce_todo_pairing(state)
-    if intercepted is not None:
-        new_tool_messages = list(intercepted["messages"])
-        existing = list(state.get("live_messages") or state.get("messages", []))
-        for msg in new_tool_messages:
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            reporter.tool_done(getattr(msg, "name", "gate"), content or "(no output)", error=True)
-        return {
-            **intercepted,
-            "live_messages": existing + new_tool_messages,
-            "last_todos": state.get("last_todos", []),
-        }
 
     result = ToolNode(get_all_tools() + _mcp_tools).invoke(state)
 
