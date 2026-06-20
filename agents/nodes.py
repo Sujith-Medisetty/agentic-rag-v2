@@ -1501,8 +1501,19 @@ def node_agent(state: RunnerState) -> dict:
     history = _prepare_history(state, session_id)
     messages = _assemble_messages(static_base, dynamic_suffix, history)
 
-    llm = _get_llm().bind_tools(get_all_tools() + _mcp_tools)
-    ai = _stream_model_call(llm, messages, session_id=session_id)
+    llm = _get_llm()
+    # For OpenAI-compatible providers (openai / openai-compatible / minimax),
+    # explicitly request parallel tool calls. `parallel_tool_calls=True` is
+    # the Chat Completions API default, but custom OpenAI-compatible
+    # endpoints sometimes default to `false` or strip the flag entirely —
+    # passing it explicitly makes the intent unambiguous in the wire request.
+    # Anthropic supports parallel tool_use blocks natively and doesn't take
+    # this flag, so we skip it for that provider.
+    bind_kwargs: dict = {}
+    if _provider != "anthropic":
+        bind_kwargs["parallel_tool_calls"] = True
+    llm_with_tools = llm.bind_tools(get_all_tools() + _mcp_tools, **bind_kwargs)
+    ai = _stream_model_call(llm_with_tools, messages, session_id=session_id)
     _run_budget.record(ai)
 
     _publish_context_usage(ai, session_id)
