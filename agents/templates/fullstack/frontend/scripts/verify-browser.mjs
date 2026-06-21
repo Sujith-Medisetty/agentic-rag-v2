@@ -11,6 +11,9 @@
  *   - Forms that submit but never update the UI
  *   - Backends that return empty arrays (no seed data)
  *   - Console errors / unhandled promise rejections
+ *   - Routes that load on first nav but break on F5
+ *   - React key warnings, validateDOMNesting, memory leaks
+ *   - Dynamic routes the UI doesn't expose as anchors
  *
  * This guard boots the built app (fullstack: backend + vite
  * preview; static: vite preview only), opens it in headless
@@ -34,12 +37,29 @@
  *     password field combo and filled with TEST_CREDS generated
  *     once per run. The same creds are reused across the whole
  *     run, so signup → login exercises the SAME account.
+ *   7. Refresh survival — after the click+form pass on each
+ *     route, page.reload() re-checks blank-screen and API
+ *     visibility against the reloaded DOM.
+ *   8. Console warnings — captured in addition to errors; five
+ *     specific React / DOM patterns promote to failures
+ *     (missing keys, validateDOMNesting, setState during render,
+ *      memory leaks, act() wrapper).
+ *   9. Dynamic routes discovered from /openapi.json — patterns
+ *     like /api/{name}/{idParam} are walked, the corresponding
+ *     list endpoint is queried, the first 3 IDs are visited via
+ *     Playwright (so the UI rendering is exercised, not just the
+ *     API).
+ *  10. CRUD button classification — buttons matching add/create/
+ *     save/update/edit/delete are tagged; list-count snapshots
+ *     before vs after the click+form pass are reported as
+ *     evidence (informational, not pass/fail).
  *
  * Exits 0 if every route loads cleanly, every interactive
  * element responds without error, no network request 4xxs, every
- * route renders actual content, and any non-empty /api/*
- * response has its data visible in the rendered DOM. Exits 1
- * with a structured failure report otherwise.
+ * route renders actual content, every route survives refresh,
+ * any non-empty /api/* response has its data visible in the
+ * rendered DOM, and every dynamic detail route loads cleanly.
+ * Exits 1 with a structured failure report otherwise.
  *
  * Pre-requisites the caller (npm run verify:browser) handles:
  *   - Playwright + chromium browser installed
@@ -51,57 +71,35 @@
  *   node scripts/verify-browser.mjs
  *   # or auto-wired via `npm run verify:browser` / `npm run verify`
  */
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 
-const __filename = fileURLToPath(import.meta.url);
-const projectRoot = resolve(dirname(__filename), "..");
-const repoRoot = resolve(projectRoot, "..");
-
-const FRONTEND_PORT = Number(process.env.OJAS_VERIFY_FRONTEND_PORT ?? 4173);
-const BACKEND_PORT = Number(process.env.OJAS_VERIFY_BACKEND_PORT ?? 8765);
-const PYTHON_BIN = process.env.OJAS_VERIFY_PYTHON ?? "python3";
-const FRONTEND_URL = `http://127.0.0.1:${FRONTEND_PORT}`;
-const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`;
-
-// Console + pageerror messages we tolerate. These are noise, not
-// bugs: devtools probes, favicon 404s when there's no favicon,
-// service-worker complaints on the dev-tools preview port, etc.
-const IGNORED_CONSOLE_PATTERNS = [
-  /Download the React DevTools/i,
-  /favicon\.ico/i,
-  /sw\.js/i,
-];
-
-const MAX_ROUTES = 50;
-const NAV_TIMEOUT_MS = 15_000;
-
-// One set of test credentials per run. Stable across the whole
-// run so a signup submit followed by a login submit uses the
-// SAME email + password — the runner actually creates the
-// account on the first submit and reuses it on the second.
-// Clearly test data (verify-*@example.com, "Verify Browser",
-// password prefixed VerifyBrowser!) so a backend that
-// accidentally accepts these can't confuse them with real users.
-const TEST_CREDS = (() => {
-  const suffix = Math.random().toString(36).slice(2, 10);
-  return {
-    email: `verify-${Date.now()}-${suffix}@example.com`,
-    password: `VerifyBrowser!${Math.random().toString(36).slice(2, 14)}`,
-    username: `verify_${suffix}`,
-    name: "Verify Browser",
-  };
-})();
+import {
+  projectRoot,
+  repoRoot,
+  FRONTEND_URL,
+  BACKEND_URL,
+  IGNORED_CONSOLE_PATTERNS,
+  MAX_ROUTES,
+  NAV_TIMEOUT_MS,
+  TEST_CREDS,
+  bootFullstack,
+  bootStatic,
+  withCleanup,
+} from "./verify-helpers.mjs";
 
 const failures = [];
 const consoleErrors = [];
+const consoleWarnings = [];
 const networkFailures = [];
 const apiEmptyResponses = [];
 const apiVisibilityFailures = [];
 const blankScreenFailures = [];
+const refreshFailures = [];
+const crudEvidence = [];
+const dynamicRouteErrors = [];
+const dynamicRoutesVisited = new Set();
 // /api/* responses captured on the CURRENT route, BEFORE the
 // destructive walker runs. Both arrays reset before each
 // navigation so the "data visible" + "data not empty" checks
@@ -115,221 +113,19 @@ let currentRouteApiEmpty = [];
 let visibilityCheckedForRoute = false;
 const visitedRoutes = new Set();
 
-// ---------------------------------------------------------------------------
-// Server lifecycle
-// ---------------------------------------------------------------------------
-async function waitForUrl(url, { timeoutMs = 30_000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  let lastErr;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(url, { method: "GET" });
-      if (res.status < 500) return true;
-    } catch (e) {
-      lastErr = e;
-    }
-    await wait(500);
-  }
-  throw new Error(
-    `Timed out waiting for ${url} (${timeoutMs}ms)${
-      lastErr ? `: ${lastErr.message}` : ""
-    }`,
-  );
-}
-
-function spawnLogged(cmd, args, opts = {}) {
-  const child = spawn(cmd, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    ...opts,
-  });
-  child.stdout.on("data", (b) => process.stdout.write(`[${cmd}] ${b}`));
-  child.stderr.on("data", (b) => process.stderr.write(`[${cmd}] ${b}`));
-  return child;
-}
-
-async function withCleanup(procs, fn) {
-  try {
-    return await fn();
-  } finally {
-    for (const p of procs) {
-      if (p && !p.killed) {
-        try {
-          p.kill("SIGTERM");
-        } catch {}
-      }
-    }
-    await wait(500);
-    for (const p of procs) {
-      if (p && !p.killed) {
-        try {
-          p.kill("SIGKILL");
-        } catch {}
-      }
-    }
-  }
-}
-
-async function bootFullstack() {
-  const procs = [];
-
-  // Backend: uvicorn on the local port, with a transient DB so we
-  // don't touch anything on disk the user cares about.
-  const dbPath = join(projectRoot, "node_modules", ".ojas-verify", "verify.db");
-  const backendEnv = {
-    ...process.env,
-    DATABASE_URL: `sqlite:///${dbPath}`,
-    PORT: String(BACKEND_PORT),
-    OJAS_VERIFY_MODE: "1",
-  };
-  const backendCwd = join(repoRoot, "backend");
-  const uvicorn = spawnLogged(
-    PYTHON_BIN,
-    ["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", String(BACKEND_PORT)],
-    { cwd: backendCwd, env: backendEnv },
-  );
-  procs.push(uvicorn);
-
-  // Frontend: tiny static+proxy server. We don't use
-  // `vite preview` because (a) the Ojas template's vite.config.ts
-  // has no proxy entry, so API calls would hit vite's SPA
-  // fallback (returning HTML instead of JSON) — that's the exact
-  // "deployed but UI broken" bug we're trying to catch, and
-  // shipping a false-negative here defeats the gate. (b)
-  // vite preview defaults to localhost which on macOS resolves
-  // to [::1] (IPv6) and Node's fetch sometimes lands on the
-  // wrong stack. The proxy here binds to 127.0.0.1 explicitly.
-  const proxyServer = await startProxyServer();
-  procs.push(proxyServer);
-
-  await Promise.all([
-    // /health may not exist; fall back to root. The frontend will
-    // surface real backend errors when its first fetch fires.
-    waitForUrl(`${BACKEND_URL}/health`).catch(() => waitForUrl(BACKEND_URL)),
-    waitForUrl(FRONTEND_URL),
-  ]);
-
-  return procs;
-}
-
-async function bootStatic() {
-  // No backend; serve dist/ + SPA fallback over the proxy.
-  const proxyServer = await startProxyServer();
-  await waitForUrl(FRONTEND_URL);
-  return [proxyServer];
-}
-
-// Tiny HTTP server: serves the built dist/ statically + proxies
-// /api/* to the backend (fullstack) or returns 404 (static). The
-// SPA fallback returns index.html for any non-asset GET so deep
-// links work. Kept in-process (no extra dep) — `http` is built
-// into Node.
-const STATIC_MIME = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".mjs": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  ".ico": "image/x-icon",
-  ".woff": "font/woff",
-  ".woff2": "font/woff2",
-  ".txt": "text/plain; charset=utf-8",
-  ".webmanifest": "application/manifest+json",
-};
-
-async function startProxyServer() {
-  const { createServer } = await import("node:http");
-  const { readFile, stat } = await import("node:fs/promises");
-  const { extname, join, normalize, resolve } = await import("node:path");
-
-  const distDir = resolve(projectRoot, "dist");
-  const backendOrigin = BACKEND_URL;
-  const hasBackend = existsSync(join(repoRoot, "backend", "main.py"));
-
-  const server = createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url || "/", FRONTEND_URL);
-
-      // Proxy /api/* to backend (fullstack only).
-      if (hasBackend && url.pathname.startsWith("/api/")) {
-        const target = `${backendOrigin}${url.pathname}${url.search}`;
-        const upstream = await fetch(target, {
-          method: req.method,
-          headers: req.headers,
-          // fetch() requires ReadableStream; for simple bodies
-          // we let it use GET/HEAD default. Other methods with
-          // bodies would need explicit buffering — none of the
-          // Ojas verify suite uses them.
-        });
-        res.statusCode = upstream.status;
-        upstream.headers.forEach((v, k) => {
-          // Skip hop-by-hop headers; everything else passes through.
-          if (["connection", "transfer-encoding"].includes(k.toLowerCase())) return;
-          res.setHeader(k, v);
-        });
-        const buf = Buffer.from(await upstream.arrayBuffer());
-        res.end(buf);
-        return;
-      }
-
-      // Static file or SPA fallback. Resolve safely under dist/.
-      let filePath = join(distDir, normalize(decodeURIComponent(url.pathname)));
-      if (!filePath.startsWith(distDir)) {
-        res.statusCode = 403;
-        res.end("Forbidden");
-        return;
-      }
-      let fileStat;
-      try {
-        fileStat = await stat(filePath);
-      } catch {
-        fileStat = null;
-      }
-      // SPA fallback for non-asset GETs that don't exist on disk.
-      if (
-        (!fileStat || !fileStat.isFile()) &&
-        req.method === "GET" &&
-        !/\.[a-z0-9]+$/i.test(url.pathname)
-      ) {
-        filePath = join(distDir, "index.html");
-        fileStat = await stat(filePath);
-      }
-      if (!fileStat || !fileStat.isFile()) {
-        res.statusCode = 404;
-        res.end("Not found");
-        return;
-      }
-      const content = await readFile(filePath);
-      res.setHeader(
-        "content-type",
-        STATIC_MIME[extname(filePath).toLowerCase()] ||
-          "application/octet-stream",
-      );
-      res.end(content);
-    } catch (e) {
-      res.statusCode = 500;
-      res.end(`Proxy error: ${e instanceof Error ? e.message : e}`);
-    }
-  });
-
-  await new Promise((resolveReady, rejectReady) => {
-    server.once("error", rejectReady);
-    server.listen(FRONTEND_PORT, "127.0.0.1", () => resolveReady(undefined));
-  });
-
-  // Wrap so withCleanup's `p.kill()` works — the proxy is a
-  // server object, not a child process. Provide no-op kill that
-  // actually closes the server.
-  return {
-    kill(sig) {
-      server.close();
-    },
-  };
-}
+// Console WARNING patterns that promote to FAILURES. These are
+// not transient devtools noise — each one indicates a real
+// React/DOM bug the agent should fix in the app, not silence in
+// the test. The promote happens before the IGNORED_CONSOLE_PATTERNS
+// filter is consulted, so even "favicon"-shaped noise can't
+// swallow a missing-key warning.
+const PROMOTED_WARNING_PATTERNS = [
+  { re: /each child in a list should have a unique "key" prop/i, tag: "react-missing-key" },
+  { re: /validateDOMNesting|validate dom nesting/i, tag: "validate-dom-nesting" },
+  { re: /cannot update a component while rendering a different component/i, tag: "setstate-during-render" },
+  { re: /memory leak|can't perform a react state update on an unmounted component/i, tag: "react-memory-leak" },
+  { re: /not wrapped in act\(/i, tag: "react-act-wrapper" },
+];
 
 // ---------------------------------------------------------------------------
 // Recording helpers
@@ -341,6 +137,21 @@ function shouldIgnoreConsole(text) {
 function recordConsole(page, text) {
   if (shouldIgnoreConsole(text)) return;
   consoleErrors.push({ route: page.url(), text });
+}
+
+function recordConsoleWarning(page, text) {
+  if (shouldIgnoreConsole(text)) return;
+  // Promote specific React/DOM warning patterns to errors.
+  for (const { re, tag } of PROMOTED_WARNING_PATTERNS) {
+    if (re.test(text)) {
+      consoleErrors.push({
+        route: page.url(),
+        text: `[${tag}] ${text}`,
+      });
+      return;
+    }
+  }
+  consoleWarnings.push({ route: page.url(), text });
 }
 
 function recordNetwork(resp) {
@@ -406,6 +217,14 @@ function isInternalHref(href) {
   return href.startsWith("/");
 }
 
+// Aria-aware CRUD button classification. `positive` matches any
+// button that looks like it mutates data; `destructive` is a
+// subset that fires without confirmation (delete/remove/etc.).
+// The list-count snapshot in `walkPage` uses these to attribute
+// before/after deltas to CRUD intent.
+const CRUD_KEYWORDS = /\b(add|create|new|save|update|edit|delete|remove|submit)\b/i;
+const DESTRUCTIVE_KEYWORDS = /\b(delete|remove|destroy|purge|wipe|drop|kill|clear|reset)\b/i;
+
 // ---------------------------------------------------------------------------
 // Page walker
 // ---------------------------------------------------------------------------
@@ -441,25 +260,33 @@ async function enumerateElements(page) {
   });
 }
 
-async function clickButtons(page, buttons) {
-  for (const btn of buttons) {
-    if (!btn.text) continue;
-    // Use page.getByRole to tolerate re-rendered lists — text
-    // selectors that include arbitrary quotes/escapes are
-    // brittle. getByRole('button', { name }) does the right thing.
-    const handle = page.getByRole("button", { name: btn.text, exact: false }).first();
-    try {
-      await handle.click({ timeout: 2_000 });
-      await wait(300);
-      // Close any modal/sheet that opened so the next button click
-      // hits the page underneath.
-      await page.keyboard.press("Escape").catch(() => {});
-      await wait(200);
-    } catch {
-      // Click intercepted, element detached, modal blocking — not
-      // necessarily a bug. Real failures surface as console errors.
-    }
-  }
+// Best-effort count of list rows currently rendered. Heuristic:
+// count repeated structural patterns that look like a list —
+// <li> inside <ul>/<ol>, <tr> inside <tbody>, articles under
+// <main>. The intent is "did the row count change after clicks",
+// not "did we find every possible list component". Returns -1
+// when no list-like container is found so the caller can skip
+// the snapshot rather than reporting 0/0 as "no CRUD fired".
+async function countListItems(page) {
+  return page.evaluate(() => {
+    const main = document.querySelector("main") || document.body;
+    if (!main) return -1;
+    const counts = [];
+    const ul = main.querySelectorAll("ul > li").length;
+    const ol = main.querySelectorAll("ol > li").length;
+    const tr = main.querySelectorAll("tbody > tr").length;
+    const art = main.querySelectorAll("article").length;
+    const cards = main.querySelectorAll(
+      '[data-testid*="item"], [data-testid*="row"], [class*="Card"]',
+    ).length;
+    for (const c of [ul, ol, tr, art, cards]) if (c > 0) counts.push(c);
+    if (counts.length === 0) return -1;
+    // Use the maximum count — list components usually render ONE
+    // of these patterns. Reporting the max avoids 0/0 false
+    // negatives when an app uses <li> for nav and <Card> for
+    // items.
+    return Math.max(...counts);
+  });
 }
 
 // Auth-form detection. Two signals: (1) the form's action/name
@@ -634,6 +461,63 @@ async function checkBlankScreen(page) {
   return { blank: false };
 }
 
+// Returns the URL paths of dynamic detail endpoints in the spec,
+// e.g. [{ name: "items", detailPath: "/api/items/{item_id}" }].
+// A path is "detail-like" if (a) it starts with /api/, (b) it
+// has exactly one path parameter, and (c) the corresponding
+// list endpoint (/api/{name}) is also documented. The single-id
+// requirement excludes bulk routes like /api/items/bulk-delete
+// that take an `op` parameter, not an entity id.
+async function collectDetailPaths(spec) {
+  if (!spec?.paths) return [];
+  const out = [];
+  for (const [path, methods] of Object.entries(spec.paths)) {
+    if (!path.startsWith("/api/")) continue;
+    const params = [...path.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
+    if (params.length !== 1) continue;
+    // Skip paths where the param is a non-id (filter / op / type).
+    if (!/id$/i.test(params[0])) continue;
+    // Derive list endpoint: strip the last segment.
+    const listPath = path.replace(/\/\{[^}]+\}$/, "");
+    if (!spec.paths[listPath]) continue;
+    // The list endpoint should support GET.
+    const listMethods = spec.paths[listPath] || {};
+    if (!listMethods.get) continue;
+    out.push({ name: listPath.replace(/^\/api\//, ""), detailPath: path, idParam: params[0] });
+  }
+  return out;
+}
+
+// Fetch a list endpoint and return up to `n` ids. Walks the
+// response for `id`, `Id`, `_id`, `uuid`, or any `*_id`-suffixed
+// field. Empty / non-JSON responses return [].
+async function fetchIdsFromList(url, n) {
+  try {
+    const res = await fetch(url, { headers: { accept: "application/json" } });
+    if (res.status >= 400) return [];
+    const ct = res.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) return [];
+    const body = await res.json();
+    const arr = Array.isArray(body)
+      ? body
+      : Array.isArray(body?.items)
+        ? body.items
+        : Array.isArray(body?.results)
+          ? body.results
+          : [];
+    const ids = [];
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const idField = Object.keys(item).find((k) => /(^|_)(id|uuid)$/i.test(k));
+      if (idField) ids.push(item[idField]);
+      if (ids.length >= n) break;
+    }
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
 async function walkPage(page) {
   const url = new URL(page.url());
   const route = url.pathname + url.search;
@@ -717,14 +601,22 @@ async function walkPage(page) {
   // empty-array warning.
   visibilityCheckedForRoute = true;
 
+  // Snapshot list-count BEFORE the click+form pass so we can
+  // attribute before/after deltas to CRUD intent. Skipped on
+  // detail pages (no list pattern visible).
+  const beforeCount = await countListItems(page);
+
   const elements = await enumerateElements(page);
   // After clicking a button, new forms may appear in the DOM
   // (e.g. a Dialog opens and its form mounts). Re-fill/submit
   // every visible form after each click so we exercise forms
   // that only exist after their trigger was clicked. Auth-aware
   // — see fillAndSubmitForms.
+  const crudButtonsFired = new Set();
   for (const btn of elements.buttons) {
     if (!btn.text) continue;
+    const isCrud = CRUD_KEYWORDS.test(btn.text);
+    const isDestructive = DESTRUCTIVE_KEYWORDS.test(btn.text);
     const handle = page.getByRole("button", { name: btn.text, exact: false }).first();
     try {
       await handle.click({ timeout: 2_000 });
@@ -738,9 +630,111 @@ async function walkPage(page) {
     // page underneath.
     await page.keyboard.press("Escape").catch(() => {});
     await wait(200);
+    if (isCrud && !isDestructive) crudButtonsFired.add(btn.text);
+  }
+
+  // Snapshot AFTER + report delta as evidence. We only emit
+  // evidence when (a) we fired at least one CRUD button AND
+  // (b) the count was observable on this route (≠ -1).
+  if (crudButtonsFired.size > 0) {
+    const afterCount = await countListItems(page);
+    if (beforeCount >= 0 && afterCount >= 0 && beforeCount !== afterCount) {
+      crudEvidence.push({
+        route,
+        buttons: [...crudButtonsFired],
+        beforeCount,
+        afterCount,
+      });
+    }
+  }
+
+  // B1: Refresh survival. After the destructive pass, reload
+  // and re-check blank-screen + API visibility. A page that
+  // worked once but breaks on F5 (state held in memory,
+  // missing hydration, etc.) is a real deployed-app failure
+  // mode. Try/catch so a hung reload doesn't fail the whole
+  // run — it gets recorded as a refreshFailure instead.
+  try {
+    await page.reload({ waitUntil: "networkidle", timeout: NAV_TIMEOUT_MS });
+  } catch (e) {
+    refreshFailures.push({ route, kind: "reload-timeout", message: e.message });
+    return collectInternalLinks(elements.links, FRONTEND_URL);
+  }
+  const blankAfter = await checkBlankScreen(page);
+  if (blankAfter.blank) {
+    refreshFailures.push({
+      route,
+      kind: "blank-after-reload",
+      reason: blankAfter.reason,
+    });
   }
 
   return collectInternalLinks(elements.links, FRONTEND_URL);
+}
+
+// B3: Dynamic route enumeration via OpenAPI. After BFS finishes,
+// walk spec.paths for /api/{name}/{idParam} patterns, fetch the
+// first 3 IDs from the corresponding list endpoint, and navigate
+// Playwright to each detail URL so the UI rendering is exercised.
+// Blank or errored detail pages feed into the existing failure
+// arrays.
+async function exerciseDynamicRoutes(page, isFullstack) {
+  if (!isFullstack) return;
+  let spec;
+  try {
+    const res = await fetch(`${BACKEND_URL}/openapi.json`);
+    if (!res.ok) return;
+    spec = await res.json();
+  } catch {
+    return;
+  }
+  const detailPaths = await collectDetailPaths(spec);
+  if (detailPaths.length === 0) return;
+
+  const DYNAMIC_ID_COUNT = 3;
+  for (const { name, detailPath, idParam } of detailPaths) {
+    const listUrl = `${BACKEND_URL}/api/${name}`;
+    const ids = await fetchIdsFromList(listUrl, DYNAMIC_ID_COUNT);
+    if (ids.length === 0) continue;
+    for (const id of ids) {
+      // Build the SPA URL: strip the /api prefix (the frontend
+      // typically mounts detail routes under /<name>/<id>).
+      const uiDetailPath = `/${name}/${encodeURIComponent(id)}`;
+      const route = uiDetailPath;
+      if (visitedRoutes.has(route)) {
+        dynamicRoutesVisited.add(route);
+        continue;
+      }
+      dynamicRoutesVisited.add(route);
+      visibilityCheckedForRoute = false;
+      currentRouteApiResponses = [];
+      currentRouteApiEmpty = [];
+      try {
+        await page.goto(route, {
+          waitUntil: "networkidle",
+          timeout: NAV_TIMEOUT_MS,
+        });
+      } catch (e) {
+        dynamicRouteErrors.push({
+          route,
+          kind: "navigation",
+          message: e.message,
+        });
+        continue;
+      }
+      const blank = await checkBlankScreen(page);
+      if (blank.blank) {
+        dynamicRouteErrors.push({
+          route,
+          kind: "blank",
+          reason: blank.reason,
+        });
+      }
+      // Cap dynamic-route visits at the same MAX_ROUTES limit
+      // to avoid runaway loops in degenerate specs.
+      if (dynamicRoutesVisited.size + visitedRoutes.size > MAX_ROUTES) return;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +769,9 @@ async function main() {
     const page = await context.newPage();
 
     page.on("console", (msg) => {
-      if (msg.type() === "error") recordConsole(page, msg.text());
+      const type = msg.type();
+      if (type === "error") recordConsole(page, msg.text());
+      else if (type === "warning") recordConsoleWarning(page, msg.text());
     });
     page.on("pageerror", (err) =>
       recordConsole(page, `pageerror: ${err.message}`),
@@ -803,6 +799,9 @@ async function main() {
       // apps. A normal app has <10 routes.
       if (visitedRoutes.size + queue.length > MAX_ROUTES) break;
     }
+
+    // B3: dynamic route enumeration via OpenAPI (fullstack only).
+    await exerciseDynamicRoutes(page, isFullstack);
 
     await browser.close();
   });
@@ -857,6 +856,32 @@ async function main() {
           .join("\n"),
     );
   }
+  if (refreshFailures.length) {
+    problems.push(
+      `Refresh failures — route loaded on first navigation but broke on F5 (${refreshFailures.length}):\n` +
+        refreshFailures
+          .map(
+            (r) =>
+              `  ${r.route}: [${r.kind}] ${r.message ?? r.reason}. ` +
+              `Likely state held in memory, missing hydration, or ` +
+              `an effect that doesn't re-run after mount.`,
+          )
+          .join("\n"),
+    );
+  }
+  if (dynamicRouteErrors.length) {
+    problems.push(
+      `Dynamic detail routes — first 3 IDs per /api/{name}/{id} pattern failed (${dynamicRouteErrors.length}):\n` +
+        dynamicRouteErrors
+          .map(
+            (d) =>
+              `  ${d.route}: [${d.kind}] ${d.message ?? d.reason}. ` +
+              `The route renders for some IDs but not others — ` +
+              `check for missing loaders or 404 fallbacks.`,
+          )
+          .join("\n"),
+    );
+  }
   if (problems.length) {
     console.error("verify-browser FAILED:");
     for (const p of problems) console.error("  - " + p);
@@ -867,7 +892,25 @@ async function main() {
       );
       for (const e of apiEmptyResponses) console.error("  - " + e.url);
     }
-    console.error(`\nVisited ${visitedRoutes.size} route(s).`);
+    if (consoleWarnings.length) {
+      console.error(
+        `\nNote: ${consoleWarnings.length} console warning(s) (informational):`,
+      );
+      for (const w of consoleWarnings) console.error(`  - ${w.route} :: ${w.text}`);
+    }
+    if (crudEvidence.length) {
+      console.error(
+        `\nNote: ${crudEvidence.length} CRUD snapshot(s) — UI clicks changed list counts:`,
+      );
+      for (const e of crudEvidence) {
+        console.error(
+          `  - ${e.route}: buttons=[${e.buttons.join(", ")}] count ${e.beforeCount} → ${e.afterCount}`,
+        );
+      }
+    }
+    console.error(
+      `\nVisited ${visitedRoutes.size} static route(s) + ${dynamicRoutesVisited.size} dynamic route(s).`,
+    );
     process.exit(1);
   }
 
@@ -881,6 +924,27 @@ async function main() {
     console.log(
       `verify-browser OK -- ${visitedRoutes.size} route(s) exercised cleanly.`,
     );
+  }
+  if (dynamicRoutesVisited.size > 0) {
+    console.log(
+      `verify-browser dynamic detail routes: ${dynamicRoutesVisited.size} (first 3 IDs per /api/{name}/{id} pattern).`,
+    );
+  }
+  if (consoleWarnings.length) {
+    console.log(
+      `\nConsole warnings (${consoleWarnings.length}, informational):`,
+    );
+    for (const w of consoleWarnings) console.log(`  - ${w.route} :: ${w.text}`);
+  }
+  if (crudEvidence.length) {
+    console.log(
+      `\nCRUD evidence — UI clicks that changed list counts (${crudEvidence.length}):`,
+    );
+    for (const e of crudEvidence) {
+      console.log(
+        `  - ${e.route}: buttons=[${e.buttons.join(", ")}] count ${e.beforeCount} → ${e.afterCount}`,
+      );
+    }
   }
   console.log(
     `verify-browser test creds (used for any auth forms encountered): ` +
