@@ -22,6 +22,11 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
+from agents._timeouts import (
+    _call_with_wall_clock_guard,
+    DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S,
+    CHECKPOINT_WRITE_TIMEOUT_ENV,
+)
 
 # LLM-reported input_tokens from the most recent call (per-context).
 # The local `len//4` estimator underestimates by 5-6× (no system prompt,
@@ -814,26 +819,63 @@ class CompactingCheckpointer(SqliteSaver):
 
         Safety net only — the primary compaction now happens in
         `maybe_compact()` called from the agent loop before each LLM call.
+
+        Wall-clock guarded: the body runs inside _call_with_wall_clock_guard
+        with a budget of OJAS_CHECKPOINT_WRITE_TIMEOUT_S (default 30s). The
+        base SqliteSaver holds `self.lock` for the full INSERT+commit, so a
+        stuck thread on the other end of that lock stalls us indefinitely on
+        `acquire()` — that's the failure mode for the "testing..!" stall
+        (6+ hours of no new checkpoints after the LLM call completed
+        cleanly). On timeout, TimeoutError bubbles out of the LangGraph
+        stream into `run_turn:318`'s `except Exception` arm, which fires the
+        full error pipeline (`reporter.error` + `assistant_text(done=True)`
+        + persisted `[error]` + `turn_summary`). The previous good
+        checkpoint is preserved — the next user message resumes from it.
+
+        Why hard-fail (raise) not soft-fail (synthesize a config pointing at
+        the parent checkpoint)? Soft-fail would tell LangGraph the write
+        succeeded when it didn't — the next node invocation would re-execute
+        from the parent checkpoint, potentially re-triggering the same hang.
+        Hard-fail aborts the turn cleanly; the next attempt's first
+        checkpoint write is on a fresh execution that doesn't share the stuck
+        lock-holder.
         """
-        messages = checkpoint.get("channel_values", {}).get("messages", [])
-
-        # Over the token threshold → compact. (_compact_messages no-ops on a
-        # ≤1-message history, so no count guard is needed here.)
-        if _estimate_tokens(messages) >= _auto_compact_threshold():
-            todos = checkpoint.get("channel_values", {}).get("last_todos", [])
-            compacted = _compact_messages(messages, todos)
-            removed = len(messages) - len(compacted)
-            if removed > 0:
-                logging.getLogger(__name__).info(
-                    "auto-compact (safety net): %d messages summarised, ~%d tokens freed",
-                    removed, removed * 200,
+        try:
+            timeout_s = float(
+                os.getenv(
+                    CHECKPOINT_WRITE_TIMEOUT_ENV,
+                    str(DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S),
                 )
-            checkpoint = {
-                **checkpoint,
-                "channel_values": {
-                    **checkpoint.get("channel_values", {}),
-                    "messages": compacted,
-                },
-            }
+                or DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S
+            )
+        except ValueError:
+            timeout_s = DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S
+        timeout_s = max(1.0, timeout_s)
 
-        return super().put(config, checkpoint, metadata, new_versions)
+        def _do_put() -> dict:
+            messages = checkpoint.get("channel_values", {}).get("messages", [])
+
+            # Over the token threshold → compact. (_compact_messages no-ops on a
+            # ≤1-message history, so no count guard is needed here.)
+            if _estimate_tokens(messages) >= _auto_compact_threshold():
+                todos = checkpoint.get("channel_values", {}).get("last_todos", [])
+                compacted = _compact_messages(messages, todos)
+                removed = len(messages) - len(compacted)
+                if removed > 0:
+                    logging.getLogger(__name__).info(
+                        "auto-compact (safety net): %d messages summarised, ~%d tokens freed",
+                        removed, removed * 200,
+                    )
+                checkpoint = {
+                    **checkpoint,
+                    "channel_values": {
+                        **checkpoint.get("channel_values", {}),
+                        "messages": compacted,
+                    },
+                }
+
+            return super().put(config, checkpoint, metadata, new_versions)
+
+        return _call_with_wall_clock_guard(
+            _do_put, timeout_s, label="checkpoint_put"
+        )

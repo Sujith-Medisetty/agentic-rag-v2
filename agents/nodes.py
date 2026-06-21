@@ -61,6 +61,11 @@ from memory.checkpointer import (
     _truncate_tool_result,
     CONTEXT_WINDOW_TOKENS,
 )
+from agents._timeouts import (
+    _call_with_wall_clock_guard,
+    DEFAULT_NODE_BODY_TIMEOUT_S,
+    NODE_BODY_TIMEOUT_ENV,
+)
 from tools.wrappers import get_all_tools
 
 # ---------------------------------------------------------------------------
@@ -1570,45 +1575,87 @@ def node_agent(state: RunnerState) -> dict:
     without a new assistant message so should_continue routes to END at a clean,
     checkpointed boundary (tool results already delivered). Re-running the same
     thread_id resumes from here with a fresh budget — no crash, no lost work.
+
+    Wall-clock guard: the entire body runs inside _call_with_wall_clock_guard
+    with a budget of AGENT_NODE_BODY_TIMEOUT_S (default 600s). This catches
+    hangs in the pre-stream phase (`_prepare_history` / `maybe_compact` /
+    SqliteSaver read), the SDK request setup, the LLM call itself when the
+    per-chunk _stream_with_idle_timeout doesn't fire (slow-but-alive stream),
+    and the post-stream bookkeeping. On timeout, TimeoutError propagates out
+    of the LangGraph stream and lands in `run_turn:318`'s `except Exception`
+    arm, which publishes an `error` event + `assistant_text(done=True)` +
+    persists `[error] <msg>` + fires `turn_summary`. The next user message
+    resumes from the last good LangGraph checkpoint — no work lost beyond the
+    hung call's output.
+
+    Why not _handle_budget_pause? Two reasons: (1) the pause pattern returns
+    `{"paused": True}` BEFORE the LangGraph checkpoint write at the pause
+    boundary — there's no checkpoint at the hang point to pause AT, so the
+    next resume would re-enter the same hung call. (2) `reporter` is bound to
+    a ContextVar that doesn't propagate across `threading.Thread` boundaries
+    (only across `asyncio.run_in_executor` + `ctx.run`), so `tool_done` calls
+    from inside the guard's worker would silently vanish. The raise path runs
+    in the parent thread where the reporter is live.
     """
     session_id = state.get("session_id") or ""
     pause = _run_budget.check()
     if pause is not None:
         return _handle_budget_pause(pause)
 
-    iterations = int(state.get("iterations", 0)) + 1
-    static_base, dynamic_suffix = _resolve_system_prompt_pair(state)
-    history = _prepare_history(state, session_id)
-    messages = _assemble_messages(static_base, dynamic_suffix, history)
+    # Read the timeout once per node invocation. Defensive parsing: bad env
+    # values fall back to the default rather than crashing the turn.
+    try:
+        body_timeout_s = float(
+            os.getenv(NODE_BODY_TIMEOUT_ENV, str(DEFAULT_NODE_BODY_TIMEOUT_S))
+            or DEFAULT_NODE_BODY_TIMEOUT_S
+        )
+    except ValueError:
+        body_timeout_s = DEFAULT_NODE_BODY_TIMEOUT_S
+    body_timeout_s = max(1.0, body_timeout_s)
 
-    llm = _get_llm()
-    # For OpenAI-compatible providers (openai / openai-compatible / minimax),
-    # explicitly request parallel tool calls. `parallel_tool_calls=True` is
-    # the Chat Completions API default, but custom OpenAI-compatible
-    # endpoints sometimes default to `false` or strip the flag entirely —
-    # passing it explicitly makes the intent unambiguous in the wire request.
-    # Anthropic supports parallel tool_use blocks natively and doesn't take
-    # this flag, so we skip it for that provider.
-    bind_kwargs: dict = {}
-    if _provider != "anthropic":
-        bind_kwargs["parallel_tool_calls"] = True
-    llm_with_tools = llm.bind_tools(get_all_tools() + _mcp_tools, **bind_kwargs)
-    ai = _stream_model_call(llm_with_tools, messages, session_id=session_id)
-    _run_budget.record(ai)
+    def _node_agent_body() -> dict:
+        # Closure captures `state` and `session_id` from the outer scope.
+        # Both are read-only for the lifetime of this call — Python closures
+        # are thread-safe to invoke. If `node_agent`'s signature is ever
+        # refactored to take `state` as a kwarg, this closure needs to be
+        # updated.
+        iterations = int(state.get("iterations", 0)) + 1
+        static_base, dynamic_suffix = _resolve_system_prompt_pair(state)
+        history = _prepare_history(state, session_id)
+        messages = _assemble_messages(static_base, dynamic_suffix, history)
 
-    _publish_context_usage(ai, session_id)
-    _emit_cache_diag(ai, session_id, static_base, dynamic_suffix, messages)
+        llm = _get_llm()
+        # For OpenAI-compatible providers (openai / openai-compatible / minimax),
+        # explicitly request parallel tool calls. `parallel_tool_calls=True` is
+        # the Chat Completions API default, but custom OpenAI-compatible
+        # endpoints sometimes default to `false` or strip the flag entirely —
+        # passing it explicitly makes the intent unambiguous in the wire request.
+        # Anthropic supports parallel tool_use blocks natively and doesn't take
+        # this flag, so we skip it for that provider.
+        bind_kwargs: dict = {}
+        if _provider != "anthropic":
+            bind_kwargs["parallel_tool_calls"] = True
+        llm_with_tools = llm.bind_tools(get_all_tools() + _mcp_tools, **bind_kwargs)
+        ai = _stream_model_call(llm_with_tools, messages, session_id=session_id)
+        _run_budget.record(ai)
 
-    # Persist the post-process history as the LLM input for the NEXT turn.
-    # Two channels: `messages` (add_messages reducer — append-only audit log)
-    # and `live_messages` (REPLACE reducer — the LLM only ever reads this, so
-    # it stays bounded by the auto-compact threshold).
-    return {
-        "messages": [ai],
-        "live_messages": list(history) + [ai],
-        "iterations": iterations,
-        "system_prompt_pair": [static_base, dynamic_suffix],
-    }
+        _publish_context_usage(ai, session_id)
+        _emit_cache_diag(ai, session_id, static_base, dynamic_suffix, messages)
+
+        # Persist the post-process history as the LLM input for the NEXT turn.
+        # Two channels: `messages` (add_messages reducer — append-only audit log)
+        # and `live_messages` (REPLACE reducer — the LLM only ever reads this, so
+        # it stays bounded by the auto-compact threshold).
+        return {
+            "messages": [ai],
+            "live_messages": list(history) + [ai],
+            "iterations": iterations,
+            "system_prompt_pair": [static_base, dynamic_suffix],
+        }
+
+    return _call_with_wall_clock_guard(
+        _node_agent_body, body_timeout_s, label="node_agent"
+    )
 
 
 def _read_todo_store(session_id: str | None) -> list[dict]:
