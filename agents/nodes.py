@@ -678,12 +678,15 @@ class _ThinkingTagSplitter:
 # (cancelling a 20 s legitimate read) is worse than the rare hang.
 #
 # Env knobs:
-#   AGENT_LLM_RETRY_ATTEMPTS        total attempts incl. initial (default 2 = 1 retry)
+#   AGENT_LLM_RETRY_ATTEMPTS        total attempts incl. initial (default 2 = 1 retry).
+#                                    Set to 3 to give a stalled provider 2 retries.
 #   AGENT_LLM_RETRY_BACKOFF_S       seconds to sleep before the retry (default 2.0)
 #   AGENT_LLM_STREAM_IDLE_TIMEOUT_S raise TimeoutError if no chunk arrives within N
-#                                    seconds (default 90). Detects mid-stream socket
-#                                    pauses that the 300s httpx total timeout would
-#                                    otherwise wait N minutes to catch.
+#                                    seconds (default 90). Set higher (e.g. 300) for
+#                                    OpenAI-compatible providers that sometimes stall
+#                                    silently mid-response. Catches the same hang
+#                                    shapes as the 300s httpx total timeout, just
+#                                    faster.
 #   AGENT_LLM_DEBUG                 set to 1 to log every LLM-stream chunk + state
 #                                    transition to stderr (filter with
 #                                    `grep '[llm-stream]'`). Zero overhead when off.
@@ -912,11 +915,28 @@ def _stream_with_retry(
                     f"LLM call failed after {max_attempts} attempt(s): "
                     f"{type(e).__name__}: {e}"
                 ) from e
+            # Map the exception class to a short, user-friendly reason so the
+            # chat surfaces a clear "why we're retrying" instead of a raw SDK
+            # class name. Falls back to "provider error" for anything else.
+            _reason = {
+                "TimeoutError": "timeout",
+                "APITimeoutError": "timeout",
+                "ConnectionError": "connection error",
+                "APIConnectionError": "connection error",
+                "RateLimitError": "rate limit",
+            }.get(type(e).__name__, "provider error")
+            # The retry we're about to start is numbered (attempt+1) of 0..max-1,
+            # so surface it as "retry attempt N of M" where M = max_attempts-1
+            # retries remain after the current failed one.
+            _retry_n = attempt + 1
+            _retries_left = max_attempts - 1
             # Notify UI before backing off. Best-effort — never let the
             # notification itself fail the retry.
             try:
                 reporter.assistant_text(
-                    f"\n\n[LLM {type(e).__name__} — retrying in {backoff_s:.1f}s]\n\n",
+                    f"\n\n[LLM provider {_reason} — "
+                    f"retry attempt {_retry_n} of {_retries_left}, "
+                    f"waiting {backoff_s:.1f}s]\n\n",
                     done=False,
                 )
             except Exception:
@@ -941,17 +961,17 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage], session_id: 
     global _t_call_start
     _t_call_start = time.monotonic()
 
-    # Retry config. `AGENT_LLM_RETRY_ATTEMPTS` defaults to 2 = 1 retry,
-    # matching the user-facing knob ("retries to 1"). Backoff is fixed
-    # at `AGENT_LLM_RETRY_BACKOFF_S` seconds (default 2s) — the failed
-    # attempt is reported inline to the UI before the sleep so the
-    # user sees something is happening.
+    # Retry config. `AGENT_LLM_RETRY_ATTEMPTS` defaults to 2 = 1 retry.
+    # Set to 3 to give a stalled provider two chances to recover; the chat
+    # surfaces "[LLM provider <reason> — retry attempt N of M, waiting Xs]"
+    # before each retry so the user sees progress instead of silence.
     max_attempts = max(1, int(os.getenv("AGENT_LLM_RETRY_ATTEMPTS", "2")))
     backoff_s = max(0.0, float(os.getenv("AGENT_LLM_RETRY_BACKOFF_S", "2.0")))
     # Idle-timeout watchdog (default 90s). Catches mid-stream socket
     # pauses that the 300s httpx total timeout would otherwise wait
     # minutes to surface. Set to a very large value to effectively
-    # disable (e.g. 86400 for a 24h ceiling).
+    # disable (e.g. 86400 for a 24h ceiling). 300 (5 min) is the recommended
+    # setting for slow OpenAI-compatible providers (e.g. MiniMax).
     idle_timeout_s = max(1.0, float(os.getenv("AGENT_LLM_STREAM_IDLE_TIMEOUT_S", "90")))
     retryable = _get_retryable_exceptions()
 
