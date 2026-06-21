@@ -23,6 +23,7 @@ already imports from `memory.checkpointer`, so it cannot import from
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 
@@ -67,16 +68,37 @@ def _call_with_wall_clock_guard(fn, timeout_s: float, label: str):
     `label` appears in the TimeoutError message and the daemon thread
     name so journalctl / `pgrep -f` / `py-spy` can attribute the hang.
 
+    IMPORTANT — ContextVar propagation: this guard wraps the body in a
+    `threading.Thread`, but `contextvars.ContextVar` values do NOT
+    propagate to plain Thread workers by default (they only propagate
+    through `asyncio.run_in_executor()`). The agent's reporter lives
+    in a ContextVar (`agents/reporter.py:_reporter_var`), so without the
+    explicit `copy_context()` below every tool_done / assistant_text /
+    token_update call inside the worker would silently no-op (the
+    default reporter swallows them), and the WebSocket stream would
+    show blank even though the agent ran to completion. `ctx.run(fn)`
+    inside the thread ensures the worker inherits the calling
+    ContextVar state.
+
     IMPORTANT: this is meant to wrap short-lived sync calls, not to
     protect callers against malicious or infinite loops in `fn`. The
     worker thread runs `fn` directly — if `fn` itself spawns further
     threads, those are NOT covered by the wall-clock budget.
     """
+    # Snapshot the current ContextVar state on the parent thread.
+    # Must happen on the caller side — once we're inside the daemon
+    # thread, copy_context() would only see the worker's empty
+    # context (which is exactly the bug we're fixing).
+    ctx = contextvars.copy_context()
     holder: list = []
 
     def _target() -> None:
         try:
-            holder.append(("ok", fn()))
+            # ctx.run executes `fn` with the captured ContextVar
+            # values bound, so reporter / any other context-bound
+            # state inside `fn` resolves correctly. Exceptions
+            # raised by `fn` surface here unchanged.
+            holder.append(("ok", ctx.run(fn)))
         except BaseException as e:  # noqa: BLE001 — any exception surfaces
             holder.append(("err", e))
 
