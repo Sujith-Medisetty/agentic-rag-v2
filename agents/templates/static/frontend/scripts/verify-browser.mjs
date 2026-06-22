@@ -9,54 +9,63 @@
  *     CORS, missing service worker, etc.)
  *   - Click handlers that throw or do nothing
  *   - Forms that submit but never update the UI
+ *   - Backends that return empty arrays (no seed data)
  *   - Console errors / unhandled promise rejections
  *   - Routes that load on first nav but break on F5
  *   - React key warnings, validateDOMNesting, memory leaks
+ *   - Dynamic routes the UI doesn't expose as anchors
  *
- * This guard boots the built static app, opens it in headless
+ * This guard boots the built app (fullstack: backend + vite
+ * preview; static: vite preview only), opens it in headless
  * Chromium via Playwright, and exercises every visible route,
  * button, link, and form. It captures:
  *
  *   1. Console errors + pageerror events.
  *   2. Any network response >= 400 on the app's origin.
- *   3. Click handlers that throw — caught as console errors
+ *   3. Any fetch/XHR to /api/* that returns an empty array body
+ *     (downgraded to a warning — fresh apps legitimately have
+ *     no data on first run, but a deployed app should have
+ *     seeded data).
+ *   4. Click handlers that throw — caught as console errors
  *     rather than as a separate signal, because the browser
  *     already gives us that surface.
- *   4. Blank-screen-of-death: route returns 200 but the rendered
+ *   5. Blank-screen-of-death: route returns 200 but the rendered
  *     DOM has no semantic content nodes and almost no text —
  *     typical of an error boundary returning null or a list
  *     with no items and no empty-state copy.
- *   5. Auth forms (signup / login) are detected by the email +
+ *   6. Auth forms (signup / login) are detected by the email +
  *     password field combo and filled with TEST_CREDS generated
  *     once per run. The same creds are reused across the whole
  *     run, so signup → login exercises the SAME account.
- *   6. Refresh survival — after the click+form pass on each
- *     route, page.reload() re-checks blank-screen against the
- *     reloaded DOM.
- *   7. Console warnings — captured in addition to errors; five
+ *   7. Refresh survival — after the click+form pass on each
+ *     route, page.reload() re-checks blank-screen and API
+ *     visibility against the reloaded DOM.
+ *   8. Console warnings — captured in addition to errors; five
  *     specific React / DOM patterns promote to failures
  *     (missing keys, validateDOMNesting, setState during render,
  *      memory leaks, act() wrapper).
- *   8. CRUD button classification — buttons matching add/create/
+ *   9. Dynamic routes discovered from /openapi.json — patterns
+ *     like /api/{name}/{idParam} are walked, the corresponding
+ *     list endpoint is queried, the first 3 IDs are visited via
+ *     Playwright (so the UI rendering is exercised, not just the
+ *     API).
+ *  10. CRUD button classification — buttons matching add/create/
  *     save/update/edit/delete are tagged; list-count snapshots
  *     before vs after the click+form pass are reported as
  *     evidence (informational, not pass/fail).
  *
- * NOTE — no dynamic-route enumeration for the static template:
- * the static template has no backend, so /openapi.json isn't
- * available. The dynamic-route block in exerciseDynamicRoutes()
- * is gated on `isFullstack`, which is false here. The browser
- * walker itself is otherwise identical to the fullstack copy.
- *
  * Exits 0 if every route loads cleanly, every interactive
  * element responds without error, no network request 4xxs, every
- * route renders actual content, and every route survives refresh.
+ * route renders actual content, every route survives refresh,
+ * any non-empty /api/* response has its data visible in the
+ * rendered DOM, and every dynamic detail route loads cleanly.
  * Exits 1 with a structured failure report otherwise.
  *
  * Pre-requisites the caller (npm run verify:browser) handles:
  *   - Playwright + chromium browser installed
  *     (`npm install` then `npx playwright install chromium`)
  *   - `npm run build` has produced frontend/dist/index.html
+ *   - For fullstack apps: backend deps installed
  *
  * Usage:
  *   node scripts/verify-browser.mjs
@@ -70,21 +79,40 @@ import {
   projectRoot,
   repoRoot,
   FRONTEND_URL,
+  BACKEND_URL,
   IGNORED_CONSOLE_PATTERNS,
   MAX_ROUTES,
   NAV_TIMEOUT_MS,
   TEST_CREDS,
+  bootFullstack,
   bootStatic,
   withCleanup,
+  loadReport,
+  saveReport,
 } from "./verify-helpers.mjs";
 
 const failures = [];
 const consoleErrors = [];
 const consoleWarnings = [];
 const networkFailures = [];
+const apiEmptyResponses = [];
+const apiVisibilityFailures = [];
 const blankScreenFailures = [];
 const refreshFailures = [];
 const crudEvidence = [];
+const dynamicRouteErrors = [];
+const dynamicRoutesVisited = new Set();
+// /api/* responses captured on the CURRENT route, BEFORE the
+// destructive walker runs. Both arrays reset before each
+// navigation so the "data visible" + "data not empty" checks
+// only see what fired during the page's initial load.
+let currentRouteApiResponses = [];
+let currentRouteApiEmpty = [];
+// True once we've run the visibility check for the current
+// route. While set, the walker is free to delete items and
+// trigger empty /api/* responses without those polluting the
+// "missing seed data" warning.
+let visibilityCheckedForRoute = false;
 const visitedRoutes = new Set();
 
 // Console WARNING patterns that promote to FAILURES. These are
@@ -135,6 +163,49 @@ function recordNetwork(resp) {
   // Ignore cross-origin noise (CDN font 404s, etc.).
   if (!url.startsWith(FRONTEND_URL)) return;
   networkFailures.push({ url, status });
+}
+
+function recordApiResponse(resp) {
+  // Track two things per /api/* response:
+  //   1. Empty arrays → warning (likely missing seed data).
+  //   2. Non-empty arrays → store the body so the per-route walker
+  //      can check whether the items actually appear in the
+  //      rendered DOM (an API call that returns data the UI never
+  //      displays is just as broken as a 500).
+  const url = resp.url();
+  if (!url.includes("/api/")) return;
+  if (resp.status() >= 400) return;
+  const ct = resp.headers()["content-type"] || "";
+  if (!ct.includes("application/json")) return;
+  resp
+    .json()
+    .then((body) => {
+      if (!Array.isArray(body)) return;
+      // After the walker has run its destructive clicks,
+      // /api/* responses may legitimately shrink to [] (we just
+      // deleted every item). Only count responses that fired
+      // BEFORE the visibility check — those reflect the page's
+      // actual initial-load state.
+      if (visibilityCheckedForRoute) return;
+      if (body.length === 0) {
+        currentRouteApiEmpty.push({ url });
+      } else {
+        // Cap stored body at 50 items / 20 KB to keep memory
+        // bounded; we only need a few items to confirm
+        // visibility in the DOM.
+        const capped = body.slice(0, 50);
+        let approxSize = 0;
+        const trimmed = [];
+        for (const item of capped) {
+          const s = JSON.stringify(item);
+          if (approxSize + s.length > 20_000) break;
+          approxSize += s.length;
+          trimmed.push(item);
+        }
+        currentRouteApiResponses.push({ url, items: trimmed });
+      }
+    })
+    .catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +463,63 @@ async function checkBlankScreen(page) {
   return { blank: false };
 }
 
+// Returns the URL paths of dynamic detail endpoints in the spec,
+// e.g. [{ name: "items", detailPath: "/api/items/{item_id}" }].
+// A path is "detail-like" if (a) it starts with /api/, (b) it
+// has exactly one path parameter, and (c) the corresponding
+// list endpoint (/api/{name}) is also documented. The single-id
+// requirement excludes bulk routes like /api/items/bulk-delete
+// that take an `op` parameter, not an entity id.
+async function collectDetailPaths(spec) {
+  if (!spec?.paths) return [];
+  const out = [];
+  for (const [path, methods] of Object.entries(spec.paths)) {
+    if (!path.startsWith("/api/")) continue;
+    const params = [...path.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
+    if (params.length !== 1) continue;
+    // Skip paths where the param is a non-id (filter / op / type).
+    if (!/id$/i.test(params[0])) continue;
+    // Derive list endpoint: strip the last segment.
+    const listPath = path.replace(/\/\{[^}]+\}$/, "");
+    if (!spec.paths[listPath]) continue;
+    // The list endpoint should support GET.
+    const listMethods = spec.paths[listPath] || {};
+    if (!listMethods.get) continue;
+    out.push({ name: listPath.replace(/^\/api\//, ""), detailPath: path, idParam: params[0] });
+  }
+  return out;
+}
+
+// Fetch a list endpoint and return up to `n` ids. Walks the
+// response for `id`, `Id`, `_id`, `uuid`, or any `*_id`-suffixed
+// field. Empty / non-JSON responses return [].
+async function fetchIdsFromList(url, n) {
+  try {
+    const res = await fetch(url, { headers: { accept: "application/json" } });
+    if (res.status >= 400) return [];
+    const ct = res.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) return [];
+    const body = await res.json();
+    const arr = Array.isArray(body)
+      ? body
+      : Array.isArray(body?.items)
+        ? body.items
+        : Array.isArray(body?.results)
+          ? body.results
+          : [];
+    const ids = [];
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const idField = Object.keys(item).find((k) => /(^|_)(id|uuid)$/i.test(k));
+      if (idField) ids.push(item[idField]);
+      if (ids.length >= n) break;
+    }
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
 async function walkPage(page) {
   const url = new URL(page.url());
   const route = url.pathname + url.search;
@@ -409,6 +537,71 @@ async function walkPage(page) {
   if (blank.blank) {
     blankScreenFailures.push({ route, reason: blank.reason });
   }
+
+  // Visibility check: any /api/* response captured during this
+  // route's INITIAL load (before we started clicking buttons
+  // that may destroy data) should have its string fields visible
+  // in the rendered DOM. If the backend returns items but none
+  // appear on screen, the UI is silently dropping them — a
+  // "data shows up empty" bug, the failure mode the user
+  // explicitly called out.
+  if (currentRouteApiResponses.length > 0) {
+    const pageText = await page.evaluate(() => document.body.innerText || "");
+    // Dedupe by URL — keep only the LATEST response per
+    // endpoint so an intermediate "after a delete" snapshot
+    // doesn't fail the check against the original "full list".
+    const latestByUrl = new Map();
+    for (const captured of currentRouteApiResponses) {
+      latestByUrl.set(captured.url, captured);
+    }
+    for (const captured of latestByUrl.values()) {
+      const { url: apiUrl, items } = captured;
+      if (items.length === 0) continue;
+      let visibleCount = 0;
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        for (const val of Object.values(item)) {
+          if (
+            typeof val === "string" &&
+            val.length >= 3 &&
+            pageText.includes(val)
+          ) {
+            visibleCount++;
+            break;
+          }
+        }
+      }
+      if (visibleCount === 0) {
+        apiVisibilityFailures.push({
+          route,
+          url: apiUrl,
+          itemCount: items.length,
+        });
+      } else if (visibleCount < items.length / 2) {
+        // Partial visibility — could be pagination or filtering.
+        // Warn but don't fail; the user can investigate.
+        apiEmptyResponses.push({
+          url: `${apiUrl} (only ${visibleCount}/${items.length} items visible on ${route})`,
+        });
+      }
+    }
+  }
+  // Drain the empty-array captures for THIS route's initial
+  // load into the report list. They reflect the page's first
+  // paint state, not the post-walker state.
+  for (const empty of currentRouteApiEmpty) {
+    apiEmptyResponses.push(empty);
+  }
+
+  // Clear for the next route's initial load.
+  currentRouteApiResponses = [];
+  currentRouteApiEmpty = [];
+  // Lock out further /api/* recording until the next route
+  // navigates. The walker below may destroy data (delete items,
+  // empty the list); responses fired during destruction are not
+  // a signal of "missing seed data" and must not pollute the
+  // empty-array warning.
+  visibilityCheckedForRoute = true;
 
   // Snapshot list-count BEFORE the click+form pass so we can
   // attribute before/after deltas to CRUD intent. Skipped on
@@ -458,11 +651,11 @@ async function walkPage(page) {
   }
 
   // B1: Refresh survival. After the destructive pass, reload
-  // and re-check blank-screen. A page that worked once but
-  // breaks on F5 (state held in memory, missing hydration,
-  // etc.) is a real deployed-app failure mode. Try/catch so a
-  // hung reload doesn't fail the whole run — it gets recorded
-  // as a refreshFailure instead.
+  // and re-check blank-screen + API visibility. A page that
+  // worked once but breaks on F5 (state held in memory,
+  // missing hydration, etc.) is a real deployed-app failure
+  // mode. Try/catch so a hung reload doesn't fail the whole
+  // run — it gets recorded as a refreshFailure instead.
   try {
     await page.reload({ waitUntil: "networkidle", timeout: NAV_TIMEOUT_MS });
   } catch (e) {
@@ -481,10 +674,76 @@ async function walkPage(page) {
   return collectInternalLinks(elements.links, FRONTEND_URL);
 }
 
+// B3: Dynamic route enumeration via OpenAPI. After BFS finishes,
+// walk spec.paths for /api/{name}/{idParam} patterns, fetch the
+// first 3 IDs from the corresponding list endpoint, and navigate
+// Playwright to each detail URL so the UI rendering is exercised.
+// Blank or errored detail pages feed into the existing failure
+// arrays.
+async function exerciseDynamicRoutes(page, isFullstack) {
+  if (!isFullstack) return;
+  let spec;
+  try {
+    const res = await fetch(`${BACKEND_URL}/openapi.json`);
+    if (!res.ok) return;
+    spec = await res.json();
+  } catch {
+    return;
+  }
+  const detailPaths = await collectDetailPaths(spec);
+  if (detailPaths.length === 0) return;
+
+  const DYNAMIC_ID_COUNT = 3;
+  for (const { name, detailPath, idParam } of detailPaths) {
+    const listUrl = `${BACKEND_URL}/api/${name}`;
+    const ids = await fetchIdsFromList(listUrl, DYNAMIC_ID_COUNT);
+    if (ids.length === 0) continue;
+    for (const id of ids) {
+      // Build the SPA URL: strip the /api prefix (the frontend
+      // typically mounts detail routes under /<name>/<id>).
+      const uiDetailPath = `/${name}/${encodeURIComponent(id)}`;
+      const route = uiDetailPath;
+      if (visitedRoutes.has(route)) {
+        dynamicRoutesVisited.add(route);
+        continue;
+      }
+      dynamicRoutesVisited.add(route);
+      visibilityCheckedForRoute = false;
+      currentRouteApiResponses = [];
+      currentRouteApiEmpty = [];
+      try {
+        await page.goto(route, {
+          waitUntil: "networkidle",
+          timeout: NAV_TIMEOUT_MS,
+        });
+      } catch (e) {
+        dynamicRouteErrors.push({
+          route,
+          kind: "navigation",
+          message: e.message,
+        });
+        continue;
+      }
+      const blank = await checkBlankScreen(page);
+      if (blank.blank) {
+        dynamicRouteErrors.push({
+          route,
+          kind: "blank",
+          reason: blank.reason,
+        });
+      }
+      // Cap dynamic-route visits at the same MAX_ROUTES limit
+      // to avoid runaway loops in degenerate specs.
+      if (dynamicRoutesVisited.size + visitedRoutes.size > MAX_ROUTES) return;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
+  const isFullstack = existsSync(join(repoRoot, "backend", "main.py"));
   if (!existsSync(join(projectRoot, "dist", "index.html"))) {
     console.error(
       "verify-browser FAILED: dist/index.html not found. " +
@@ -504,7 +763,7 @@ async function main() {
     process.exit(1);
   }
 
-  const procs = await bootStatic();
+  const procs = isFullstack ? await bootFullstack() : await bootStatic();
 
   await withCleanup(procs, async () => {
     const browser = await chromium.launch({ headless: true });
@@ -520,12 +779,16 @@ async function main() {
       recordConsole(page, `pageerror: ${err.message}`),
     );
     page.on("response", recordNetwork);
+    page.on("response", recordApiResponse);
 
     // BFS over routes starting at "/".
     const queue = ["/"];
     while (queue.length > 0) {
       const route = queue.shift();
       if (visitedRoutes.has(route)) continue;
+      // Reset per-route API capture so the visibility check
+      // only sees responses fired during THIS route's load.
+      currentRouteApiResponses = [];
       try {
         await page.goto(route, { waitUntil: "networkidle", timeout: NAV_TIMEOUT_MS });
       } catch (e) {
@@ -539,9 +802,13 @@ async function main() {
       if (visitedRoutes.size + queue.length > MAX_ROUTES) break;
     }
 
+    // B3: dynamic route enumeration via OpenAPI (fullstack only).
+    await exerciseDynamicRoutes(page, isFullstack);
+
     await browser.close();
   });
 
+  // Give the apiEmptyResponses promises a beat to resolve.
   await wait(500);
 
   // Report.
@@ -561,6 +828,20 @@ async function main() {
     problems.push(
       `Network failures (${networkFailures.length}):\n` +
         networkFailures.map((n) => `  ${n.status} ${n.url}`).join("\n"),
+    );
+  }
+  if (apiVisibilityFailures.length) {
+    problems.push(
+      `API data not visible in UI (${apiVisibilityFailures.length}):\n` +
+        apiVisibilityFailures
+          .map(
+            (v) =>
+              `  ${v.route}: ${v.url} returned ${v.itemCount} item(s) but ` +
+              `none of their text appears in the rendered page. ` +
+              `Either the UI isn't reading the response, or the seed ` +
+              `data doesn't match what the page renders.`,
+          )
+          .join("\n"),
     );
   }
   if (blankScreenFailures.length) {
@@ -590,9 +871,29 @@ async function main() {
           .join("\n"),
     );
   }
+  if (dynamicRouteErrors.length) {
+    problems.push(
+      `Dynamic detail routes — first 3 IDs per /api/{name}/{id} pattern failed (${dynamicRouteErrors.length}):\n` +
+        dynamicRouteErrors
+          .map(
+            (d) =>
+              `  ${d.route}: [${d.kind}] ${d.message ?? d.reason}. ` +
+              `The route renders for some IDs but not others — ` +
+              `check for missing loaders or 404 fallbacks.`,
+          )
+          .join("\n"),
+    );
+  }
   if (problems.length) {
     console.error("verify-browser FAILED:");
     for (const p of problems) console.error("  - " + p);
+    if (apiEmptyResponses.length) {
+      console.error(
+        `\nNote: ${apiEmptyResponses.length} /api/ endpoint(s) returned ` +
+          `empty arrays (downgraded to warning — seed your DB before deploy):`,
+      );
+      for (const e of apiEmptyResponses) console.error("  - " + e.url);
+    }
     if (consoleWarnings.length) {
       console.error(
         `\nNote: ${consoleWarnings.length} console warning(s) (informational):`,
@@ -609,13 +910,28 @@ async function main() {
         );
       }
     }
-    console.error(`\nVisited ${visitedRoutes.size} route(s).`);
+    console.error(
+      `\nVisited ${visitedRoutes.size} static route(s) + ${dynamicRoutesVisited.size} dynamic route(s).`,
+    );
     process.exit(1);
   }
 
-  console.log(
-    `verify-browser OK -- ${visitedRoutes.size} route(s) exercised cleanly.`,
-  );
+  if (apiEmptyResponses.length) {
+    console.log(
+      `verify-browser OK with warning: ${apiEmptyResponses.length} ` +
+        `endpoint(s) returned empty arrays — seed your DB before deploy.`,
+    );
+    for (const e of apiEmptyResponses) console.log("  - " + e.url);
+  } else {
+    console.log(
+      `verify-browser OK -- ${visitedRoutes.size} route(s) exercised cleanly.`,
+    );
+  }
+  if (dynamicRoutesVisited.size > 0) {
+    console.log(
+      `verify-browser dynamic detail routes: ${dynamicRoutesVisited.size} (first 3 IDs per /api/{name}/{id} pattern).`,
+    );
+  }
   if (consoleWarnings.length) {
     console.log(
       `\nConsole warnings (${consoleWarnings.length}, informational):`,
@@ -636,6 +952,33 @@ async function main() {
     `verify-browser test creds (used for any auth forms encountered): ` +
       `email=${TEST_CREDS.email} password=${TEST_CREDS.password}`,
   );
+
+  // Contribute structured evidence to the unified
+  // verify-report.json so the deploy UI can show "X routes
+  // walked, Y console errors, Z dynamic detail pages" on
+  // the success card. verify-browser owns
+  // `report.guards.browser`.
+  const report = loadReport();
+  report.guards.browser = {
+    status: problems.length === 0 ? "pass" : "fail",
+    routes_walked: visitedRoutes.size,
+    dynamic_routes_walked: dynamicRoutesVisited.size,
+    console_errors: consoleErrors.length,
+    console_warnings: consoleWarnings.length,
+    network_failures: networkFailures.length,
+    blank_routes: blankScreenFailures.length,
+    refresh_failures: refreshFailures.length,
+    api_visibility_failures: apiVisibilityFailures.length,
+    empty_api_responses: apiEmptyResponses.length,
+    crud_evidence: crudEvidence.length,
+    test_creds: {
+      email: TEST_CREDS.email,
+      password: TEST_CREDS.password,
+    },
+    sample_console_errors: consoleErrors.slice(0, 3),
+    sample_blank_routes: blankScreenFailures.slice(0, 3),
+  };
+  saveReport(report);
 }
 
 main().catch((e) => {

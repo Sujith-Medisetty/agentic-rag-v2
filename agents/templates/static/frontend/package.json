@@ -13,7 +13,8 @@
     "verify:radix": "node scripts/verify-radix.mjs",
     "verify:render": "node scripts/verify-render.mjs",
     "verify:browser": "node scripts/verify-browser.mjs",
-    "verify": "npm run verify:deps && npm run verify:radix && npm run build && npm run verify:render && npm run verify:browser"
+    "verify:integration": "node scripts/verify-integration.mjs",
+    "verify": "npm run verify:deps && npm run verify:radix && npm run build && npm run verify:render && npm run verify:integration && npm run verify:browser"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.1.0",

@@ -4476,6 +4476,22 @@ async def _run_deploy_job(
             "app": {**DeployedAppResponse(**app_row).model_dump(mode="json"),
                     "public_url": _public_url_for(slug)},
         }
+        # Attach the verify chain's report (if any) so the deploy
+        # UI can show "what was tested" on the success card. The
+        # report is written by the agent's `npm run verify` chain
+        # (verify:api / verify:integration / verify:browser all
+        # contribute) to the project's
+        # node_modules/.ojas-verify/verify-report.json. We
+        # discover the project by the session's first 8 chars of
+        # its id — same convention as the self-heal in
+        # _try_self_heal_todos.
+        try:
+            report = _read_session_verify_report(job.session_id)
+            if report is not None:
+                result["verify_report"] = report
+        except Exception:
+            # Never block the deploy on a missing/broken report.
+            pass
         _set_terminal("succeeded", result=result)
 
     except asyncio.CancelledError:
@@ -5031,6 +5047,55 @@ def _validate_session_todos(session_id: str) -> None:
     # catch sees a string error, not a wrapped class.
     except _IncompleteBuildError:
         raise
+
+
+def _read_session_verify_report(session_id: str) -> dict | None:
+    """Read the unified verify-report.json that the agent's
+    `npm run verify` chain writes to the project's
+    node_modules/.ojas-verify/ directory. Returns None if the
+    file doesn't exist (no verify run, or it's from a different
+    session) or can't be parsed.
+
+    Discovery: the project dir lives at
+    `/home/ojas/ojas/<first-8-chars>/<project-name>/frontend/`
+    — same convention used by `_try_self_heal_todos`. We pick
+    the first matching project dir under the short-id parent.
+    If there are multiple, the one whose frontend dir actually
+    contains the report wins; ties go alphabetically.
+
+    The report carries structured evidence from every guard
+    in the chain:
+      - guards.deps (verify:deps — node_modules sanity)
+      - guards.radix (verify:radix — Dialog/Sheet invariant)
+      - guards.render (verify:render — react-dom/server smoke)
+      - guards.api (verify:api — OpenAPI CRUD round-trip)
+      - guards.integration (verify:integration — endpoint↔UI
+        mapping, added 2026-06-22)
+      - guards.browser (verify:browser — Playwright BFS walk)
+
+    The deploy UI surfaces this on the success card so the
+    user can SEE what was tested, not just "all green".
+    Returns the parsed dict; None if the file is missing.
+    """
+    import json
+
+    short_id = session_id[:8]
+    project_root = Path("/home/ojas/ojas") / short_id
+    if not project_root.is_dir():
+        return None
+    # Find the first frontend/ that has the report.
+    candidates = sorted(project_root.glob("*/frontend"))
+    for frontend in candidates:
+        report_path = frontend / "node_modules" / ".ojas-verify" / "verify-report.json"
+        if report_path.is_file():
+            try:
+                data = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            if not isinstance(data, dict):
+                return None
+            return data
+    return None
 
 
 def _do_copy_dist(*, dist, dist_target, slug) -> None:

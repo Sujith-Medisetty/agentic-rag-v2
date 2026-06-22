@@ -87,6 +87,8 @@ import {
   bootFullstack,
   bootStatic,
   withCleanup,
+  loadReport,
+  saveReport,
 } from "./verify-helpers.mjs";
 
 const failures = [];
@@ -950,6 +952,33 @@ async function main() {
     `verify-browser test creds (used for any auth forms encountered): ` +
       `email=${TEST_CREDS.email} password=${TEST_CREDS.password}`,
   );
+
+  // Contribute structured evidence to the unified
+  // verify-report.json so the deploy UI can show "X routes
+  // walked, Y console errors, Z dynamic detail pages" on
+  // the success card. verify-browser owns
+  // `report.guards.browser`.
+  const report = loadReport();
+  report.guards.browser = {
+    status: problems.length === 0 ? "pass" : "fail",
+    routes_walked: visitedRoutes.size,
+    dynamic_routes_walked: dynamicRoutesVisited.size,
+    console_errors: consoleErrors.length,
+    console_warnings: consoleWarnings.length,
+    network_failures: networkFailures.length,
+    blank_routes: blankScreenFailures.length,
+    refresh_failures: refreshFailures.length,
+    api_visibility_failures: apiVisibilityFailures.length,
+    empty_api_responses: apiEmptyResponses.length,
+    crud_evidence: crudEvidence.length,
+    test_creds: {
+      email: TEST_CREDS.email,
+      password: TEST_CREDS.password,
+    },
+    sample_console_errors: consoleErrors.slice(0, 3),
+    sample_blank_routes: blankScreenFailures.slice(0, 3),
+  };
+  saveReport(report);
 }
 
 main().catch((e) => {

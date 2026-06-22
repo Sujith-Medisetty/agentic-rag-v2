@@ -20,7 +20,7 @@
  * independent deliverables.
  */
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as wait } from "node:timers/promises";
@@ -314,6 +314,54 @@ async function startProxyServer({ frontendUrl, backendUrl } = {}) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Verify report
+// ---------------------------------------------------------------------------
+// All verify scripts (verify:deps, verify:render, verify:api,
+// verify:integration, verify:browser) contribute structured
+// evidence to a single verify-report.json under
+// node_modules/.ojas-verify/. The server reads it after
+// `npm run verify` completes and surfaces the data on the
+// deploy success card, so the user can SEE what was tested —
+// not just "all green".
+//
+// API:
+//   const report = loadReport();        // start with existing or {}
+//   report.guards.deps = { status: "pass", ms: 1234 };
+//   saveReport(report);                 // atomic write
+//
+// The script's last action is `saveReport(report)`. Each script
+// only owns its own guard key — concurrent writes to the same
+// file from chained npm scripts are sequential, so no locking
+// is needed.
+const REPORT_DIR = join(projectRoot, "node_modules", ".ojas-verify");
+const REPORT_PATH = join(REPORT_DIR, "verify-report.json");
+
+function loadReport() {
+  try {
+    if (existsSync(REPORT_PATH)) {
+      return JSON.parse(readFileSync(REPORT_PATH, "utf8"));
+    }
+  } catch {
+    /* fall through to fresh */
+  }
+  return {
+    started_at: new Date().toISOString(),
+    guards: {},
+  };
+}
+
+function saveReport(report) {
+  mkdirSync(REPORT_DIR, { recursive: true });
+  report.finished_at = new Date().toISOString();
+  // Atomic write: write to .tmp, then rename. A crash mid-write
+  // leaves the old report intact rather than a half-truncated
+  // JSON file.
+  const tmp = REPORT_PATH + ".tmp";
+  writeFileSync(tmp, JSON.stringify(report, null, 2));
+  renameSync(tmp, REPORT_PATH);
+}
+
 export {
   projectRoot,
   repoRoot,
@@ -326,6 +374,10 @@ export {
   MAX_ROUTES,
   NAV_TIMEOUT_MS,
   TEST_CREDS,
+  REPORT_DIR,
+  REPORT_PATH,
+  loadReport,
+  saveReport,
   waitForUrl,
   spawnLogged,
   withCleanup,
