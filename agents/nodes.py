@@ -1636,7 +1636,29 @@ def node_agent(state: RunnerState) -> dict:
         if _provider != "anthropic":
             bind_kwargs["parallel_tool_calls"] = True
         llm_with_tools = llm.bind_tools(get_all_tools() + _mcp_tools, **bind_kwargs)
-        ai = _stream_model_call(llm_with_tools, messages, session_id=session_id)
+        try:
+            ai = _stream_model_call(llm_with_tools, messages, session_id=session_id)
+        except Exception as stream_exc:  # noqa: BLE001 — see "loop-resilience contract" in node_tools
+            # A non-retryable streaming failure (e.g. provider SDK raises
+            # `RuntimeError: super(): no arguments` from a buggy hook class,
+            # or the wire deserializer trips over malformed JSON). The
+            # `_stream_with_retry` layer has already exhausted its retries on
+            # transient shapes; this branch is the genuine poison-pill
+            # path. Synthesise an empty AIMessage with no tool_calls so the
+            # loop reaches `should_continue` cleanly and routes to
+            # `node_force_todo_sync` (if there are open todos) or `__end__`
+            # — but never crashes mid-turn. Surface the error to the UI
+            # via the same reporter path the chat uses for normal errors.
+            err_text = f"Error: {stream_exc}"
+            try:
+                from agents.reporter import get_reporter
+                get_reporter().assistant_text(
+                    f"\n\n[LLM stream failed: {err_text}]\n\n",
+                    done=False,
+                )
+            except Exception:
+                pass
+            ai = AIMessage(content=f"[error] {err_text}")
         _run_budget.record(ai)
 
         _publish_context_usage(ai, session_id)
@@ -1774,6 +1796,15 @@ def node_force_todo_sync(state: RunnerState) -> dict:
 def should_continue(state: RunnerState) -> str:
     """Terminal check: continue while the assistant requests tools.
 
+    Hard rule: the loop ONLY ends when the last assistant message has
+    no `tool_calls` AND no `invalid_tool_calls` AND no pending open
+    todos (or we've already nudged). If tool calls are pending — even
+    if some are malformed (`invalid_tool_calls`) — we still route back
+    to `node_tools` so the agent gets a chance to see the error and
+    retry. Previously a malformed tool_call would short-circuit to
+    `__end__` (because `tool_calls` was empty) and the turn would die
+    mid-flight — symptom: "loop ended with N tool calls still planned".
+
     Force-sync gate: if the assistant is about to return no-tool-calls
     (i.e. the loop is about to terminate) AND we have a non-empty
     `last_todos` snapshot with at least one `pending` or `in_progress`
@@ -1785,8 +1816,13 @@ def should_continue(state: RunnerState) -> str:
     """
     messages = state.get("messages", [])
     last = messages[-1] if messages else None
-    if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
-        return "node_tools"
+    if isinstance(last, AIMessage):
+        # Pending EITHER valid OR invalid tool calls must route back
+        # through node_tools — invalid_tool_calls means the model
+        # tried to call a tool with bad args; we want node_tools to
+        # surface the parse/validation error so the LLM can retry.
+        if getattr(last, "tool_calls", None) or getattr(last, "invalid_tool_calls", None):
+            return "node_tools"
 
     # Force-sync nudge at task end. Skip if the agent already
     # synced this turn (last assistant message was the TodoWrite
@@ -1805,11 +1841,62 @@ def should_continue(state: RunnerState) -> str:
 
 def node_tools(state: RunnerState) -> dict:
     """Execute the assistant's requested tools (permissions enforced inside each
-    tool wrapper) and append the results."""
+    tool wrapper) and append the results.
+
+    Loop-resilience contract: this node MUST NEVER raise out of the LangGraph
+    stream. If any tool (or ToolNode itself) blows up with an unhandled
+    exception — e.g. a third-party MCP tool raises `RuntimeError: super(): no
+    arguments` from a misconfigured base class, or `_parse_input` itself
+    trips over a malformed tool_call — we synthesise a synthetic
+    `ToolMessage` carrying the error text, attach it to every pending
+    `tool_call_id` from the last AIMessage, and return. The LLM sees the
+    error on the next iteration and can decide to retry / pivot / summarise.
+    Without this guard, the exception bubbles into `run_turn`'s outer
+    `except Exception`, the turn ends mid-flight, and the agent appears to
+    "stop before all tool calls" even though the model had more planned.
+
+    `handle_tool_errors=True` is also passed to `ToolNode` for the per-tool
+    case (one tool raising while siblings succeed) — without it, an exception
+    in any single tool aborts the whole batch."""
     from agents.reporter import get_reporter
     reporter = get_reporter()
 
-    result = ToolNode(get_all_tools() + _mcp_tools).invoke(state)
+    messages = state.get("messages", []) or []
+    last = messages[-1] if messages else None
+    pending_ids: list[str] = []
+    if isinstance(last, AIMessage):
+        for tc in (getattr(last, "tool_calls", None) or []):
+            tcid = tc.get("id")
+            if tcid:
+                pending_ids.append(tcid)
+
+    try:
+        result = ToolNode(
+            get_all_tools() + _mcp_tools,
+            handle_tool_errors=True,
+        ).invoke(state)
+    except Exception as node_exc:  # noqa: BLE001 — last-resort guard, see contract above
+        # ToolNode blew up before producing per-tool results. Build one
+        # synthetic error ToolMessage per pending tool_call so the LLM
+        # sees a complete response and the conversation can continue.
+        err_text = f"Error: {node_exc}"
+        synthetic: list = []
+        for tcid in pending_ids or ["synthetic"]:
+            synthetic.append(ToolMessage(
+                content=err_text,
+                tool_call_id=tcid,
+                name="tool_node",
+                status="error",
+            ))
+        try:
+            reporter.tool_done("tool_node", err_text, error=True)
+        except Exception:
+            pass
+        existing = list(state.get("live_messages") or state.get("messages", []))
+        return {
+            "messages": synthetic,
+            "live_messages": existing + synthetic,
+        }
 
     for msg in result.get("messages", []):
         content = msg.content if isinstance(msg.content, str) else str(msg.content)

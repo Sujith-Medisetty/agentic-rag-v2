@@ -806,7 +806,11 @@ class CompactingCheckpointer(SqliteSaver):
         db_path = Path.home() / ".agent" / "checkpoints.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        super().__init__(conn)
+        # Explicit super(SubClass, self) form — robust against refactors that
+        # move this body into a closure (where bare `super()` would raise
+        # `RuntimeError: super(): no arguments` because the implicit
+        # `__class__` cell is missing outside a method).
+        super(CompactingCheckpointer, self).__init__(conn)
 
     def put(
         self,
@@ -884,7 +888,7 @@ class CompactingCheckpointer(SqliteSaver):
                     },
                 }
 
-            return super().put(config, ckpt, metadata, new_versions)
+            return super(CompactingCheckpointer, self).put(config, ckpt, metadata, new_versions)
 
         return _call_with_wall_clock_guard(
             _do_put, timeout_s, label="checkpoint_put"
