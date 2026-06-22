@@ -15,7 +15,9 @@
     "verify:browser": "node scripts/verify-browser.mjs",
     "verify:api": "node scripts/verify-api.mjs",
     "verify:integration": "node scripts/verify-integration.mjs",
-    "verify": "npm run verify:deps && npm run verify:radix && npm run build && npm run verify:render && npm run verify:api && npm run verify:integration && npm run verify:browser"
+    "verify:data": "node scripts/verify-data.mjs",
+    "verify:full-integration": "node scripts/verify-full-integration.mjs",
+    "verify": "npm run verify:data && npm run verify:deps && npm run verify:radix && npm run build && npm run verify:render && npm run verify:api && npm run verify:integration && npm run verify:browser && npm run verify:full-integration"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.1.0",

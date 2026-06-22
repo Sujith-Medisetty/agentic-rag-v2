@@ -302,7 +302,16 @@ function expectedSuccessStatuses(method) {
 // Returns null for endpoints with no body (GET, DELETE, etc.).
 // Returns { skip: true, reason } if the body requires fixtures
 // we can't synthesise.
-function buildBody(operation, spec) {
+//
+// `realIdsByName` (optional) is a Map<resourceName, id[]>
+// populated by main() from real GETs to the list endpoints.
+// If provided, we walk the synthesized body for FK-shaped
+// fields (suffixed `_id`, integer type) and substitute real
+// IDs from the matching resource. This kills the largest
+// class of false-positives where the schema is technically
+// valid but the body would have a non-existent FK and the
+// endpoint returns 500 from the FK constraint.
+function buildBody(operation, spec, realIdsByName) {
   const rb = operation.requestBody;
   if (!rb) return { body: null };
   const jsonContent = rb.content?.["application/json"];
@@ -315,6 +324,42 @@ function buildBody(operation, spec) {
   const value = generateValue(schema, spec, new Set(), 0);
   if (!value || typeof value !== "object") {
     return { body: value };
+  }
+  // FK substitution pass: walk every value-shaped field in
+  // the body. If the field name ends in `_id` and we have a
+  // real ID for the corresponding resource, swap it in.
+  // Examples:
+  //   {product_id: 1, qty: 2}            (cart/items)
+  //   {store_id: 1, address_id: 4, ...}  (orders)
+  //   {album_id: 2, photo_ids: [1,2]}    (albums)
+  if (realIdsByName && realIdsByName.size > 0) {
+    for (const [k, v] of Object.entries(value)) {
+      if (!/_id$/.test(k) && !/_ids$/.test(k)) continue;
+      // Derive resource name from field: `product_id` → "product",
+      // `photo_ids` → "photo", `user_id` → "user". Singularise by
+      // stripping the trailing `s` for `*_ids` arrays.
+      let resource = k.replace(/_ids?$/, "");
+      // Some schemas use names that don't match the URL segment
+      // 1:1 — `product_ids` (array) is for the `/products` list,
+      // singular `product_id` is for `/products/{id}`. Both work
+      // because the resource name is the URL segment prefix.
+      const candidates = [resource, resource + "s"];
+      let realIds = null;
+      for (const c of candidates) {
+        if (realIdsByName.has(c)) {
+          realIds = realIdsByName.get(c);
+          resource = c;
+          break;
+        }
+      }
+      if (!realIds || realIds.length === 0) continue;
+      if (Array.isArray(v)) {
+        // array of ids: use up to 3 real ids
+        value[k] = realIds.slice(0, Math.min(3, realIds.length));
+      } else {
+        value[k] = realIds[0];
+      }
+    }
   }
   // Check if EVERY required field is a fixture field — if so,
   // skip rather than send a body of "verify-fixture-…" strings
@@ -408,7 +453,7 @@ async function exerciseEndpoint({ method, path, operation }, baseUrl, spec, auth
   // Build body (POST/PUT/PATCH)
   let body = null;
   if (["post", "put", "patch"].includes(method)) {
-    const built = buildBody(operation, spec);
+    const built = buildBody(operation, spec, realIdsByName);
     if (built.skip) return { kind: "skipped", reason: built.reason };
     body = built.body;
   }

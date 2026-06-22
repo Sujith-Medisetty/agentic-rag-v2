@@ -395,6 +395,88 @@ async function fillAndSubmitForms(page) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Declared-route discovery (App.tsx + other router files)
+// ---------------------------------------------------------------------------
+// The BFS walker used to start at "/" and only follow anchor
+// links. That misses declared routes that no anchor links
+// to: admin pages, settings, dynamic-detail patterns the
+// agent added, etc. The walker would skip them and the user
+// would ship an app whose admin/settings page is broken.
+//
+// We extend the BFS seed with a static parse of every router
+// file under src/. Two patterns cover the Ojas template
+// (React Router's `<Route path="X">` JSX and
+// `createBrowserRouter([{path: "X", ...}])` object literals).
+// A full TS AST walk would need a TS compiler at runtime
+// (~50MB dep); the regex is enough for the patterns the
+// template actually uses.
+function* walkAppRouterFiles(dir) {
+  const SKIP = new Set(["ui", "node_modules", "dist", "scripts", "lib"]);
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith(".")) continue;
+    if (entry.name.startsWith("_")) continue;
+    if (SKIP.has(entry.name)) continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) yield* walkAppRouterFiles(full);
+    else if (entry.isFile() && /\.(t|j)sx?$/.test(entry.name)) {
+      // Pre-filter: only files that mention a router primitive
+      // are worth scanning. Avoids reading 200 component files
+      // just to regex them.
+      try {
+        const src = readFileSync(full, "utf8");
+        if (
+          /<Route\s+path=/.test(src) ||
+          /createBrowserRouter\s*\(/.test(src) ||
+          /createHashRouter\s*\(/.test(src) ||
+          /createMemoryRouter\s*\(/.test(src) ||
+          /<RouterProvider/.test(src)
+        ) {
+          yield full;
+        }
+      } catch {
+        /* unreadable — skip */
+      }
+    }
+  }
+}
+
+function discoverDeclaredRoutes() {
+  const out = new Set();
+  out.add("/"); // always include root
+  const src = join(projectRoot, "src");
+  for (const file of walkAppRouterFiles(src)) {
+    let content;
+    try {
+      content = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    // Pattern A: <Route path="X" ...> JSX. Capture the path
+    // value as a string literal between quotes.
+    const jsxRe = /<Route\s+(?:[^>]*?\s)?path\s*=\s*["']([^"']+)["']/g;
+    let m;
+    while ((m = jsxRe.exec(content)) !== null) {
+      const p = m[1];
+      if (!p) continue;
+      out.add(p.startsWith("/") ? p : `/${p}`);
+    }
+    // Pattern B: createBrowserRouter([{path: "X", ...}]) —
+    // object-literal route config. Capture `path: "X"`.
+    // Skip the wildcard "*" (404) and any param-only path
+    // like ":slug" (those are dynamic and handled by the
+    // OpenAPI-driven walker).
+    const objRe = /path\s*:\s*["']([^"']+)["']/g;
+    while ((m = objRe.exec(content)) !== null) {
+      const p = m[1];
+      if (!p || p === "*" || p.startsWith(":")) continue;
+      out.add(p.startsWith("/") ? p : `/${p}`);
+    }
+  }
+  return [...out];
+}
+
 function collectInternalLinks(links, baseUrl) {
   const out = [];
   for (const link of links) {
@@ -781,8 +863,18 @@ async function main() {
     page.on("response", recordNetwork);
     page.on("response", recordApiResponse);
 
-    // BFS over routes starting at "/".
-    const queue = ["/"];
+    // BFS over routes. Seed: "/" + every route declared in
+    // App.tsx (and any other router file). This catches
+    // declared routes that no anchor links to — admin pages,
+    // settings, dynamic-detail pages, etc. — so they still
+    // get tested.
+    const declared = discoverDeclaredRoutes();
+    console.log(
+      `verify-browser: discovered ${declared.length} declared route(s) from App.tsx: ` +
+        declared.slice(0, 8).join(", ") +
+        (declared.length > 8 ? "…" : ""),
+    );
+    const queue = [...declared];
     while (queue.length > 0) {
       const route = queue.shift();
       if (visitedRoutes.has(route)) continue;
@@ -798,8 +890,11 @@ async function main() {
       const newRoutes = await walkPage(page);
       queue.push(...newRoutes);
       // Cap BFS — guards against runaway link loops in degenerate
-      // apps. A normal app has <10 routes.
-      if (visitedRoutes.size + queue.length > MAX_ROUTES) break;
+      // apps. Raised from 50 to 200 so apps with many declared
+      // routes (admin panels, multi-section sites) get full
+      // coverage. 200 is still well within Playwright's comfort
+      // zone and the per-route work is cheap.
+      if (visitedRoutes.size + queue.length > 200) break;
     }
 
     // B3: dynamic route enumeration via OpenAPI (fullstack only).
