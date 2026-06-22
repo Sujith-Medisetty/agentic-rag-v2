@@ -4161,21 +4161,11 @@ async def _run_deploy_job(
     try:
         # 0. validate
         _set_step(0, "running")
-        # 0a. session todo list -- refuse deploy when the agent's own
-        #     TodoList shows unfinished tasks. Catches the failure mode
-        #     where the agent stopped mid-build (budget pause, stall
-        #     detector, model timeout, transient API error) without
-        #     completing its plan. The user would otherwise click
-        #     Deploy and get an app that renders the StarterDashboard
-        #     because App.tsx was never overwritten, or a half-built
-        #     UI with stubs. No-op when the session never used
-        #     TodoWrite (scaffold-only / static-only flow).
-        try:
-            _validate_session_todos(job.session_id)
-        except Exception as todo_err:
-            _set_step(0, "failed", str(todo_err)[:200])
-            raise
-        # 0b. dist quality -- reject bundles that contain two copies of
+        # NOTE: IncompleteBuild / todo-state guard removed by operator
+        # request (2026-06-22). Deploys now proceed regardless of the
+        # agent's TodoList state. Other gates (dist quality, build
+        # freshness, feature-completeness) still run below.
+        # 0a. dist quality -- reject bundles that contain two copies of
         #     React. Symptom at runtime: "Cannot read properties of null
         #     (reading 'useContext')" and a blank <div id="root">. Cause:
         #     the agent ran `npm install` from outside the project and
@@ -4483,8 +4473,8 @@ async def _run_deploy_job(
         # contribute) to the project's
         # node_modules/.ojas-verify/verify-report.json. We
         # discover the project by the session's first 8 chars of
-        # its id — same convention as the self-heal in
-        # _try_self_heal_todos.
+        # its id (the short-id convention documented in
+        # `_read_session_verify_report`).
         try:
             report = _read_session_verify_report(job.session_id)
             if report is not None:
@@ -4756,297 +4746,15 @@ def _maybe_rebuild_stale_dist(project_abs):
             f"auto-rebuilt with npm run build (exit 0, {dist_index.stat().st_size} bytes)")
 
 
-def _try_self_heal_todos(session_id: str) -> tuple[bool, str]:
-    """Detect the 'agent finished but forgot to tick its todos' case and
-    auto-mark the open ones as completed in clawd-todos.json.
-
-    The IncompleteBuild guard assumes the agent ticks its own plan as it
-    works. That assumption breaks when the agent is killed by a budget
-    pause, stall detector, model timeout, or transient API error right
-    after finishing — the build chain and smoke test have actually run,
-    the dist is on disk, the verify dbs prove the smoke test mutated
-    real data, but the agent never got to mark `completed`. The user
-    then sees a "Build incomplete" error even though the app is fine.
-
-    Two tiers of evidence, both requiring the session to be idle
-    (no bash log in the last 10 minutes — i.e. the agent is gone):
-
-    Tier 1 (mild) — scaffold / backend / pages / App.tsx are all
-    `completed` and only the finishing tasks are open. Evidence:
-    dist/index.html + verify.db + verify-api.db exist, the api db is
-    newer than verify.db, and the row counts differ in at least one
-    table (the smoke test left a mark).
-    Action: tick only the open todos whose content matches a known
-    "finishing" pattern (verify / smoke / browser / "Build + verify").
-
-    Tier 2 (strong) — the agent didn't tick ANY of its todos. Evidence:
-    tier-1 artifacts PLUS verify-api.db has rows in user-generated
-    tables (users, orders, addresses) that verify.db has zero of —
-    meaning the smoke test ran the full signup → browse → checkout
-    flow. Every page that flow touches (auth, stores, cart, checkout,
-    orders) was exercised end-to-end.
-    Action: tick ALL open todos. The build is done; only the paperwork
-    wasn't. We still mark each one with `[auto-ticked by self-heal]`
-    so the admin can see what happened.
-
-    Returns (healed, reason). Reason is a short human-readable string
-    suitable for logging; the empty string means "no heal" but we
-    always return a reason for the False branch too so the caller can
-    see why we declined.
-    """
-    import json
-    import sqlite3
-
-    # 1. Locate the project dir. Convention: /home/ojas/ojas/<8-char
-    #    short id of session_id>/<project-name>/frontend/. The short
-    #    id is the first 8 hex chars of the full session_id.
-    short_id = session_id[:8]
-    project_root = Path("/home/ojas/ojas") / short_id
-    if not project_root.is_dir():
-        return (False, f"no project root at {project_root}")
-    frontends = list(project_root.glob("*/frontend"))
-    if not frontends:
-        return (False, f"no frontend dir under {project_root}")
-    frontend = frontends[0]
-
-    # 2. Required artifacts: a built dist + both verify dbs.
-    dist_index = frontend / "dist" / "index.html"
-    verify_db = frontend / "node_modules" / ".ojas-verify" / "verify.db"
-    verify_api_db = frontend / "node_modules" / ".ojas-verify" / "verify-api.db"
-    if not dist_index.is_file():
-        return (False, "dist/index.html missing (build never succeeded)")
-    if not verify_db.is_file():
-        return (False, "verify.db missing (verify-deps never ran)")
-    if not verify_api_db.is_file():
-        return (False, "verify-api.db missing (verify:browser never ran)")
-    # NOTE: we deliberately do NOT compare mtimes here. The verify
-    # scripts sometimes create verify-api.db by copying from verify.db
-    # (preserving the source mtime) before running the smoke test; the
-    # file's mtime can therefore be older than verify.db even though
-    # the smoke test wrote to it seconds later. The row-count diff in
-    # step 4 below is the actual ground-truth signal.
-
-    # 3. Session must be idle. The agent's last bash log being > 10 min
-    #    old is the "agent exited the loop" signal — we're sure it's
-    #    not still working. If there are no logs at all, that's a
-    #    weaker signal (session is brand new) but the artifact-level
-    #    evidence above is strong enough on its own.
-    bash_dir = Path("/tmp/ojas-bash") / session_id
-    if bash_dir.is_dir():
-        logs = list(bash_dir.glob("bash-*.log"))
-        if logs:
-            newest = max(logs, key=lambda p: p.stat().st_mtime)
-            age_sec = time.time() - newest.stat().st_mtime
-            if age_sec < 600:
-                return (False, f"session still active (newest bash log {int(age_sec)}s old)")
-
-    # 4. Compare row counts between verify.db (post-seed) and verify-api.db
-    #    (post-smoke-test). The smoke test must have left a mark — if
-    #    the two are byte-identical in row counts, the api db was never
-    #    written to, which means verify:browser didn't actually run.
-    try:
-        with sqlite3.connect(verify_db) as c1, sqlite3.connect(verify_api_db) as c2:
-            def _counts(conn):
-                out = {}
-                for (t,) in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall():
-                    out[t] = conn.execute(
-                        f'SELECT COUNT(*) FROM "{t}"'
-                    ).fetchone()[0]
-                return out
-            seed_counts = _counts(c1)
-            api_counts = _counts(c2)
-    except Exception as e:
-        return (False, f"db inspection failed: {e}")
-
-    if not any(
-        seed_counts.get(t) != api_counts.get(t)
-        for t in set(seed_counts) | set(api_counts)
-    ):
-        return (
-            False,
-            "verify-api.db row counts identical to verify.db "
-            "(smoke test left no mark)",
-        )
-
-    # 5. Tier-2 signal: user-generated tables have rows in api that seed
-    #    lacks. users/orders/addresses being non-zero in api and zero in
-    #    seed = the smoke test ran the full signup → checkout flow. That
-    #    proves every page in that flow was built and working.
-    user_tables = ("users", "orders", "addresses")
-    tier2 = any(
-        api_counts.get(t, 0) > 0 and seed_counts.get(t, 0) == 0
-        for t in user_tables
-    )
-
-    # 6. Open the todos and tick the right ones.
-    todos_path = (
-        Path.home() / ".agent" / "sessions" / session_id / "clawd-todos.json"
-    )
-    try:
-        data = json.loads(todos_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        return (False, f"todos unreadable: {e}")
-    if not isinstance(data, list):
-        return (False, "todos is not a list")
-
-    finish_keywords = (
-        "verify", "smoke", "browser", "build + verify", "build, verify",
-    )
-    ticked = []
-    for t in data:
-        if not isinstance(t, dict):
-            continue
-        if t.get("status") not in ("pending", "in_progress"):
-            continue
-        original = t.get("content") or ""
-        if tier2:
-            # Strong evidence — tick every open todo. Audit trail:
-            # append the marker so the user can see what happened in
-            # the session's todo list later.
-            t["status"] = "completed"
-            t["content"] = original + " [auto-ticked by self-heal: tier-2 e2e smoke-test evidence]"
-            ticked.append(original)
-        else:
-            # Mild evidence — only tick "finishing" tasks. Never tick
-            # "Scaffold …" or "Build backend …" because those need
-            # code-presence checks, not artifact checks.
-            if any(kw in original.lower() for kw in finish_keywords):
-                t["status"] = "completed"
-                t["content"] = original + " [auto-ticked by self-heal: tier-1 dist+verify artifacts]"
-                ticked.append(original)
-
-    if not ticked:
-        return (
-            False,
-            "no open todos matched the heal patterns (scaffold/backend/"
-            "etc. still open and not provable from artifacts)",
-        )
-
-    # 7. Persist the change. Write atomically (write-then-rename) so a
-    #    crash mid-write can't leave the file half-truncated. The agent
-    #    may re-read this file in a future turn — it should always see
-    #    either the old or the new content, never garbage.
-    import os
-    tmp = todos_path.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(tmp, todos_path)
-
-    tier_label = "tier-2 (e2e evidence)" if tier2 else "tier-1 (artifact evidence)"
-    return (
-        True,
-        f"{tier_label}; ticked {len(ticked)} todo(s): {'; '.join(ticked)}",
-    )
+# NOTE: IncompleteBuild / todo-state guard removed by operator request
+# (2026-06-22). The functions below (_try_self_heal_todos and
+# _validate_session_todos) used to be called from the deploy step-0
+# entry point. They are no longer wired up, so a deploy will proceed
+# regardless of the agent's TodoList state. Other gates (dist
+# quality, build freshness, feature-completeness) still run. If you
+# want the guard back, re-add the call in step 0 of _run_deploy_job.
 
 
-def _validate_session_todos(session_id: str) -> None:
-    """Reject deploys from sessions where the agent's TodoList has
-    unfinished items. Catches the failure mode where the agent stops
-    mid-build (budget pause, stall detector, model timeout, transient
-    API error) without completing its plan — the user clicks Deploy
-    and gets an app that renders the StarterDashboard because App.tsx
-    was never overwritten.
-
-    The session's todo list is the agent's own contract with itself:
-    it called TodoWrite to commit to a plan, so leaving items
-    `pending` / `in_progress` at deploy time means the plan was NOT
-    completed — even if some files were written to disk. The build
-    may compile, but the user-facing app will be half-built.
-
-    The check is permissive about static-only apps and templates that
-    never call TodoWrite: if `clawd-todos.json` doesn't exist (or is
-    empty), there is no plan to validate, so we allow deploy. This
-    matches the FreshCart-at-deploy behavior for the scaffold flow.
-
-    Before rejecting, we also try to self-heal: if the on-disk evidence
-    shows the build chain + smoke test actually ran and the session is
-    idle, we auto-tick the open todos as `completed` and allow the
-    deploy. See _try_self_heal_todos for the full rules. This catches
-    the common "agent finished the work but got killed before ticking
-    its todos" case without bypassing the guard for genuine
-    half-finished builds.
-
-    Raises _IncompleteBuildError with a numbered list of unfinished
-    items so the deploy UI can show the user exactly what the agent
-    didn't get to.
-    """
-    import json
-
-    class _IncompleteBuildError(Exception):
-        pass
-
-    try:
-        todos_path = Path.home() / ".agent" / "sessions" / session_id / "clawd-todos.json"
-        if not todos_path.is_file():
-            # No TodoList ever written — scaffold / static-only flow.
-            # The other gates (feature-completeness, build-freshness,
-            # dist quality) still catch the actual build issues.
-            return
-        try:
-            data = json.loads(todos_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # Corrupt / unreadable todo file — don't block deploy on a
-            # storage bug. The other gates will catch the real issues.
-            return
-        if not isinstance(data, list):
-            return
-        open_items = [
-            t for t in data
-            if isinstance(t, dict)
-            and t.get("status") in ("pending", "in_progress")
-        ]
-        if not open_items:
-            return
-
-        # Self-heal: if the on-disk evidence shows the build chain and
-        # smoke test actually ran (and the session is idle), auto-tick
-        # the open todos as completed. This recovers from the common
-        # "agent finished but the todo-update call was the last thing
-        # to get cut off" failure mode without bypassing the guard for
-        # genuinely half-finished builds. Logged at WARNING so the
-        # admin can see it happened; each ticked todo also gets an
-        # `[auto-ticked by self-heal]` marker in its content.
-        healed, reason = _try_self_heal_todos(session_id)
-        if healed:
-            logger.warning(
-                "self-heal: session %s had open todos but on-disk evidence "
-                "shows the agent finished; auto-ticking and allowing "
-                "deploy. reason: %s",
-                session_id, reason,
-            )
-            return
-
-        # Build a numbered list, distinguishing the two statuses so
-        # the user can see what was *started* vs what was *never
-        # attempted*. Order is preserved as in the original file.
-        lines = []
-        for i, t in enumerate(open_items, 1):
-            content = (t.get("content") or "(no description)").strip()
-            status = t.get("status", "pending")
-            lines.append(f"  {i}. [{status}] {content}")
-        raise _IncompleteBuildError(
-            f"Build incomplete: {len(open_items)} of {len(data)} planned "
-            "task(s) are not done. The agent stopped before finishing its "
-            "plan — usually a budget pause (stall detector / timeout / "
-            "token cap) or a transient API error. The current build may "
-            "compile but will render an unfinished app (StarterDashboard "
-            "if App.tsx was never overwritten). Unfinished tasks:\n"
-            + "\n".join(lines)
-            + "\n\nFix: send the agent another message in this session "
-            "asking it to finish the open tasks. Or click Resume if the "
-            "Ojas UI offers it. After the todos are all `completed`, "
-            "redeploy."
-        )
-
-    # Re-raise so the caller (deploy step 0) translates to step=failed.
-    # Wrap in a fresh exception so the deploy job's generic Exception
-    # catch sees a string error, not a wrapped class.
-    except _IncompleteBuildError:
-        raise
 
 
 def _read_session_verify_report(session_id: str) -> dict | None:
@@ -5057,9 +4765,8 @@ def _read_session_verify_report(session_id: str) -> dict | None:
     session) or can't be parsed.
 
     Discovery: the project dir lives at
-    `/home/ojas/ojas/<first-8-chars>/<project-name>/frontend/`
-    — same convention used by `_try_self_heal_todos`. We pick
-    the first matching project dir under the short-id parent.
+    `/home/ojas/ojas/<first-8-chars>/<project-name>/frontend/`.
+    We pick the first matching project dir under the short-id parent.
     If there are multiple, the one whose frontend dir actually
     contains the report wins; ties go alphabetically.
 
