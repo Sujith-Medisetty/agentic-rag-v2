@@ -142,7 +142,6 @@ async def run_turn(
         try/except in run_turn can synthesize the right end-of-turn events
         from a single place."""
         from agents.graph import runner_graph
-        from agents.nodes import reset_run_budget
 
         # Pin the sub-agent + todo stores to THIS session's private dir BEFORE
         # we hand work to the graph. Without this, both stores fall back to
@@ -175,35 +174,24 @@ async def run_turn(
             pass
         set_session_sandbox(workspace, is_root, session_id)
 
-        reset_run_budget(
-            max_iters=max_iterations,
-            max_tokens=0,         # token/time budgets are off by default in web mode
-            max_seconds=0,
-            no_progress_limit=8,
-            session_id=session_id,
-        )
         config = {
             "configurable": {"thread_id": session_id},
             "recursion_limit": (
                 (max_iterations * 2 + 10) if max_iterations > 0 else 100_000
             ),
         }
-        # Append the new user message to BOTH channels: `messages`
-        # (add_messages reducer, appends to the accumulator) and
-        # `live_messages` (REPLACE reducer — we read the prior turn's
-        # working set, append, write the full list). Without this,
-        # `live_messages` stays stale and the LLM fires with the prior
-        # turn's context, never seeing the user's new question.
-        prior_live: list = []
+        # Read the prior turn's working set so we can seed `messages` with the
+        # user's new question on top of it. node_agent will auto-compact
+        # before its next LLM call if the working set is too big.
+        prior_messages: list = []
         try:
-            prior_live = list(
-                runner_graph.get_state(config).values.get("live_messages") or []
+            prior_messages = list(
+                runner_graph.get_state(config).values.get("messages") or []
             )
         except Exception:
             pass
         initial_state = {
-            "messages":        [HumanMessage(content=user_prompt)],
-            "live_messages":   list(prior_live) + [HumanMessage(content=user_prompt)],
+            "messages":        list(prior_messages) + [HumanMessage(content=user_prompt)],
             "task":            user_prompt,
             "workspace":       workspace,
             "repo":            "",
@@ -214,12 +202,6 @@ async def run_turn(
             # Plumbed so node_agent can key the cross-turn
             # maybe_compact / record_llm_input_tokens cache by session.
             "session_id":      session_id,
-            # Fresh todo state for the new turn. The TodoWrite tool
-            # will overwrite `last_todos` after its first call of
-            # this turn. `todo_sync_nudged` resets so the end-of-
-            # task sync gate can fire once on THIS turn if needed.
-            "last_todos":      [],
-            "todo_sync_nudged": False,
         }
         for _ in runner_graph.stream(
             initial_state, config=config, stream_mode="updates",
@@ -296,21 +278,19 @@ async def run_turn(
         try:
             from agents.graph import runner_graph
             cfg = {"configurable": {"thread_id": session_id}}
-            prior_live = list(
-                runner_graph.get_state(cfg).values.get("live_messages") or []
+            prior_msgs = list(
+                runner_graph.get_state(cfg).values.get("messages") or []
             )
             already_present = any(
                 getattr(m, "content", None) == user_prompt
                 and getattr(m, "type", None) == "human"
-                for m in prior_live
+                for m in prior_msgs
             )
             if not already_present:
-                new_live = prior_live + [HumanMessage(content=user_prompt)]
                 runner_graph.update_state(
                     cfg,
                     {
-                        "messages": [HumanMessage(content=user_prompt)],
-                        "live_messages": new_live,
+                        "messages": prior_msgs + [HumanMessage(content=user_prompt)],
                     },
                 )
         except Exception:

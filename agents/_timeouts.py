@@ -1,138 +1,89 @@
 """
-Wall-clock guards for sync code paths that the per-chunk
-`_stream_with_idle_timeout` watchdog (agents/nodes.py) can't see —
-history prep, message assembly, LLM SDK request setup, post-LLM
-bookkeeping, checkpoint writes.
+Per-chunk streaming watchdog.
 
-Public surface:
-  _call_with_wall_clock_guard(fn, timeout_s, label) -> result | raises
+This is the ONLY timeout left in the agent loop:
+  * Streams from the LLM are wrapped in `_stream_with_idle_timeout` so a
+    mid-stream stall (TCP freeze, provider deadlock, silent socket drop)
+    raises TimeoutError after `AGENT_LLM_STREAM_IDLE_TIMEOUT_S` of no
+    chunks. The LLM retry layer catches that and retries once.
 
-The agent loop previously had no upper bound on these regions: the
-per-chunk watchdog only protected the LLM stream iteration itself,
-so a hang in pre-stream (e.g. message-assembly on a 1.1 MB msgpack
-checkpoint), post-stream bookkeeping, or a SQLite checkpoint write
-that can't acquire `self.lock` would leave the turn alive but silent
-forever. The two observed incidents ("test-final" / 19 min, and
-"testing..!" / 6+ hours) both sit in these gaps.
+Everything else — wall-clock guards around node bodies, iter caps, token
+caps, checkpoint write budgets — was removed in the 2026-06-22 cleanup.
+The provider timeout (`AGENT_LLM_TIMEOUT_SECS`, default 300s, set on the
+httpx client) is still there but it's a wall-clock ceiling on the
+*individual* HTTP request, not on the agent loop.
 
-The helper is a leaf module so both `agents.nodes` and
-`memory.checkpointer` can import it without a cycle — the latter
-already imports from `memory.checkpointer`, so it cannot import from
-`agents.nodes`.
+Tool execution timeouts live inside each tool (bash.py, file_ops.py, …)
+and are not affected by this module.
 """
 
 from __future__ import annotations
 
-import contextvars
-import logging
-import threading
+import queue as _queue
+import threading as _threading
+import time
+import os
+import sys
 
 
-# Env-var names. Match the existing family split:
-#   AGENT_* — per-call knobs that the LLM-call author tunes
-#     (see agents/nodes.py AGENT_LLM_TIMEOUT_SECS / _RETRY_* / _STREAM_IDLE_TIMEOUT_S)
-#   OJAS_* — system-resource knobs the storage / memory layer tunes
-#     (see memory/checkpointer.py OJAS_AUTO_COMPACT_INPUT_TOKENS / _TRUNCATE_TOOL_RESULT_AT)
-NODE_BODY_TIMEOUT_ENV = "AGENT_NODE_BODY_TIMEOUT_S"
-CHECKPOINT_WRITE_TIMEOUT_ENV = "OJAS_CHECKPOINT_WRITE_TIMEOUT_S"
-
-# 30 min — bounds ONE node_agent invocation (pre-stream prep +
-# _stream_model_call + post-stream bookkeeping). The old 600s default
-# was too tight: a complex build turn (long history → maybe_compact →
-# slow-but-alive LLM stream → bookkeeping) routinely hits 10+ minutes
-# and the timeout fires mid-turn, surfacing as the cryptic
-# "✗ Error: node_agent exceeded wall-clock budget 600.0s". 30 min
-# gives a 3x safety margin over the realistic worst case (a single
-# maybe_compact + LLM call on a 50K-token history takes ~5-8 min).
-# Override per-deployment via AGENT_NODE_BODY_TIMEOUT_S or
-# AgentConfig.node_body_timeout_s.
-DEFAULT_NODE_BODY_TIMEOUT_S = 1800.0
-
-# 30s — a healthy SqliteSaver.put on a local DB takes <100ms (single
-# row, single transaction, simple msgpack). 30s is 300x headroom for
-# slow disk; anything past 30s is a lock conflict or stuck writer.
-DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S = 30.0
-
-_log = logging.getLogger(__name__)
+_LLM_DBG = os.getenv("AGENT_LLM_DEBUG", "").lower() in ("1", "true", "yes")
+_LLM_TAG = "[llm-stream]"
 
 
-def _call_with_wall_clock_guard(fn, timeout_s: float, label: str):
-    """Run a sync call in a daemon thread; raise TimeoutError if it
-    exceeds `timeout_s` wall-clock.
+def _llm_dbg(msg: str) -> None:
+    if _LLM_DBG:
+        print(f"{_LLM_TAG} {msg}", file=sys.stderr, flush=True)
 
-    Used to bound sections of node_agent and CompactingCheckpointer.put
-    that the per-chunk _stream_with_idle_timeout watchdog can't see
-    (history prep, message assembly, LLM SDK request setup, post-LLM
-    bookkeeping, checkpoint writes).
 
-    On timeout, the worker thread is left running (daemon=True so it
-    dies with the process). The hung underlying call — DB read, msgpack
-    encode, provider socket — can't be interrupted from outside. Same
-    caveat as _stream_with_idle_timeout's orphan worker
-    (agents/nodes.py:738-742). Process exit is the only way to free the
-    resource; the next agent turn resumes from the last good checkpoint.
+def _stream_with_idle_timeout(stream_iter, idle_timeout_s: float):
+    """Wrap a sync stream iterator with an idle-timeout watchdog.
 
-    `label` appears in the TimeoutError message and the daemon thread
-    name so journalctl / `pgrep -f` / `py-spy` can attribute the hang.
+    Sync streams can't be timed out cleanly with `asyncio.wait_for` (the
+    iterator isn't a coroutine) and `signal.alarm` doesn't interrupt
+    blocking network IO across threads. So we run the iterator in a
+    daemon worker thread that pushes chunks onto a `queue.Queue`; the
+    main thread pulls with `queue.get(timeout=idle_timeout_s)` and
+    raises `TimeoutError` if no chunk arrives within the window.
 
-    IMPORTANT — ContextVar propagation: this guard wraps the body in a
-    `threading.Thread`, but `contextvars.ContextVar` values do NOT
-    propagate to plain Thread workers by default (they only propagate
-    through `asyncio.run_in_executor()`). The agent's reporter lives
-    in a ContextVar (`agents/reporter.py:_reporter_var`), so without the
-    explicit `copy_context()` below every tool_done / assistant_text /
-    token_update call inside the worker would silently no-op (the
-    default reporter swallows them), and the WebSocket stream would
-    show blank even though the agent ran to completion. `ctx.run(fn)`
-    inside the thread ensures the worker inherits the calling
-    ContextVar state.
-
-    IMPORTANT: this is meant to wrap short-lived sync calls, not to
-    protect callers against malicious or infinite loops in `fn`. The
-    worker thread runs `fn` directly — if `fn` itself spawns further
-    threads, those are NOT covered by the wall-clock budget.
+    Note on the orphan worker: we can't actually cancel the underlying
+    httpx request from the consumer side. When the consumer raises
+    TimeoutError, the worker keeps pulling until the socket dies
+    naturally (the 300s httpx total timeout will eventually fire). The
+    worker is a daemon, so it dies with the agent loop process.
     """
-    # Snapshot the current ContextVar state on the parent thread.
-    # Must happen on the caller side — once we're inside the daemon
-    # thread, copy_context() would only see the worker's empty
-    # context (which is exactly the bug we're fixing).
-    ctx = contextvars.copy_context()
-    holder: list = []
+    q: "_queue.Queue[tuple]" = _queue.Queue(maxsize=1024)
+    _start_t = time.monotonic()
+    _llm_dbg(f"START idle_timeout_s={idle_timeout_s} stream={type(stream_iter).__name__}")
 
-    def _target() -> None:
+    def _producer() -> None:
         try:
-            # ctx.run executes `fn` with the captured ContextVar
-            # values bound, so reporter / any other context-bound
-            # state inside `fn` resolves correctly. Exceptions
-            # raised by `fn` surface here unchanged.
-            holder.append(("ok", ctx.run(fn)))
-        except BaseException as e:  # noqa: BLE001 — any exception surfaces
-            holder.append(("err", e))
+            for chunk in stream_iter:
+                q.put(("chunk", chunk))
+        except BaseException as e:  # noqa: BLE001 — surface to consumer
+            q.put(("error", e))
+        finally:
+            q.put(("done", None))
 
-    t = threading.Thread(target=_target, daemon=True, name=f"ojas-guard-{label}")
+    t = _threading.Thread(target=_producer, daemon=True, name="ojas-llm-stream")
     t.start()
-    t.join(timeout=timeout_s)
-    if t.is_alive():
-        # Log the wall-clock breach on the main thread. The worker's
-        # logging is racy with our timeout message and useless once the
-        # worker is hung on a socket/DB call — it can't get back to
-        # Python to emit anything. The WARNING is filterable in
-        # journalctl: `journalctl -u ojas-backend | grep wall-clock-guard`
-        _log.warning(
-            "[wall-clock-guard] %s exceeded %.1fs — raising TimeoutError; "
-            "worker thread %s left as orphan daemon",
-            label, timeout_s, t.name,
-        )
-        raise TimeoutError(f"{label} exceeded wall-clock budget {timeout_s}s")
-    if not holder:
-        # Defensive — shouldn't happen. The thread either sets `holder`
-        # (ok or err) or times out (t.is_alive()). If we got here the
-        # thread exited cleanly without populating `holder` — fail loud
-        # rather than return None, which would mask the actual bug.
-        raise RuntimeError(
-            f"{label} produced no result (worker thread exited cleanly with no return)"
-        )
-    kind, payload = holder[0]
-    if kind == "err":
-        raise payload
-    return payload
+
+    while True:
+        try:
+            kind, payload = q.get(timeout=idle_timeout_s)
+        except _queue.Empty:
+            _llm_dbg(
+                f"idle {idle_timeout_s}s — no chunk received "
+                f"(producer_alive={t.is_alive()})"
+            )
+            raise TimeoutError(
+                f"LLM stream idle for {idle_timeout_s}s — no chunk received"
+            )
+
+        if kind == "done":
+            return
+        if kind == "error":
+            # Re-raise the producer's exception verbatim — the retry layer
+            # catches transient shapes and lets poison-pill errors bubble.
+            raise payload
+
+        yield payload

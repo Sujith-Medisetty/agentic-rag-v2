@@ -22,11 +22,6 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata
-from agents._timeouts import (
-    _call_with_wall_clock_guard,
-    DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S,
-    CHECKPOINT_WRITE_TIMEOUT_ENV,
-)
 
 # LLM-reported input_tokens from the most recent call (per-context).
 # The local `len//4` estimator underestimates by 5-6× (no system prompt,
@@ -806,10 +801,6 @@ class CompactingCheckpointer(SqliteSaver):
         db_path = Path.home() / ".agent" / "checkpoints.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        # Explicit super(SubClass, self) form — robust against refactors that
-        # move this body into a closure (where bare `super()` would raise
-        # `RuntimeError: super(): no arguments` because the implicit
-        # `__class__` cell is missing outside a method).
         super(CompactingCheckpointer, self).__init__(conn)
 
     def put(
@@ -823,73 +814,31 @@ class CompactingCheckpointer(SqliteSaver):
 
         Safety net only — the primary compaction now happens in
         `maybe_compact()` called from the agent loop before each LLM call.
-
-        Wall-clock guarded: the body runs inside _call_with_wall_clock_guard
-        with a budget of OJAS_CHECKPOINT_WRITE_TIMEOUT_S (default 30s). The
-        base SqliteSaver holds `self.lock` for the full INSERT+commit, so a
-        stuck thread on the other end of that lock stalls us indefinitely on
-        `acquire()` — that's the failure mode for the "testing..!" stall
-        (6+ hours of no new checkpoints after the LLM call completed
-        cleanly). On timeout, TimeoutError bubbles out of the LangGraph
-        stream into `run_turn:318`'s `except Exception` arm, which fires the
-        full error pipeline (`reporter.error` + `assistant_text(done=True)`
-        + persisted `[error]` + `turn_summary`). The previous good
-        checkpoint is preserved — the next user message resumes from it.
-
-        Why hard-fail (raise) not soft-fail (synthesize a config pointing at
-        the parent checkpoint)? Soft-fail would tell LangGraph the write
-        succeeded when it didn't — the next node invocation would re-execute
-        from the parent checkpoint, potentially re-triggering the same hang.
-        Hard-fail aborts the turn cleanly; the next attempt's first
-        checkpoint write is on a fresh execution that doesn't share the stuck
-        lock-holder.
+        No wall-clock guard here: the underlying SQLite write is local and
+        takes <100ms on a healthy disk; if it ever does hang, the
+        LangGraph stream will surface the underlying error through the
+        normal run_turn exception path.
         """
-        try:
-            timeout_s = float(
-                os.getenv(
-                    CHECKPOINT_WRITE_TIMEOUT_ENV,
-                    str(DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S),
+        ckpt = checkpoint
+        messages = ckpt.get("channel_values", {}).get("messages", [])
+
+        # Over the token threshold → compact. (_compact_messages no-ops on
+        # a ≤1-message history, so no count guard is needed here.)
+        if _estimate_tokens(messages) >= _auto_compact_threshold():
+            todos = ckpt.get("channel_values", {}).get("last_todos", [])
+            compacted = _compact_messages(messages, todos)
+            removed = len(messages) - len(compacted)
+            if removed > 0:
+                logging.getLogger(__name__).info(
+                    "auto-compact (safety net): %d messages summarised, ~%d tokens freed",
+                    removed, removed * 200,
                 )
-                or DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S
-            )
-        except ValueError:
-            timeout_s = DEFAULT_CHECKPOINT_WRITE_TIMEOUT_S
-        timeout_s = max(1.0, timeout_s)
+            ckpt = {
+                **ckpt,
+                "channel_values": {
+                    **ckpt.get("channel_values", {}),
+                    "messages": compacted,
+                },
+            }
 
-        def _do_put() -> dict:
-            # Bind the outer-scope `checkpoint` to a fresh local name. The
-            # body used to reassign to `checkpoint` directly, which made
-            # Python treat the name as a LOCAL for the whole inner function —
-            # so the first read below raised UnboundLocalError before the
-            # assignment ever ran (`cannot access local variable 'checkpoint'
-            # where it is not associated with a value`). That bug aborted
-            # every checkpoint write and surfaced as the "task abandoned
-            # mid-build" / "deploy_step fails after the agent thinks it
-            # finished" symptom on the wire.
-            ckpt = checkpoint
-            messages = ckpt.get("channel_values", {}).get("messages", [])
-
-            # Over the token threshold → compact. (_compact_messages no-ops on a
-            # ≤1-message history, so no count guard is needed here.)
-            if _estimate_tokens(messages) >= _auto_compact_threshold():
-                todos = ckpt.get("channel_values", {}).get("last_todos", [])
-                compacted = _compact_messages(messages, todos)
-                removed = len(messages) - len(compacted)
-                if removed > 0:
-                    logging.getLogger(__name__).info(
-                        "auto-compact (safety net): %d messages summarised, ~%d tokens freed",
-                        removed, removed * 200,
-                    )
-                ckpt = {
-                    **ckpt,
-                    "channel_values": {
-                        **ckpt.get("channel_values", {}),
-                        "messages": compacted,
-                    },
-                }
-
-            return super(CompactingCheckpointer, self).put(config, ckpt, metadata, new_versions)
-
-        return _call_with_wall_clock_guard(
-            _do_put, timeout_s, label="checkpoint_put"
-        )
+        return super(CompactingCheckpointer, self).put(config, ckpt, metadata, new_versions)
