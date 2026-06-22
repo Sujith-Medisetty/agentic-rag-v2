@@ -272,16 +272,136 @@ function substitutePathParams(pathTemplate, pathParams, index) {
 // request goes out unauthenticated. When a future template adds
 // securitySchemes (e.g. bearer JWT via OAuth2 password flow),
 // wire the signup + token-grant sequence here.
-async function maybeAuthenticate(spec) {
+// ---------------------------------------------------------------------------
+// Auth-aware request
+// ---------------------------------------------------------------------------
+// When the spec declares securitySchemes (e.g. bearer JWT via
+// OAuth2 password flow), we perform a signup + login dance to
+// obtain a real token, then attach it to every protected
+// request. This turns 401s on protected endpoints into real
+// 2xx/4xx signal — the same auth flow a real user would
+// experience.
+//
+// The Ojas fullstack template currently ships two auth
+// shapes:
+//   1. Pydantic OAuth2 password flow — POST /auth/signup then
+//      POST /auth/login, capture the bearer from the response.
+//   2. A custom "send signup body with email + password, get
+//      a token back" shape (some templates use this).
+//
+// We try (1) first, then (2) as a fallback. The
+// `firstAuthRoute()` helper walks the spec for the first path
+// containing "auth" + the appropriate method, since the exact
+// route name varies by template.
+function firstAuthPath(spec, suffix) {
+  for (const [path, methods] of Object.entries(spec.paths || {})) {
+    if (path.includes(suffix)) {
+      for (const m of ["post", "POST"]) {
+        if (methods[m]) return path;
+      }
+    }
+  }
+  return null;
+}
+
+function extractToken(body) {
+  if (!body || typeof body !== "object") return null;
+  // Common token fields: access_token, token, jwt, bearer
+  for (const k of ["access_token", "token", "jwt", "bearer", "auth_token"]) {
+    if (typeof body[k] === "string" && body[k].length > 0) return body[k];
+  }
+  return null;
+}
+
+async function maybeAuthenticate(spec, baseUrl) {
   const schemes = spec.components?.securitySchemes;
   if (!schemes || Object.keys(schemes).length === 0) return null;
-  // TODO: when a template ships auth, do:
-  //   1. POST /auth/signup with TEST_CREDS (or whatever the spec names)
-  //   2. POST /auth/login, capture bearer token from response
-  //   3. return { Authorization: `Bearer ${token}` }
-  // For now we don't know the auth routes' paths, so we fail
-  // closed: return null, the caller marks protected endpoints
-  // as skipped.
+  // If the spec declares bearerAuth / BearerAuth (or any
+  // HTTP-bearer scheme), try to obtain a token. The OpenAPI
+  // 3.x bearer scheme is `type: http, scheme: bearer`.
+  const isBearer = Object.values(schemes).some(
+    (s) =>
+      s &&
+      ((s.type === "http" && s.scheme === "bearer") ||
+        s.type === "oauth2" ||
+        s.type === "apiKey"),
+  );
+  if (!isBearer) return null;
+
+  const signupPath = firstAuthPath(spec, "signup") || firstAuthPath(spec, "register");
+  const loginPath =
+    firstAuthPath(spec, "login") ||
+    firstAuthPath(spec, "signin") ||
+    firstAuthPath(spec, "auth");
+
+  // First: try signup. If the user already exists (from a
+  // previous run) the backend returns 4xx — that's fine,
+  // we move to login.
+  if (signupPath) {
+    try {
+      const r = await fetch(`${baseUrl}${signupPath}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          email: TEST_CREDS.email,
+          password: TEST_CREDS.password,
+          name: TEST_CREDS.name,
+        }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (r.ok) {
+        const body = await r.json().catch(() => null);
+        const token = extractToken(body);
+        if (token) {
+          return { Authorization: `Bearer ${token}` };
+        }
+      }
+    } catch {
+      /* fall through to login */
+    }
+  }
+  // Second: try login. Some templates (apple-photos /
+  // instacart) accept {email, password} and return a token
+  // without a separate signup endpoint — they'll succeed
+  // here. Others (Pydantic OAuth2 password flow) require
+  // form-encoded data — try both shapes.
+  if (loginPath) {
+    for (const body of [
+      // JSON shape: most custom templates
+      JSON.stringify({
+        email: TEST_CREDS.email,
+        password: TEST_CREDS.password,
+      }),
+      // Form shape: Pydantic OAuth2PasswordRequestForm
+      new URLSearchParams({
+        username: TEST_CREDS.email,
+        password: TEST_CREDS.password,
+      }).toString(),
+    ]) {
+      const isForm = body.startsWith("username=");
+      try {
+        const r = await fetch(`${baseUrl}${loginPath}`, {
+          method: "POST",
+          headers: {
+            "content-type": isForm
+              ? "application/x-www-form-urlencoded"
+              : "application/json",
+          },
+          body,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+        if (r.ok) {
+          const respBody = await r.json().catch(() => null);
+          const token = extractToken(respBody);
+          if (token) {
+            return { Authorization: `Bearer ${token}` };
+          }
+        }
+      } catch {
+        /* try the next body shape */
+      }
+    }
+  }
   return null;
 }
 
@@ -302,7 +422,16 @@ function expectedSuccessStatuses(method) {
 // Returns null for endpoints with no body (GET, DELETE, etc.).
 // Returns { skip: true, reason } if the body requires fixtures
 // we can't synthesise.
-function buildBody(operation, spec) {
+//
+// `realIdsByName` (optional) is a Map<resourceName, id[]>
+// populated by main() from real GETs to the list endpoints.
+// If provided, we walk the synthesized body for FK-shaped
+// fields (suffixed `_id`, integer type) and substitute real
+// IDs from the matching resource. This kills the largest
+// class of false-positives where the schema is technically
+// valid but the body would have a non-existent FK and the
+// endpoint returns 500 from the FK constraint.
+function buildBody(operation, spec, realIdsByName) {
   const rb = operation.requestBody;
   if (!rb) return { body: null };
   const jsonContent = rb.content?.["application/json"];
@@ -315,6 +444,42 @@ function buildBody(operation, spec) {
   const value = generateValue(schema, spec, new Set(), 0);
   if (!value || typeof value !== "object") {
     return { body: value };
+  }
+  // FK substitution pass: walk every value-shaped field in
+  // the body. If the field name ends in `_id` and we have a
+  // real ID for the corresponding resource, swap it in.
+  // Examples:
+  //   {product_id: 1, qty: 2}            (cart/items)
+  //   {store_id: 1, address_id: 4, ...}  (orders)
+  //   {album_id: 2, photo_ids: [1,2]}    (albums)
+  if (realIdsByName && realIdsByName.size > 0) {
+    for (const [k, v] of Object.entries(value)) {
+      if (!/_id$/.test(k) && !/_ids$/.test(k)) continue;
+      // Derive resource name from field: `product_id` → "product",
+      // `photo_ids` → "photo", `user_id` → "user". Singularise by
+      // stripping the trailing `s` for `*_ids` arrays.
+      let resource = k.replace(/_ids?$/, "");
+      // Some schemas use names that don't match the URL segment
+      // 1:1 — `product_ids` (array) is for the `/products` list,
+      // singular `product_id` is for `/products/{id}`. Both work
+      // because the resource name is the URL segment prefix.
+      const candidates = [resource, resource + "s"];
+      let realIds = null;
+      for (const c of candidates) {
+        if (realIdsByName.has(c)) {
+          realIds = realIdsByName.get(c);
+          resource = c;
+          break;
+        }
+      }
+      if (!realIds || realIds.length === 0) continue;
+      if (Array.isArray(v)) {
+        // array of ids: use up to 3 real ids
+        value[k] = realIds.slice(0, Math.min(3, realIds.length));
+      } else {
+        value[k] = realIds[0];
+      }
+    }
   }
   // Check if EVERY required field is a fixture field — if so,
   // skip rather than send a body of "verify-fixture-…" strings
@@ -360,17 +525,33 @@ async function sendRequest({ method, url, body, headers }) {
   try {
     const res = await fetch(url, init);
     let parsed = null;
+    let rawText = null;
     const ct = res.headers.get("content-type") || "";
     if (ct.includes("application/json")) {
       try {
         parsed = await res.json();
       } catch {
-        parsed = null;
+        // JSON parse failed — fall through and capture raw
+        // text so the failure message shows the body the
+        // server actually sent (e.g. an HTML error page or
+        // a Python traceback).
       }
     }
-    return { status: res.status, body: parsed };
+    // Always read the body as text too. Used for failure
+    // reporting on non-2xx responses where the server might
+    // have returned an HTML error page or a stack trace
+    // rather than JSON. Capped to 500 chars to keep the
+    // failure message readable.
+    if (!parsed || res.status >= 400) {
+      try {
+        rawText = (await res.text()).slice(0, 500);
+      } catch {
+        /* ignore */
+      }
+    }
+    return { status: res.status, body: parsed, rawText };
   } catch (e) {
-    return { status: 0, body: null, error: e instanceof Error ? e.message : String(e) };
+    return { status: 0, body: null, rawText: null, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -408,7 +589,7 @@ async function exerciseEndpoint({ method, path, operation }, baseUrl, spec, auth
   // Build body (POST/PUT/PATCH)
   let body = null;
   if (["post", "put", "patch"].includes(method)) {
-    const built = buildBody(operation, spec);
+    const built = buildBody(operation, spec, realIdsByName);
     if (built.skip) return { kind: "skipped", reason: built.reason };
     body = built.body;
   }
@@ -427,9 +608,25 @@ async function exerciseEndpoint({ method, path, operation }, baseUrl, spec, auth
 
   const expected = expectedSuccessStatuses(method);
   if (!expected.includes(primary.status)) {
+    // Build an informative failure message. The body
+    // (parsed JSON or raw text) tells the user WHY the
+    // endpoint failed — was it a 500 with a stack trace? a
+    // 401 with a "missing token" hint? a 422 with a
+    // validation error? Without the body, all 5xx look
+    // identical and the user has to re-run the request by
+    // hand to debug.
+    let detail = "";
+    if (primary.body && typeof primary.body === "object") {
+      const json = JSON.stringify(primary.body);
+      detail = json.length > 300 ? json.slice(0, 300) + "…" : json;
+    } else if (primary.rawText) {
+      detail = primary.rawText;
+    } else if (primary.body) {
+      detail = String(primary.body).slice(0, 300);
+    }
     return {
       kind: "failed",
-      reason: `expected ${expected.join("/")}, got ${primary.status} (${JSON.stringify(primary.body)?.slice(0, 200) ?? ""})`,
+      reason: `expected ${expected.join("/")}, got ${primary.status}: ${detail || "(no body)"}`,
     };
   }
 
@@ -595,7 +792,7 @@ async function main() {
     }
 
     // Optional auth.
-    const authHeaders = await maybeAuthenticate(spec);
+    const authHeaders = await maybeAuthenticate(spec, API_BACKEND_URL);
     const authHeader = authHeaders
       ? Object.fromEntries(
           Object.entries(authHeaders).map(([k, v]) => [k.toLowerCase(), v]),

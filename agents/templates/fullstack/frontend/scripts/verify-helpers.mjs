@@ -163,6 +163,54 @@ async function bootFullstack(opts = {}) {
   );
   procs.push(uvicorn);
 
+  // Sanity-check: if the port was already in use (a leftover
+  // process from a previous run, or another local service),
+  // the spawn here won't fail — uvicorn will just print
+  // "address already in use" to stderr and exit. The verify
+  // scripts then fetch /openapi.json from that port and
+  // get the WRONG spec (the leftover backend's spec), and
+  // every test is meaningless. Detect this case by waiting
+  // a beat, then checking the actual port. If something
+  // else is on the port, fail loudly with a clear message.
+  // We bind a quick probe socket to the port: if it fails
+  // AND uvicorn isn't our process, abort.
+  await wait(500);
+  // uvicorn logs "Uvicorn running on http://127.0.0.1:PORT"
+  // to stdout. If we don't see that within ~1s, the spawn
+  // failed (port collision, missing venv, syntax error in
+  // main.py, etc.). Health-check /health to confirm it's
+  // OUR backend (not a leftover from a prior run).
+  const healthUrl = `${backendUrl}/health`;
+  let healthOk = false;
+  for (let i = 0; i < 30; i++) {
+    try {
+      const r = await fetch(healthUrl, {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (r.ok) {
+        healthOk = true;
+        break;
+      }
+    } catch {
+      /* not up yet */
+    }
+    await wait(200);
+  }
+  if (!healthOk) {
+    // Kill any process we spawned and bail. The user sees
+    // a clear error instead of a silent wrong-spec run.
+    try {
+      uvicorn.kill("SIGKILL");
+    } catch {}
+    throw new Error(
+      `bootFullstack: backend did not come up at ${backendUrl}/health ` +
+        `within 6s. Common causes: port ${new URL(backendUrl).port} is ` +
+        `already in use (a leftover process from a prior run — kill ` +
+        `it with \`lsof -i :${new URL(backendUrl).port}\`); the venv ` +
+        `at ${pythonBin} is missing uvicorn; or main.py has a syntax error.`,
+    );
+  }
+
   // Frontend: tiny static+proxy server. We don't use
   // `vite preview` because (a) the Ojas template's vite.config.ts
   // has no proxy entry, so API calls would hit vite's SPA
