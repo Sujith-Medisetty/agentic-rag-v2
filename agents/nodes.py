@@ -1602,8 +1602,12 @@ def node_agent(state: RunnerState) -> dict:
     if pause is not None:
         return _handle_budget_pause(pause)
 
-    # Read the timeout once per node invocation. Defensive parsing: bad env
-    # values fall back to the default rather than crashing the turn.
+    # Read the timeout once per node invocation. Tunable via the
+    # AGENT_NODE_BODY_TIMEOUT_S env var (AgentConfig merges that var into
+    # `config.node_body_timeout_s` at backend boot — same precedence).
+    # Defensive parsing: bad values fall back to the default rather than
+    # crashing the turn. `max(1.0, …)` keeps the floor sane (a 0-second
+    # budget would trip on the first chatty line).
     try:
         body_timeout_s = float(
             os.getenv(NODE_BODY_TIMEOUT_ENV, str(DEFAULT_NODE_BODY_TIMEOUT_S))
@@ -1675,9 +1679,51 @@ def node_agent(state: RunnerState) -> dict:
             "system_prompt_pair": [static_base, dynamic_suffix],
         }
 
-    return _call_with_wall_clock_guard(
-        _node_agent_body, body_timeout_s, label="node_agent"
-    )
+    try:
+        return _call_with_wall_clock_guard(
+            _node_agent_body, body_timeout_s, label="node_agent"
+        )
+    except TimeoutError:
+        # Wall-clock guard fired — the hung section could be pre-stream
+        # (`_prepare_history` / `maybe_compact`), the SDK request setup,
+        # the LLM stream itself (slow-but-alive), or post-stream bookkeeping.
+        # Before this catch existed, the TimeoutError propagated out of the
+        # LangGraph stream into `run_turn`'s outer `except Exception` and the
+        # turn ended with the cryptic `✗ Error: node_agent exceeded wall-clock
+        # budget 600.0s` — even though the previous tool results had already
+        # landed and the next user message could safely resume from this
+        # checkpoint.
+        #
+        # Synthesise a clear AIMessage so should_continue routes to END at
+        # a clean boundary. The user sees what happened and can simply
+        # re-prompt to resume; the next node_agent call gets a fresh budget.
+        err_text = (
+            f"[turn paused — node_agent exceeded the {int(body_timeout_s)}s "
+            f"wall-clock budget for this model call. The previous tool "
+            f"results are persisted; send another message to resume from "
+            f"here with a fresh budget. Override the budget via the "
+            f"AGENT_NODE_BODY_TIMEOUT_S env var or "
+            f"agent.json:node_body_timeout_s.]"
+        )
+        try:
+            from agents.reporter import get_reporter
+            get_reporter().assistant_text(
+                f"\n\n{err_text}\n\n", done=False,
+            )
+            get_reporter().tool_done(
+                "node_agent", err_text, error=True,
+            )
+        except Exception:
+            pass
+        ai = AIMessage(content=err_text)
+        iterations = int(state.get("iterations", 0)) + 1
+        history = state.get("live_messages") or state.get("messages") or []
+        return {
+            "messages": [ai],
+            "live_messages": list(history) + [ai],
+            "iterations": iterations,
+            "system_prompt_pair": _resolve_system_prompt_pair(state),
+        }
 
 
 def _read_todo_store(session_id: str | None) -> list[dict]:

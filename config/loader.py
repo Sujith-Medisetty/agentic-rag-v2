@@ -69,6 +69,14 @@ class AgentConfig:
     max_run_tokens:    int             = 0
     max_run_seconds:   int             = 0
     no_progress_limit: int             = 8
+    # Wall-clock budget for ONE node_agent invocation (pre-stream + stream +
+    # bookkeeping). 0 means "use the built-in default" (1800s). When the
+    # budget fires, the node synthesises an AIMessage instead of crashing,
+    # so the user sees "turn paused, send a message to resume" instead of
+    # the cryptic "node_agent exceeded wall-clock budget". Tunable via
+    # `node_body_timeout_s` in agent.json or the AGENT_NODE_BODY_TIMEOUT_S
+    # env var.
+    node_body_timeout_s: float         = 0
     workspace:         str             = "."
     sandbox:           SandboxConfig   = field(default_factory=SandboxConfig)
     hooks:             HookConfig      = field(default_factory=HookConfig)
@@ -154,6 +162,13 @@ def _merge_json_config(config: AgentConfig, path: Path) -> None:
         config.max_run_seconds = int(data["max_run_seconds"])
     if "no_progress_limit" in data:
         config.no_progress_limit = int(data["no_progress_limit"])
+    if "node_body_timeout_s" in data:
+        # Non-negative float seconds; 0 = "use default" in agents/nodes.py.
+        try:
+            v = float(data["node_body_timeout_s"])
+            config.node_body_timeout_s = max(0.0, v)
+        except (TypeError, ValueError):
+            pass
 
     # sandbox config
     if "sandbox" in data:
@@ -209,5 +224,10 @@ def _merge_env(config: AgentConfig) -> None:
         config.max_run_seconds = int(v)
     if v := os.getenv("AGENT_NO_PROGRESS_LIMIT"):
         config.no_progress_limit = int(v)
+    if v := os.getenv("AGENT_NODE_BODY_TIMEOUT_S"):
+        try:
+            config.node_body_timeout_s = max(0.0, float(v))
+        except ValueError:
+            pass
     if v := os.getenv("AGENT_WORKSPACE"):
         config.workspace = v

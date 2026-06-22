@@ -36,10 +36,17 @@ import threading
 NODE_BODY_TIMEOUT_ENV = "AGENT_NODE_BODY_TIMEOUT_S"
 CHECKPOINT_WRITE_TIMEOUT_ENV = "OJAS_CHECKPOINT_WRITE_TIMEOUT_S"
 
-# 10 min — 2x the existing AGENT_LLM_TIMEOUT_SECS=300 default. Catches
-# pre-stream hangs AND slow-but-alive LLM streams the per-chunk
-# _stream_with_idle_timeout (90s default) doesn't catch.
-DEFAULT_NODE_BODY_TIMEOUT_S = 600.0
+# 30 min — bounds ONE node_agent invocation (pre-stream prep +
+# _stream_model_call + post-stream bookkeeping). The old 600s default
+# was too tight: a complex build turn (long history → maybe_compact →
+# slow-but-alive LLM stream → bookkeeping) routinely hits 10+ minutes
+# and the timeout fires mid-turn, surfacing as the cryptic
+# "✗ Error: node_agent exceeded wall-clock budget 600.0s". 30 min
+# gives a 3x safety margin over the realistic worst case (a single
+# maybe_compact + LLM call on a 50K-token history takes ~5-8 min).
+# Override per-deployment via AGENT_NODE_BODY_TIMEOUT_S or
+# AgentConfig.node_body_timeout_s.
+DEFAULT_NODE_BODY_TIMEOUT_S = 1800.0
 
 # 30s — a healthy SqliteSaver.put on a local DB takes <100ms (single
 # row, single transaction, simple msgpack). 30s is 300x headroom for
