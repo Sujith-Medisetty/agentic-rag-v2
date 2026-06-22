@@ -29,8 +29,7 @@ class RunnerState(TypedDict, total=False):
     mode: str  # "cli" | "auto"
 
     # Loop bookkeeping.
-    iterations: int  # number of model calls so far this run
-    max_iterations: int  # soft cap; surfaced via the system prompt
+    iterations: int  # number of model calls so far this run (informational)
 
     # Plumbed from session_runner so the agent loop can key cross-turn
     # state (e.g. maybe_compact's session-scoped cache) by session.

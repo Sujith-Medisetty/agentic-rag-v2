@@ -56,19 +56,13 @@ def session_state_dir(session_id: str) -> Path:
     return base
 
 
-def _default_max_iterations() -> int:
-    # Unlimited by default — this is an autonomous coding agent, and a hard
-    # iteration cap was cutting off legitimate long builds mid-way. The real
-    # safety net is elsewhere:
-    #   - no_progress_limit=8 catches actual stalls (8 identical tool calls)
-    #   - per-LLM-call timeout catches model hangs
-    #   - the cancel button is your manual escape hatch
-    # If you DO want a cap (e.g. cost control in a deployment), set
-    # AGENT_MAX_ITERATIONS to a positive integer. 0 or unset = no cap.
-    try:
-        return max(0, int(os.getenv("AGENT_MAX_ITERATIONS", "0")))
-    except ValueError:
-        return 0
+def _default_recursion_limit() -> int:
+    # LangGraph's recursion_limit guards against the degenerate case
+    # where the model genuinely loops forever (emits tool_calls without
+    # making progress and the LLM/retry layer doesn't catch it).
+    # 100k is high enough that no realistic build will hit it — a full
+    # Google Photos clone takes ~100 iterations.
+    return 100_000
 
 
 async def run_turn(
@@ -76,7 +70,6 @@ async def run_turn(
     project_id: str,
     workspace: str,
     user_prompt: str,
-    max_iterations: int | None = None,
 ) -> None:
     """Persist the user message, run one agent turn end-to-end, persist the
     final assistant text. Designed to be fire-and-forgotten from the HTTP
@@ -90,8 +83,6 @@ async def run_turn(
       the live counters forever; that's how the "still counting after
       error" bug previously happened.
     """
-    if max_iterations is None:
-        max_iterations = _default_max_iterations()
     # Persist the user message immediately so the chat history is up to date
     # even before the model produces anything.
     db.append_message(session_id, "user", user_prompt)
@@ -176,9 +167,7 @@ async def run_turn(
 
         config = {
             "configurable": {"thread_id": session_id},
-            "recursion_limit": (
-                (max_iterations * 2 + 10) if max_iterations > 0 else 100_000
-            ),
+            "recursion_limit": _default_recursion_limit(),
         }
         # Read the prior turn's working set so we can seed `messages` with the
         # user's new question on top of it. node_agent will auto-compact
@@ -198,7 +187,6 @@ async def run_turn(
             "project_context": _load_claude_md(workspace),
             "mode":            "auto",
             "iterations":      0,
-            "max_iterations":  max_iterations,
             # Plumbed so node_agent can key the cross-turn
             # maybe_compact / record_llm_input_tokens cache by session.
             "session_id":      session_id,

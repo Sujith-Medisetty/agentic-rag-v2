@@ -63,13 +63,11 @@ class AgentConfig:
     permission_mode:   PermissionMode  = PermissionMode.FULL_ACCESS
     thinking:          bool            = False
     thinking_budget:   int             = 10000
-    # Loop bookkeeping.
-    max_iterations:    int             = 50
-    # Long-run budgets — removed in the 2026-06-22 cleanup. The agent loop
-    # no longer enforces a hard cap; only the per-chunk streaming idle
-    # timeout (AGENT_LLM_STREAM_IDLE_TIMEOUT_S) and the httpx total
-    # timeout (AGENT_LLM_TIMEOUT_SECS) remain. Set `max_iterations` to
-    # surface a soft cap in the system prompt.
+    # No max_iterations cap. This is a fully autonomous coding agent —
+    # the model decides when it's done. The only safety net is the
+    # LangGraph recursion_limit (set to a fixed high value in
+    # session_runner) for the genuine infinite-loop case where the model
+    # keeps emitting tool_calls without making progress.
     workspace:         str             = "."
     sandbox:           SandboxConfig   = field(default_factory=SandboxConfig)
     hooks:             HookConfig      = field(default_factory=HookConfig)
