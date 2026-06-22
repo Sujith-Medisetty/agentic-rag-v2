@@ -13,12 +13,16 @@ fallback. No `_truncate_*` / `_strip_old_thinking` / `_mask_old_observations`
 helpers. No cache diagnostics.
 
 What's preserved (because it's load-bearing):
-  * streaming model call with a per-chunk idle watchdog — a hung provider
-    socket that stops emitting chunks raises TimeoutError after
-    `AGENT_LLM_STREAM_IDLE_TIMEOUT_S` (default 90s); the retry layer
-    catches that and retries once before bubbling;
-  * httpx total timeout (set on the chat client, `AGENT_LLM_TIMEOUT_SECS`,
-    default 300s) so a fully-frozen request raises instead of hanging;
+  * streaming model call with a per-chunk idle watchdog — the SINGLE
+    timeout on the LLM call. `AGENT_LLM_STREAM_IDLE_TIMEOUT_S`
+    (default 300s) starts ticking the moment the request is sent, so a
+    provider that never sends a byte is caught in 300s. The retry layer
+    (`AGENT_LLM_RETRY_ATTEMPTS=5` = 4 retries, `AGENT_LLM_RETRY_BACKOFF_S=2`)
+    retries transient errors (TimeoutError, ConnectionError, RateLimit)
+    before bubbling;
+  * no httpx total timeout — would be redundant with the per-chunk
+    watchdog (both fire at the same 300s boundary on the same failure
+    shape);
   * auto-compaction via `maybe_compact(messages)` BEFORE each LLM call so
     the turn that crosses the context budget pays for the smaller compacted
     context, not the giant one;
@@ -144,14 +148,19 @@ def _get_llm(
     set by `configure_model()`. Sub-agents (`tools/multi_agent.py`) pass
     overrides so they can use a different model without mutating module
     state.
+
+    Note: no httpx-level timeout is set on the chat client. The single
+    timeout is the per-chunk idle watchdog (AGENT_LLM_STREAM_IDLE_TIMEOUT_S)
+    — once the request is sent, the watchdog's clock starts ticking, so a
+    provider that never sends a byte is caught within `idle_timeout_s`
+    seconds. Adding a second httpx timeout on top would be redundant.
     """
     eff_provider = (provider or _provider).lower()
     eff_model = model or _model
     eff_thinking = _thinking if thinking is None else thinking
-    timeout = float(os.getenv("AGENT_LLM_TIMEOUT_SECS", "300") or 300)
 
     if eff_provider == "anthropic":
-        kwargs = {"model": eff_model, "streaming": streaming, "timeout": timeout}
+        kwargs = {"model": eff_model, "streaming": streaming}
         if eff_thinking:
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": _thinking_budget}
         from langchain_anthropic import ChatAnthropic
@@ -166,7 +175,7 @@ def _get_llm(
         base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
         return ChatOpenAI(
             model=eff_model, api_key=api_key, base_url=base_url,
-            streaming=streaming, timeout=timeout,
+            streaming=streaming,
             # OpenAI-compatible streaming hides usage by default — without
             # this, `usage_metadata` is empty on every AIMessage and the
             # per-call token_update event never fires. `stream_usage=True`
@@ -183,7 +192,7 @@ def _get_llm(
             )
         kwargs = {
             "model": eff_model, "api_key": api_key,
-            "streaming": streaming, "timeout": timeout,
+            "streaming": streaming,
             "stream_usage": True,
         }
         if base_url:
@@ -257,10 +266,17 @@ class _ThinkingTagSplitter:
 # NOT retried (would mask a bug):
 #   - 4xx / BadRequest / Auth errors / ValueError — won't succeed on retry.
 # Env knobs:
-#   AGENT_LLM_RETRY_ATTEMPTS        total attempts incl. initial (default 2 = 1 retry)
+#   AGENT_LLM_RETRY_ATTEMPTS        total attempts incl. initial (default 5 = 4 retries).
+#                                    Bumped from 2 for autonomous builds where one
+#                                    transient provider blip shouldn't kill the turn.
 #   AGENT_LLM_RETRY_BACKOFF_S       seconds to sleep before retry (default 2.0)
 #   AGENT_LLM_STREAM_IDLE_TIMEOUT_S raise TimeoutError if no chunk arrives within N
-#                                    seconds (default 90).
+#                                    seconds (default 300). This is the SINGLE
+#                                    timeout on the LLM call — the clock starts
+#                                    ticking the moment the request is sent, so it
+#                                    catches both "no response ever" and "stalled
+#                                    mid-stream". No httpx total on top — would
+#                                    be redundant.
 #   AGENT_LLM_DEBUG                 set to 1 to log every LLM-stream chunk to stderr.
 #                                    Filter with `grep '[llm-stream]'`.
 _LLM_DBG = os.getenv("AGENT_LLM_DEBUG", "").lower() in ("1", "true", "yes")
@@ -408,9 +424,9 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage], session_id: 
     reporter = get_reporter()
     _t_call_start = time.monotonic()
 
-    max_attempts = max(1, int(os.getenv("AGENT_LLM_RETRY_ATTEMPTS", "2")))
+    max_attempts = max(1, int(os.getenv("AGENT_LLM_RETRY_ATTEMPTS", "5")))
     backoff_s = max(0.0, float(os.getenv("AGENT_LLM_RETRY_BACKOFF_S", "2.0")))
-    idle_timeout_s = max(1.0, float(os.getenv("AGENT_LLM_STREAM_IDLE_TIMEOUT_S", "90")))
+    idle_timeout_s = max(1.0, float(os.getenv("AGENT_LLM_STREAM_IDLE_TIMEOUT_S", "300")))
     retryable = _get_retryable_exceptions()
 
     aggregate, splitter = _stream_with_retry(

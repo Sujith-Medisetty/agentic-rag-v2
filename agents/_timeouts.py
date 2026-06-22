@@ -8,10 +8,9 @@ This is the ONLY timeout left in the agent loop:
     chunks. The LLM retry layer catches that and retries once.
 
 Everything else — wall-clock guards around node bodies, iter caps, token
-caps, checkpoint write budgets — was removed in the 2026-06-22 cleanup.
-The provider timeout (`AGENT_LLM_TIMEOUT_SECS`, default 300s, set on the
-httpx client) is still there but it's a wall-clock ceiling on the
-*individual* HTTP request, not on the agent loop.
+caps, checkpoint write budgets, httpx total timeouts — was removed in
+the 2026-06-22 cleanup. This single watchdog is the only timeout on
+the LLM call.
 
 Tool execution timeouts live inside each tool (bash.py, file_ops.py, …)
 and are not affected by this module.
