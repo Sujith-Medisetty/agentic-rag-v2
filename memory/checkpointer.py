@@ -853,12 +853,22 @@ class CompactingCheckpointer(SqliteSaver):
         timeout_s = max(1.0, timeout_s)
 
         def _do_put() -> dict:
-            messages = checkpoint.get("channel_values", {}).get("messages", [])
+            # Bind the outer-scope `checkpoint` to a fresh local name. The
+            # body used to reassign to `checkpoint` directly, which made
+            # Python treat the name as a LOCAL for the whole inner function —
+            # so the first read below raised UnboundLocalError before the
+            # assignment ever ran (`cannot access local variable 'checkpoint'
+            # where it is not associated with a value`). That bug aborted
+            # every checkpoint write and surfaced as the "task abandoned
+            # mid-build" / "deploy_step fails after the agent thinks it
+            # finished" symptom on the wire.
+            ckpt = checkpoint
+            messages = ckpt.get("channel_values", {}).get("messages", [])
 
             # Over the token threshold → compact. (_compact_messages no-ops on a
             # ≤1-message history, so no count guard is needed here.)
             if _estimate_tokens(messages) >= _auto_compact_threshold():
-                todos = checkpoint.get("channel_values", {}).get("last_todos", [])
+                todos = ckpt.get("channel_values", {}).get("last_todos", [])
                 compacted = _compact_messages(messages, todos)
                 removed = len(messages) - len(compacted)
                 if removed > 0:
@@ -866,15 +876,15 @@ class CompactingCheckpointer(SqliteSaver):
                         "auto-compact (safety net): %d messages summarised, ~%d tokens freed",
                         removed, removed * 200,
                     )
-                checkpoint = {
-                    **checkpoint,
+                ckpt = {
+                    **ckpt,
                     "channel_values": {
-                        **checkpoint.get("channel_values", {}),
+                        **ckpt.get("channel_values", {}),
                         "messages": compacted,
                     },
                 }
 
-            return super().put(config, checkpoint, metadata, new_versions)
+            return super().put(config, ckpt, metadata, new_versions)
 
         return _call_with_wall_clock_guard(
             _do_put, timeout_s, label="checkpoint_put"
