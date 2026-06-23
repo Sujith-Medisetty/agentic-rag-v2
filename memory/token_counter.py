@@ -203,13 +203,27 @@ class TokenCounter:
         )
 
     def cost(self) -> CostEstimate:
-        """Calculate cost in USD for all tokens used so far."""
+        """Calculate cost in USD for all tokens used so far.
+
+        `self._input` is the GROSS input count (cache_read + cache_creation
+        INCLUDED) — that's the number the UI displays and the diff it shows
+        per turn. For COST, though, the cached portions must be billed at
+        their own (cheaper) rates, not the full input rate, so we subtract
+        them out and price only the truly-new input here. This mirrors the
+        web client's formatCostMath (`new = input − cache_read − cache_write`)
+        exactly, so the server's authoritative cost_usd and the UI's visible
+        token×rate math finally agree. Billing the gross input at the full
+        rate AND the cache counts separately (the old behaviour) double-charged
+        every cached token — inflating the cost the user saw.
+        """
         pricing = _lookup_pricing(self.model)
 
         per_m = 1_000_000  # pricing is per million tokens
 
+        billable_input = max(0, self._input - self._cache_read - self._cache_write)
+
         return CostEstimate(
-            input_cost=(self._input / per_m) * pricing["input"],
+            input_cost=(billable_input / per_m) * pricing["input"],
             output_cost=(self._output / per_m) * pricing["output"],
             cache_write_cost=(self._cache_write / per_m) * pricing["cache_write"],
             cache_read_cost=(self._cache_read / per_m) * pricing["cache_read"],

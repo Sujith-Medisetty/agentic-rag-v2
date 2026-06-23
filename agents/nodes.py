@@ -512,6 +512,15 @@ def _stream_model_call(llm_with_tools, messages: list[BaseMessage], session_id: 
             cw = int((usage.get("cache_creation_input_tokens") or
                       (usage.get("prompt_tokens_details") or {}).get("cache_creation_tokens") or
                       (usage.get("input_token_details") or {}).get("cache_creation") or 0))
+            # `input_tokens` is recorded GROSS (cache_read + cache_creation
+            # INCLUDED) — that's what the UI shows as "in" and what it
+            # subtracts cache from to derive the "new" tokens. The cost,
+            # however, must NOT bill the cached portion at the full input
+            # rate: TokenCounter.cost() does the (input − cache_read −
+            # cache_creation) subtraction so the cached tokens are priced
+            # once, at their own cheaper rate. (Billing gross at the input
+            # rate AND the cache rate was the double-count that made the
+            # server's cost disagree with the UI's own tooltip math.)
             tc.record(TokenUsage(
                 input_tokens=in_delta,
                 output_tokens=out_delta,
@@ -650,7 +659,10 @@ def _prepare_history(state: RunnerState, session_id: str) -> list:
 
 def _publish_context(ai, session_id: str) -> None:
     """One call: tell the UI how full the context is, and feed the
-    auto-compact trigger. Uses the provider's authoritative `input_tokens`."""
+    auto-compact trigger. Uses the provider's authoritative `input_tokens`
+    (the FULL prompt size — cache_read tokens still occupy the context
+    window, so the gauge and the compaction trigger both key off the gross
+    number, never the cache-netted one)."""
     try:
         from agents.reporter import get_reporter
         from memory.checkpointer import CONTEXT_WINDOW_TOKENS
@@ -658,13 +670,22 @@ def _publish_context(ai, session_id: str) -> None:
         input_total = int(usage.get("input_tokens", 0) or 0)
         if input_total <= 0:
             return
+        # Real cache split for the chip tooltip ("X new · Y cache hits").
+        # Subsets of input_total; previously hard-coded to 0 so the tooltip
+        # was always blank even on cache-heavy sessions.
+        cr = int((usage.get("cache_read_input_tokens") or
+                  (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or
+                  (usage.get("input_token_details") or {}).get("cache_read") or 0))
+        cw = int((usage.get("cache_creation_input_tokens") or
+                  (usage.get("prompt_tokens_details") or {}).get("cache_creation_tokens") or
+                  (usage.get("input_token_details") or {}).get("cache_creation") or 0))
         get_reporter().context_update(
             used_tokens=input_total,
             budget_tokens=CONTEXT_WINDOW_TOKENS,
             compacting=False,
             threshold=int(_auto_compact_threshold()),
-            cache_read=0,
-            cache_creation=0,
+            cache_read=cr,
+            cache_creation=cw,
             input_total=input_total,
         )
         record_llm_input_tokens(input_total, session_id=session_id)

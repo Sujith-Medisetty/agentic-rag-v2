@@ -137,16 +137,21 @@ async def run_turn(
         # Pin the sub-agent + todo stores to THIS session's private dir BEFORE
         # we hand work to the graph. Without this, both stores fall back to
         # `Path.cwd()` and every project/session shares one folder — sub-agent
-        # records leak across sessions and deletes leave orphan files forever.
-        # We set the env vars (the existing override hooks in
-        # tools/multi_agent._agent_store_dir and tools/utils._todo_store_path)
-        # right before invoking the graph. The default asyncio executor is
-        # single-threaded so concurrent turns don't race on these env vars in
-        # practice; if you ever raise the executor pool, swap this for a
-        # ContextVar.
+        # records leak across sessions, todo `<system-reminder>`s surface the
+        # WRONG project's plan, and deletes leave orphan files forever.
+        #
+        # These are set as ContextVars (not os.environ). _drive runs inside a
+        # `contextvars.copy_context()` (see the run_in_executor call below), so
+        # the value is private to THIS turn even though the asyncio executor is
+        # a SHARED multi-thread pool — concurrent turns from different sessions
+        # no longer clobber a process-global env var (the bug that made one
+        # session see another's todos/agents). Spawned sub-agent threads
+        # inherit these via copy_context (see tools/multi_agent.run_agent).
+        from tools.utils import set_todo_store_path
+        from tools.multi_agent import set_agent_store_path
         session_root = session_state_dir(session_id)
-        os.environ["CLAWD_AGENT_STORE"] = str(session_root / "clawd-agents")
-        os.environ["CLAWD_TODO_STORE"]  = str(session_root / "clawd-todos.json")
+        set_agent_store_path(session_root / "clawd-agents")
+        set_todo_store_path(session_root / "clawd-todos.json")
 
         # Activate the workspace jail for this turn. Look up the session's
         # user role so root bypasses the jail. The sandbox is per-ContextVar,

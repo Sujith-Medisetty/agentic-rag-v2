@@ -396,20 +396,19 @@ class WebReporter(ProgressReporter):
         cache_creation: int = 0,
         input_total: int = 0,
     ) -> None:
-        # `used_tokens` is the *new* (uncached + writes) tokens the
-        # model processed this turn — already net of cache_read and
-        # cache_creation. The chip's "% used" label is computed
-        # against `threshold` from this number, so a "hi" turn on a
-        # session running at 99.8% cache hit rate shows ~0% (only
-        # 136 new tokens) instead of 154% (the cache-inflated
-        # total). The auto-compact trigger uses the same number, so
-        # chip and trigger stay in lockstep.
+        # `used_tokens` is the FULL prompt size the model processed this
+        # turn (gross — cache_read + cache_creation INCLUDED), because every
+        # one of those tokens occupies a slot in the context window even when
+        # it was served from cache. The chip's "% used" label and the
+        # auto-compact trigger both key off this same gross number, so they
+        # stay in lockstep and the gauge reflects true window occupancy
+        # (a cache hit saves cost + latency, not window space).
         #
-        # `input_total` is the full prompt size (used_tokens +
-        # cache_read + cache_creation) — included in the event so
-        # the chip tooltip can show "X new · Y cache hits"
-        # without the LABEL being the inflated number. 0 if the
-        # provider didn't surface cache fields.
+        # `cache_read` / `cache_creation` are the cached SUBSETS of
+        # `used_tokens`, surfaced so the chip tooltip can break it down as
+        # "X new · Y cache hits" (X = used_tokens − cache_read − cache_creation).
+        # 0 if the provider didn't surface cache fields. `input_total` mirrors
+        # `used_tokens` (kept for backward-compat with older chip builds).
         self._pub("context_update", {
             "used_tokens":   int(used_tokens),
             "compacting":    bool(compacting),

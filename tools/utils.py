@@ -4,6 +4,7 @@ Utility tools — TodoWrite, Sleep, SendUserMessage (Brief).
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -47,10 +48,36 @@ def slugify(text: str, *, max_len: int = 40, allow_underscore: bool = True) -> s
 # ---------------------------------------------------------------------------
 
 def _todo_store_path() -> Path:
-    override = os.environ.get("CLAWD_TODO_STORE")
+    # Per-session isolation lives in a ContextVar, NOT an env var. The agent
+    # loop runs each turn inside its own `contextvars.copy_context()` (see
+    # server.session_runner._drive), so a ContextVar set there is private to
+    # that turn even when several sessions run concurrently in the shared
+    # executor thread-pool. The previous `os.environ["CLAWD_TODO_STORE"]`
+    # approach was process-global: two turns racing in different pool threads
+    # would clobber each other's path, so one session's todo `<system-reminder>`
+    # would surface the OTHER session/project's plan. The env var stays as a
+    # last-resort fallback for non-loop callers (CLI, tests).
+    override = _todo_store_var.get()
     if override:
         return Path(override)
+    env = os.environ.get("CLAWD_TODO_STORE")
+    if env:
+        return Path(env)
     return Path.cwd() / ".clawd-todos.json"
+
+
+# Per-turn/per-session override for the todo store path. Default None →
+# fall back to env var, then cwd (see _todo_store_path).
+_todo_store_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "clawd_todo_store", default=None,
+)
+
+
+def set_todo_store_path(path: str | Path | None) -> None:
+    """Pin the todo store to `path` for the current context. Call this inside
+    the turn's copied context (session_runner._drive) so concurrent sessions
+    stay isolated. Pass None to clear the override."""
+    _todo_store_var.set(str(path) if path else None)
 
 
 @dataclass

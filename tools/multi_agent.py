@@ -15,6 +15,7 @@ installed.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -136,7 +137,27 @@ def _slugify_agent_name(name: str) -> str:
     return slugify(name, max_len=32, allow_underscore=False)
 
 def _agent_store_dir() -> Path:
+    # Session-isolated via a ContextVar — see the same rationale in
+    # tools.utils._todo_store_path. The env var is a fallback for non-loop
+    # callers; the per-turn ContextVar (set in session_runner._drive and
+    # propagated into spawned sub-agent threads via copy_context) is what
+    # keeps concurrent sessions from sharing one `.clawd-agents/` folder.
+    override = _agent_store_var.get()
+    if override:
+        return Path(override)
     return Path(os.getenv("CLAWD_AGENT_STORE", ".clawd-agents"))
+
+
+# Per-turn/per-session override for the sub-agent store dir (see above).
+_agent_store_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "clawd_agent_store", default=None,
+)
+
+
+def set_agent_store_path(path: str | Path | None) -> None:
+    """Pin the sub-agent store dir for the current context. Call inside the
+    turn's copied context so concurrent sessions stay isolated."""
+    _agent_store_var.set(str(path) if path else None)
 
 def _now_secs() -> int:
     return now_secs()
@@ -223,7 +244,22 @@ def _build_subagent_system_prompt(subagent_type: str, model: str) -> str:
     import platform
     from agents.prompt import SystemPromptBuilder, ProjectContext, current_model_name
 
-    ctx = ProjectContext.discover_with_git(os.getcwd(), date.today().isoformat())
+    # Discover project context from THIS session's workspace, not the server's
+    # launch dir. run_agent (our caller) runs in the orchestrator's context
+    # where the per-session sandbox is active, so its workspace is the right
+    # root — os.getcwd() would hand every sub-agent across every session the
+    # same (wrong) project. Fall back to cwd only when no sandbox is bound
+    # (CLI / tests).
+    root = os.getcwd()
+    try:
+        from tools.sandbox import active_sandbox
+        cfg = active_sandbox()
+        if cfg is not None and cfg.workspace:
+            root = str(cfg.workspace)
+    except Exception:
+        pass
+
+    ctx = ProjectContext.discover_with_git(root, date.today().isoformat())
     builder = (
         SystemPromptBuilder()
         .with_os(platform.system() or "unknown", platform.release() or "unknown")
@@ -342,8 +378,17 @@ def run_agent(
         "reporter": sub_reporter,
     }
     try:
+        # Carry the parent turn's context (session-scoped store paths +
+        # sandbox + reporter ContextVars) into the worker thread. A bare
+        # threading.Thread starts with a FRESH, empty context, so the
+        # sub-agent would otherwise fall back to the process-global store
+        # dirs and leak across sessions. copy_context() snapshots the
+        # parent's context now (we're still on the parent's call stack) and
+        # runs the job inside it.
+        _job_ctx = contextvars.copy_context()
         thread = threading.Thread(
-            target=_run_agent_job, args=(job,), name=f"clawd-agent-{agent_id}", daemon=True
+            target=_job_ctx.run, args=(_run_agent_job, job),
+            name=f"clawd-agent-{agent_id}", daemon=True,
         )
         thread.start()
     except Exception as e: # noqa: BLE001
