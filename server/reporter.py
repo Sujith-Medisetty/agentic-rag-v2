@@ -15,8 +15,7 @@ A single SessionBus instance per session_id owns:
 Lifecycle:
   - bus = get_bus(session_id)                  # idempotent — created on first reference
   - bus.bind_loop(asyncio.get_running_loop())  # called from app startup or first WS
-  - reporter = WebReporter(session_id)
-  - set_reporter(reporter)                      # the agent's global progress sink
+  - reporter = WebReporter(session_id)         # bound per-turn via reporter_scope()
   - bus.subscribe(websocket)                    # streams events to that client
 """
 
@@ -24,11 +23,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 import threading
 import time
 
 from agents.reporter import ProgressReporter
 from server import db
+
+
+# Per-event diagnostic trace toggle. Evaluated ONCE at import (not per event)
+# and defaulted OFF — it's a hot-path stderr write. Enable with
+# AGENT_TRACE_EVENTS=1 when debugging the live stream.
+_TRACE_EVENTS = os.getenv("AGENT_TRACE_EVENTS", "0").lower() not in ("0", "", "false", "no")
 
 
 # ============================================================================
@@ -56,12 +63,15 @@ class SessionBus:
     # will re-subscribe from the DB.
     MAX_QUEUE = 1000
 
-    # Event kinds that are safe to drop FIRST under backpressure: high-volume,
-    # coalescable deltas where losing one live frame is cosmetic (the next one
-    # supersedes it, and the full history is in the DB anyway). Lifecycle
-    # events (tool_start/tool_done/file_changed/agent_*/commit_*/turn_summary…)
-    # are NOT in this set, so a slow client can never make a tool silently jump
-    # from "running" to "done" — the tool_start is preserved over a token delta.
+    # Event kinds that are safe to drop FIRST under backpressure: either
+    # high-volume text deltas (assistant_text/thinking_text — a dropped chunk
+    # is recovered verbatim from the DB on reconnect) or low-volume numeric
+    # updates that self-correct (token_update is re-totalled authoritatively at
+    # turn_summary; context_update is replaced by the next LLM call's value).
+    # Lifecycle events (tool_start/tool_done/file_changed/agent_*/commit_*/
+    # turn_summary…) are NOT in this set, so under backpressure a buffered
+    # lifecycle frame is never deleted — a tool can't silently jump from
+    # "running" to "done" (see _evict_one / _enqueue).
     _COALESCABLE = frozenset({
         "assistant_text", "thinking_text", "token_update", "context_update",
     })
@@ -109,11 +119,11 @@ class SessionBus:
         except Exception:
             pass
         # Diagnostic trace — one line per event with sub-second timing and
-        # subscriber count. Wired so we can confirm events ARE being published
-        # in real time and aren't getting buffered. Set AGENT_TRACE_EVENTS=0
-        # to silence once we've confirmed everything works.
-        import os, sys
-        if os.getenv("AGENT_TRACE_EVENTS", "1") != "0":
+        # subscriber count. Off by default (it runs on the per-event hot path
+        # and writes a flushed line to stderr from the agent worker thread, so
+        # leaving it on adds real overhead at ~50-100 events/s). Set
+        # AGENT_TRACE_EVENTS=1 to enable when triaging live-stream issues.
+        if _TRACE_EVENTS:
             try:
                 t = time.strftime("%H:%M:%S") + f".{int(time.time()*1000)%1000:03d}"
                 sub_n = len(self._subscribers)
@@ -188,42 +198,54 @@ class SessionBus:
         """Append `event` to the fan-out queue. Runs ONLY on the event-loop
         thread (scheduled via call_soon_threadsafe), so it is the single place
         the asyncio.Queue is mutated — satisfying asyncio's single-thread
-        contract. On backpressure it evicts one buffered event to make room;
-        the evicted event is still in the DB, so a reconnect replays the gap."""
+        contract. On backpressure it tries to evict a buffered COALESCABLE
+        delta to make room; if the buffer holds only lifecycle events it drops
+        the INCOMING event instead of punching a hole in the buffered lifecycle
+        sequence. Either way the dropped event is still in the DB, so a
+        reconnect (`?since=`) replays the gap."""
         q = self._queue
         if q is None:
             return
-        if q.full():
-            self._evict_one(q)
+        if q.full() and not self._evict_one(q):
+            # Buffer is saturated with lifecycle events and nothing is safe to
+            # drop. Drop the incoming event rather than a buffered one: this
+            # keeps the already-queued lifecycle order intact (no mid-stream
+            # hole) and the incoming event replays from the DB on reconnect. A
+            # client this far behind has already lost live fidelity anyway.
+            self.dropped_count += 1
+            return
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
-            # _evict_one couldn't free a slot (should not happen) — count the
-            # new event as dropped rather than letting put_nowait raise into
-            # the loop's callback handler (which would just log + swallow it).
+            # Shouldn't happen (we just freed a slot) — count rather than raise
+            # into the loop's callback handler.
             self.dropped_count += 1
 
-    def _evict_one(self, q: asyncio.Queue) -> None:
-        """Free exactly one slot in a full queue. Prefer dropping the oldest
-        COALESCABLE delta (token/text/context) over a lifecycle event so a
-        slow client never loses a tool_start/tool_done/file_changed; only if
-        the buffer holds nothing droppable do we fall back to the true oldest.
-        Safe to scan/mutate q's deque here because we're on the loop thread
-        and a full queue has no pending getter to wake."""
+    def _evict_one(self, q: asyncio.Queue) -> bool:
+        """Try to free exactly one slot by dropping the oldest COALESCABLE delta
+        (token/text/context). Returns True if a slot was freed, False if the
+        buffer contains ONLY lifecycle events (tool_start/tool_done/file_changed/
+        agent_*/commit_*/turn_summary…) — which must never be silently dropped
+        for a live client, else a tool could appear to jump straight from
+        "running" to "done". Safe to scan/mutate q's deque here because we're on
+        the loop thread and a full queue has no pending getter to wake."""
         pending = getattr(q, "_queue", None)
         if pending is not None:
             for i, ev in enumerate(pending):
                 if isinstance(ev, dict) and ev.get("kind") in self._COALESCABLE:
                     del pending[i]
                     self.dropped_count += 1
-                    return
-        # Nothing coalescable buffered (or no introspectable deque): drop the
-        # oldest event outright.
+                    return True
+            # Every buffered event is a lifecycle event — refuse to drop one.
+            return False
+        # No introspectable deque (shouldn't happen for asyncio.Queue): fall
+        # back to dropping the oldest so the producer can't deadlock.
         try:
             q.get_nowait()
             self.dropped_count += 1
+            return True
         except Exception:
-            pass
+            return False
 
 
     # ---- consumer side (WebSocket handler) ------------------------------
@@ -270,7 +292,12 @@ def bus_stats() -> list[dict]:
     (queue full, subscribers = 0). Returns a list of small dicts —
     no PII, just the session_id + counters."""
     out = []
-    for sid, bus in _buses.items():
+    # Snapshot the registry under the lock — get_bus/discard_bus mutate _buses
+    # from other threads, and iterating it live can raise "dictionary changed
+    # size during iteration".
+    with _registry_lock:
+        buses = list(_buses.items())
+    for sid, bus in buses:
         qsize = bus._queue.qsize() if bus._queue is not None else 0
         out.append({
             "session_id":     sid,

@@ -26,6 +26,7 @@ import contextvars
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -125,7 +126,11 @@ async def run_turn(
 
     iters = 0
     turn_failed = False
-    _turn_cancelled = False  # set to True when the asyncio Task is cancelled
+    # Cross-thread cancellation flag. Set on the event-loop thread (the
+    # CancelledError handler), read on the worker thread (_drive). A
+    # threading.Event is the correct primitive for that hand-off — a plain
+    # bool would be a data race relying on the GIL for visibility.
+    _turn_cancelled = threading.Event()
 
     def _drive() -> int:
         """Sync body that runs in a worker thread. Returns iteration count.
@@ -188,13 +193,27 @@ async def run_turn(
             "messages":        list(prior_messages) + [HumanMessage(content=user_prompt)],
             "task":            user_prompt,
             "workspace":       workspace,
-            "repo":            "",
             "project_context": _load_claude_md(workspace),
             "mode":            "auto",
             "iterations":      0,
             # Plumbed so node_agent can key the cross-turn
             # maybe_compact / record_llm_input_tokens cache by session.
             "session_id":      session_id,
+            # Per-TURN bookkeeping — MUST be reset every turn. The checkpointer
+            # persists the whole RunnerState per thread_id (session) and only
+            # the keys we pass here overwrite it; any key we omit silently
+            # carries its previous value into the new turn. These five are
+            # "this run" counters/anchors (see agents/state.py), so without an
+            # explicit reset the verify-gate budget (gate_nudges/gate_started_at)
+            # would accumulate across the whole session and eventually make the
+            # gate give up mid-session, and the todo-reminder counters would
+            # reflect session-lifetime tool use instead of this turn's.
+            "tools_since_todo": 0,
+            "tools_total":      0,
+            "gate_action":      "",
+            "gate_nudges":      0,
+            "gate_started_at":  0.0,
+            "todo_finalize_nudges": 0,
         }
         for _ in runner_graph.stream(
             initial_state, config=config, stream_mode="updates",
@@ -205,7 +224,7 @@ async def run_turn(
         # Skip if the asyncio Task was already cancelled (the cancel path
         # handles persistence itself; writing here too creates a duplicate
         # message because the executor thread can't be interrupted mid-run).
-        if _turn_cancelled:
+        if _turn_cancelled.is_set():
             return 0
         final = runner_graph.get_state(config)
         final_text = _final_assistant_text(final.values.get("messages", []))
@@ -242,7 +261,7 @@ async def run_turn(
         # Set the flag BEFORE doing anything else so the still-running
         # executor thread sees it and skips its own db.append_message call
         # (avoiding the duplicate-message-on-cancel bug).
-        _turn_cancelled = True
+        _turn_cancelled.set()
         turn_failed = True
         reporter.error("cancelled by user")
         reporter.assistant_text("", done=True)
@@ -298,31 +317,36 @@ async def run_turn(
         reporter.assistant_text("", done=True)
         db.append_message(session_id, "assistant", f"[error] {msg}")
 
-    # ALWAYS publish turn_summary — success OR failure. Token diff covers
-    # whatever the model actually consumed before this turn ended (zero if
-    # it crashed before the first model call).
-    tc_after = get_token_counter(session_id)
-    after = tc_after.cumulative if tc_after else None
-    cost_after = tc_after.cost() if tc_after else None
-    turn_in   = (after.input_tokens          - before.input_tokens)          if before and after else 0
-    turn_out  = (after.output_tokens         - before.output_tokens)         if before and after else 0
-    turn_cr   = (after.cache_read_tokens     - before.cache_read_tokens)     if before and after else 0
-    turn_cw   = (after.cache_creation_tokens - before.cache_creation_tokens) if before and after else 0
-    # Per-component cost diffs. Use max(0, …) because CostEstimate can
-    # theoretically dip between snapshots if the same model were re-priced
-    # mid-turn (e.g. a tool swapped the active model). Total is the sum of
-    # the four sub-totals, not a separate read of cost_after.total.
-    turn_cost_in  = max(0.0, cost_after.input_cost      - cost_before.input_cost)      if cost_after and cost_before else 0.0
-    turn_cost_out = max(0.0, cost_after.output_cost     - cost_before.output_cost)     if cost_after and cost_before else 0.0
-    turn_cost_cr  = max(0.0, cost_after.cache_read_cost - cost_before.cache_read_cost) if cost_after and cost_before else 0.0
-    turn_cost_cw  = max(0.0, cost_after.cache_write_cost - cost_before.cache_write_cost) if cost_after and cost_before else 0.0
-    turn_cost = turn_cost_in + turn_cost_out + turn_cost_cr + turn_cost_cw
-
-    # `tools_used` should be the count of tool invocations in THIS turn, not
-    # cumulative across the session. ToolMessages-in-state diff is the most
-    # reliable signal (iter count over-counts by 1 for the final no-tool turn).
+    # ALWAYS publish turn_summary — success OR failure. The whole metrics
+    # computation is wrapped so a malformed token/cost snapshot (e.g. a model
+    # swap mid-turn) can NEVER skip turn_summary — the turn-lifecycle invariant
+    # ("exactly one turn_summary per turn") must hold unconditionally, or the
+    # UI's live indicators freeze forever. On any metrics error we emit a
+    # zeroed summary instead.
+    turn_in = turn_out = turn_cr = turn_cw = 0
+    turn_cost_in = turn_cost_out = turn_cost_cr = turn_cost_cw = turn_cost = 0.0
     tool_count = max(0, iters - 1)  # fallback if state lookup fails
     try:
+        tc_after = get_token_counter(session_id)
+        after = tc_after.cumulative if tc_after else None
+        cost_after = tc_after.cost() if tc_after else None
+        turn_in   = (after.input_tokens          - before.input_tokens)          if before and after else 0
+        turn_out  = (after.output_tokens         - before.output_tokens)         if before and after else 0
+        turn_cr   = (after.cache_read_tokens     - before.cache_read_tokens)     if before and after else 0
+        turn_cw   = (after.cache_creation_tokens - before.cache_creation_tokens) if before and after else 0
+        # Per-component cost diffs. Use max(0, …) because CostEstimate can
+        # theoretically dip between snapshots if the same model were re-priced
+        # mid-turn (e.g. a tool swapped the active model). Total is the sum of
+        # the four sub-totals, not a separate read of cost_after.total.
+        turn_cost_in  = max(0.0, cost_after.input_cost      - cost_before.input_cost)      if cost_after and cost_before else 0.0
+        turn_cost_out = max(0.0, cost_after.output_cost     - cost_before.output_cost)     if cost_after and cost_before else 0.0
+        turn_cost_cr  = max(0.0, cost_after.cache_read_cost - cost_before.cache_read_cost) if cost_after and cost_before else 0.0
+        turn_cost_cw  = max(0.0, cost_after.cache_write_cost - cost_before.cache_write_cost) if cost_after and cost_before else 0.0
+        turn_cost = turn_cost_in + turn_cost_out + turn_cost_cr + turn_cost_cw
+
+        # `tools_used` should be the count of tool invocations in THIS turn, not
+        # cumulative across the session. ToolMessages-in-state diff is the most
+        # reliable signal (iter count over-counts by 1 for the final no-tool turn).
         from agents.graph import runner_graph
         _state_after = runner_graph.get_state({
             "configurable": {"thread_id": session_id},
@@ -331,9 +355,6 @@ async def run_turn(
         tool_count = max(0, tools_after - tools_before)
     except Exception:
         pass
-
-    # (Preview watcher teardown removed alongside the watcher itself —
-    # nothing to stop, nothing to flush.)
 
     reporter.turn_summary(
         tools_used           = tool_count,
@@ -359,6 +380,33 @@ async def run_turn(
         try:
             import asyncio as _aio
             _aio.create_task(_maybe_auto_rename(session_id))
+        except Exception:
+            pass
+
+    # Close debug/dev-server ports this session spun up while building. The
+    # agent's dev servers (npm run dev, vite, etc.) are ephemeral verification
+    # helpers — the real preview is the static dist/ served by caddy, and
+    # fullstack deploys use systemd units, neither of which are in
+    # session_processes. Leaving a dev server running leaks its port for the
+    # next build (the bug this closes). Success-path only: a failed/cancelled
+    # turn keeps them so state stays inspectable, and session-delete is the
+    # final backstop. Best-effort; runs in the executor so the SIGTERM grace
+    # doesn't block the loop. Toggle with AGENT_STOP_PORTS_ON_TURN_END=off.
+    if (not turn_failed
+            and os.getenv("AGENT_STOP_PORTS_ON_TURN_END", "on").strip().lower()
+            not in ("0", "off", "false", "no")):
+        try:
+            from tools.process_mgmt import stop_all_session_processes
+            stopped = await loop.run_in_executor(
+                None, stop_all_session_processes, session_id,
+            )
+            if stopped:
+                reporter.tool_done(
+                    "stop-ports",
+                    f"Closed {len(stopped)} dev/debug process(es) this session "
+                    f"started (pids {sorted(stopped)}).",
+                    error=False,
+                )
         except Exception:
             pass
 

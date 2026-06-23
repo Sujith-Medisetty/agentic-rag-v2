@@ -89,12 +89,11 @@ MODEL_PRICING: dict[str, dict] = {
 
 # Provider-family fallback — applied when the exact model name isn't in
 # MODEL_PRICING. Order matters: most specific prefix wins. Used by
-# _lookup_pricing() below. Keep this aligned with the MODEL_PRICING keys.
+# _lookup_pricing() below. These are TRUE PREFIXES only — exact-name matches
+# are handled by MODEL_PRICING first (see _lookup_pricing), so listing a full
+# model name here would be dead. Keep aligned with the MODEL_PRICING families.
 _PROVIDER_FAMILY_PRICING: list[tuple[str, dict]] = [
     # Claude families
-    ("claude-opus-4-8",  {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
-    ("claude-opus-4-7",  {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
-    ("claude-opus-4-6",  {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
     ("claude-opus-",     {"input": 15.00, "output": 75.00, "cache_write": 3.75, "cache_read": 1.50}),
     ("claude-sonnet-",   {"input": 3.00,  "output": 15.00, "cache_write": 0.75, "cache_read": 0.30}),
     ("claude-haiku-",    {"input": 0.80,  "output": 4.00,  "cache_write": 0.20, "cache_read": 0.08}),

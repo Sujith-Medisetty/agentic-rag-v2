@@ -319,9 +319,10 @@ def check_destructive(command: str) -> ValidationResult:
         return ValidationResult.block(
             f"Command '{first_proc}' is forbidden — killing processes from "
             f"inside a build session can take down the Ojas backend (port "
-            f"8765) and crash the agent's own session. If you need to free a "
-            f"port, pick a different port. If you need to stop a dev server "
-            f"you started, use the exact pid from your earlier bash output."
+            f"8765) or another session. To stop a dev/preview server YOU "
+            f"started, use the StopProcess tool: StopProcess(port=<your port>) "
+            f"or StopProcess(pid=<your pid>) — it stops only processes this "
+            f"session spawned. If you just need a free port, pick a different one."
         )
 
     # Indirect kill: a kill-family verb (kill / pkill / killall / fuser -k)

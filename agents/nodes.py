@@ -50,7 +50,6 @@ from __future__ import annotations
 import os
 import platform
 import re
-import sys
 import threading
 import time
 from datetime import date
@@ -114,8 +113,37 @@ def configure_tools(extra_tools: list | None = None) -> None:
     by server.mcp_loader.load_mcp_tools). Called ONCE at server boot;
     passing `[]` or omitting the arg leaves the agent with just the native
     toolset."""
-    global _mcp_tools
+    global _mcp_tools, _combined_tools_cache, _tool_node_cache
     _mcp_tools = list(extra_tools or [])
+    # The toolset is static after boot, so node_agent/node_tools reuse a
+    # cached combined list + ToolNode (see _combined_tools / _get_tool_node)
+    # instead of rebuilding both every turn. Invalidate on (re)configure.
+    _combined_tools_cache = None
+    _tool_node_cache = None
+
+
+# Cached after first build — the native toolset + MCP tools don't change
+# between turns, so there's no reason to reassemble the list and reconstruct
+# a ToolNode on every node_agent / node_tools invocation. configure_tools()
+# clears both.
+_combined_tools_cache: list | None = None
+_tool_node_cache = None
+
+
+def _combined_tools() -> list:
+    """The full toolset (native + MCP), built once and cached."""
+    global _combined_tools_cache
+    if _combined_tools_cache is None:
+        _combined_tools_cache = get_all_tools() + _mcp_tools
+    return _combined_tools_cache
+
+
+def _get_tool_node():
+    """Cached ToolNode over the full toolset (rebuilt only on reconfigure)."""
+    global _tool_node_cache
+    if _tool_node_cache is None:
+        _tool_node_cache = ToolNode(_combined_tools())
+    return _tool_node_cache
 
 
 def get_mcp_tools() -> list:
@@ -277,15 +305,22 @@ class _ThinkingTagSplitter:
     def _partial_tail(s: str) -> int:
         """Length of the trailing substring that could be the START of a think
         tag split across chunk boundaries — an unterminated '<…' (no '>' yet)
-        short enough, and shaped like, a partial tag. Returns 0 otherwise, so
-        ordinary text containing a lone '<' (e.g. `a < b`) is not held back."""
+        shaped like a partial tag. Returns 0 otherwise, so ordinary text
+        containing a lone '<' (e.g. `a < b`) is not held back."""
         lt = s.rfind("<")
         if lt < 0:
             return 0
         tail = s[lt:]
-        if ">" in tail or len(tail) > 10:
-            return 0  # terminated, or too long to be a partial tag
+        if ">" in tail:
+            return 0  # terminated — a complete tag would've matched the regex
+        # Bound on NON-whitespace length: a think-tag prefix has at most 7
+        # non-ws chars ("</think"), so anything longer can't become one and is
+        # ordinary text. Whitespace itself is unbounded (the tag regex tolerates
+        # "<  /  think  >"), so a fragment like "</think          " — which the
+        # old len>10 cap wrongly released and leaked — is held correctly here.
         collapsed = re.sub(r"\s+", "", tail.lower())
+        if len(collapsed) > 7:
+            return 0
         if (
             collapsed in ("<", "</")
             or "<think".startswith(collapsed)
@@ -316,15 +351,9 @@ class _ThinkingTagSplitter:
 #                                    catches both "no response ever" and "stalled
 #                                    mid-stream". No httpx total on top — would
 #                                    be redundant.
-#   AGENT_LLM_DEBUG                 set to 1 to log every LLM-stream chunk to stderr.
-#                                    Filter with `grep '[llm-stream]'`.
-_LLM_DBG = os.getenv("AGENT_LLM_DEBUG", "").lower() in ("1", "true", "yes")
-_LLM_TAG = "[llm-stream]"
-
-
-def _llm_dbg(msg: str) -> None:
-    if _LLM_DBG:
-        print(f"{_LLM_TAG} {msg}", file=sys.stderr, flush=True)
+#   AGENT_LLM_DEBUG                 set to 1 to log every LLM-stream chunk to stderr
+#                                    (handled in agents/_timeouts.py). Filter with
+#                                    `grep '[llm-stream]'`.
 
 
 def _get_retryable_exceptions() -> tuple:
@@ -867,7 +896,7 @@ def node_agent(state: RunnerState) -> dict:
         # Anthropic supports parallel tool_use natively; OpenAI-compatible
         # providers need this flag explicitly.
         bind_kwargs["parallel_tool_calls"] = True
-    llm_with_tools = llm.bind_tools(get_all_tools() + _mcp_tools, **bind_kwargs)
+    llm_with_tools = llm.bind_tools(_combined_tools(), **bind_kwargs)
     ai = _stream_model_call(llm_with_tools, messages, session_id=session_id)
 
     _publish_context(ai, session_id)
@@ -886,7 +915,7 @@ def node_tools(state: RunnerState) -> dict:
     from agents.reporter import get_reporter
     reporter = get_reporter()
 
-    result = ToolNode(get_all_tools() + _mcp_tools).invoke(state)
+    result = _get_tool_node().invoke(state)
 
     for msg in result.get("messages", []):
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -939,9 +968,52 @@ def should_continue(state: RunnerState) -> str:
     return "node_gate"
 
 
+def _todo_finalize_nudge(state: RunnerState) -> dict | None:
+    """When the turn is about to END, return a one-shot force-nudge if the
+    plan still has pending/in_progress items — otherwise None.
+
+    Closes the gap in the periodic todo reminder (which only fires every
+    AGENT_TODO_REMINDER_AFTER tool calls, mid-task): a short final burst of
+    work below that threshold could finish the turn with the panel still
+    showing items as in_progress/pending. This fires exactly once per turn
+    (bounded by `todo_finalize_nudges`) so it can't loop — if the agent
+    leaves items incomplete on purpose (task genuinely unfinished), the
+    second pass through the gate just ends.
+    """
+    if os.getenv("AGENT_TODO_REMINDER", "on").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    if int(state.get("todo_finalize_nudges", 0)) >= 1:
+        return None
+
+    from tools.utils import read_todos
+    todos = read_todos()
+    if not todos:
+        return None  # no plan → nothing to finalize (trivial task)
+    incomplete = [t for t in todos if t.get("status") in ("pending", "in_progress")]
+    if not incomplete:
+        return None  # plan already fully completed — let the turn end
+
+    names = ", ".join((t.get("content") or "?")[:60] for t in incomplete[:6])
+    text = (
+        "<system-reminder>You're about to finish, but the plan still shows "
+        f"{len(incomplete)} item(s) not completed: {names}. If they ARE done, "
+        "call TodoWrite now to mark them completed so the plan matches reality. "
+        "If the task is genuinely unfinished, leave them as-is and finish — but "
+        "the plan must reflect the truth either way. (This is the only "
+        "end-of-turn reminder; it won't fire again this turn.)</system-reminder>"
+    )
+    history = list(state.get("messages") or [])
+    return {
+        "messages": history + [HumanMessage(content=text)],
+        "gate_action": "force",
+        "todo_finalize_nudges": int(state.get("todo_finalize_nudges", 0)) + 1,
+    }
+
+
 def node_gate(state: RunnerState) -> dict:
     """Done-gate: refuse to end the turn while an Ojas app in the workspace
-    hasn't passed `npm run verify` for its current code.
+    hasn't passed `npm run verify` for its current code, AND make sure the
+    todo plan is finalized before the turn truly ends.
 
     Pure filesystem check (agents/verify_gate.py) — it never runs verify
     itself; it nudges the model to run it and fix the first failure. The
@@ -949,22 +1021,26 @@ def node_gate(state: RunnerState) -> dict:
     Bounded by OJAS_VERIFY_GATE_BUDGET_SECS / OJAS_VERIFY_GATE_MAX_NUDGES
     (and the OJAS_VERIFY_GATE=off kill switch) so it can't loop forever —
     when the budget is spent it lets the turn end with a loud warning.
+
+    The verify gate takes priority: only once it would PASS do we run the
+    one-shot todo-finalize check (so we don't nag about the plan while the
+    app is still RED).
     """
     from agents import verify_gate
     from agents.reporter import get_reporter
 
     if not verify_gate.gate_enabled():
-        return {"gate_action": "pass"}
+        return _todo_finalize_nudge(state) or {"gate_action": "pass"}
 
     workspace = state.get("workspace", ".")
     try:
         unverified = verify_gate.find_unverified_apps(workspace)
     except Exception:
         # A gate bug must never wedge the loop — fail open.
-        return {"gate_action": "pass"}
+        return _todo_finalize_nudge(state) or {"gate_action": "pass"}
 
     if not unverified:
-        return {"gate_action": "pass"}
+        return _todo_finalize_nudge(state) or {"gate_action": "pass"}
 
     nudges = int(state.get("gate_nudges", 0))
     started_at = state.get("gate_started_at")
@@ -979,7 +1055,7 @@ def node_gate(state: RunnerState) -> dict:
             )
         except Exception:
             pass
-        return {"gate_action": "pass"}
+        return _todo_finalize_nudge(state) or {"gate_action": "pass"}
 
     force_text = verify_gate.build_force_message(unverified, workspace)
     try:

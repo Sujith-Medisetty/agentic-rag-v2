@@ -238,6 +238,9 @@ class SendMessageInput(BaseModel):
     message: str = Field(description="Progress update or interim finding to send to the user")
 class ToolSearchInput(BaseModel):
     query: str = Field(description="Free-text query, or 'select:Tool1,Tool2' for exact lookup")
+class StopProcessInput(BaseModel):
+    port: int | None = Field(None, description="Stop the dev/preview process listening on this port (must be one THIS session started)")
+    pid: int | None = Field(None, description="Stop this pid + its children (must be a process THIS session started). Omit both port and pid to LIST what you can stop.")
 class PlanModeInput(BaseModel):
     pass # no parameters
 class AgentToolInput(BaseModel):
@@ -1011,8 +1014,13 @@ def TodoWrite(todos: list) -> str:
       Emit the full plan with every item `pending` on turn 1, BEFORE
       any other tool call. The user is forming an opinion in the first
       5 seconds; an empty plan panel then is a UX failure.
-    - MUST call on every state transition. One TodoWrite call per
-      transition, never batched.
+    - MUST call on every state transition, and keep it current (don't let
+      the panel lag reality). BUNDLE the TodoWrite into the SAME assistant
+      turn as the work tool(s) it relates to — it's independent of those
+      tools and costs no extra round-trip when batched alongside them, so
+      emitting it as a turn of its OWN is a wasted round-trip. Never emit a
+      turn whose only tool is TodoWrite — the single exception is the
+      turn-1 plan (when there's no work tool to ride with yet).
     - Skip ONLY for genuinely trivial single-step requests (a one-line
       edit, a single question, a quick lookup). If in doubt, plan it —
       2+ tool calls in the plan = plan it.
@@ -1079,6 +1087,19 @@ def Sleep(duration_ms: int) -> str:
     Prefer polling the actual state (read a file, check a port) over a fixed sleep when possible.
     """
     return f"Slept for {sleep_tool(duration_ms)['slept_ms']}ms."
+@tool("StopProcess", args_schema=StopProcessInput)
+@_safe_tool("StopProcess")
+def StopProcess(port: int | None = None, pid: int | None = None) -> str:
+    """Stop a dev/preview/server process THAT THIS SESSION STARTED — the sanctioned way to free a port you're reusing. Raw `kill`/`pkill`/`fuser` stay blocked (they can take down the Ojas backend or another session); this is how you stop your own dev server instead.
+    You can ONLY stop processes you spawned with `bash(run_in_background=true)` (and their child processes) — never the Ojas backend/frontend/DB, the reverse proxy, or another session's processes; those are refused.
+    Usage:
+    - `StopProcess()` (no args) — list the processes this session started and can stop (pids + ports).
+    - `StopProcess(port=3000)` — stop whatever you started that's listening on port 3000 (e.g. to restart a dev server on the same port).
+    - `StopProcess(pid=12345)` — stop a specific pid you spawned, plus its children.
+    Always launch dev servers with `bash(run_in_background=true)` so they're tracked and stoppable here; otherwise just pick a different free port.
+    """
+    from tools.process_mgmt import stop_process
+    return json.dumps(stop_process(port=port, pid=pid))
 @tool("AskUserQuestion", args_schema=AskUserInput)
 def AskUserQuestion(question: str, options: list | None = None) -> str:
     """Ask the user a single clarifying question and wait for their answer. Asking has a cost — it interrupts the user and is often answerable by looking at the codebase yourself.
@@ -1167,7 +1188,7 @@ def ExitPlanMode() -> str:
     """
     return "Plan mode OFF. Write/edit/bash tools are now available."
 UTILITY_TOOLS = [
-    TodoWrite, Sleep, AskUserQuestion, SendUserMessage, ToolSearch,
+    TodoWrite, Sleep, StopProcess, AskUserQuestion, SendUserMessage, ToolSearch,
     EnterPlanMode, ExitPlanMode,
 ]
 # ============================================================================

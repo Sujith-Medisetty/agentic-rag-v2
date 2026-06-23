@@ -51,7 +51,6 @@ def current_model_name() -> str:
 
 MAX_INSTRUCTION_FILE_CHARS = 4_000
 MAX_TOTAL_INSTRUCTION_CHARS = 12_000
-MAX_GIT_DIFF_CHARS = 50_000
 
 # ---------------------------------------------------------------------------
 # Static sections (verbatim from prompt.rs)
@@ -150,18 +149,21 @@ def get_simple_doing_tasks_section() -> str:
         "editing shell rc) — cross-workspace writes corrupt other projects. "
         "Read-only inspection (ls/which/git config) of any path is fine; WRITES "
         "are workspace-only.",
-        "NEVER KILL PROCESSES OR FREE PORTS. The Ojas backend runs on port 8765; "
-        "killing it (`fuser -k 8765/tcp`, `pkill uvicorn`, `killall python`, "
-        "`kill -9 $(lsof -ti :8765)`) kills the parent agent and crashes your own "
-        "session. The runtime HARD-REFUSES `kill`/`pkill`/`killall`/`fuser`/"
-        "`pgrep` in every permission mode — including a non-protected pid and "
-        "indirect shapes (`xargs kill`, `echo <pid> | kill`). There is never a "
-        "reason to call these. To stop a dev server, end the session (cleanup "
-        "SIGTERMs it) or call the session-end API. If a port is taken, pick a "
-        "DIFFERENT free port (3000–3999 or 5000–9999, never 8765) — e.g. "
-        "`python3 -m http.server 0`, or "
-        "`for p in 3001 3002 3003; do nc -z localhost $p || { PORT=$p; break; }; done`. "
-        "Never free a port by killing what holds it.",
+        "STOPPING PROCESSES / FREEING PORTS — use the StopProcess tool, never raw "
+        "kill. The Ojas backend runs on port 8765; killing it or a sibling process "
+        "(`fuser -k 8765/tcp`, `pkill uvicorn`, `killall python`, "
+        "`kill -9 $(lsof -ti :8765)`) takes down the parent agent and other "
+        "sessions, so the runtime HARD-REFUSES `kill`/`pkill`/`killall`/`fuser`/"
+        "`pgrep` in every permission mode (including indirect shapes like "
+        "`xargs kill`). To stop a dev/preview server YOU started, call "
+        "StopProcess(port=<port>) or StopProcess(pid=<pid>) — it stops ONLY "
+        "processes this session spawned (and their children) and refuses the "
+        "backend, the reverse proxy, and other sessions' processes. Always launch "
+        "long-running servers/watchers with `bash(run_in_background=true)` so "
+        "they're tracked and stoppable (and foreground bash would die at the "
+        "timeout anyway). Call StopProcess() with no args to list what you can "
+        "stop. If you just need a free port, prefer picking a DIFFERENT one "
+        "(3000–3999 or 5000–9999, never 8765) over stopping whatever holds it.",
         "BUILD APPS WITH VITE — NEVER SINGLE-FILE HTML. Never hand-author a root "
         "`index.html`, never inline `<script>` app logic, no \"too small for a "
         "build step\" case. The deploy pipeline needs `dist/index.html` from "
@@ -1156,56 +1158,8 @@ def read_git_status(cwd: Path) -> str | None:
     trimmed = out.strip()
     return trimmed or None
 
-def _truncate_diff(diff: str) -> str:
-    if len(diff) > MAX_GIT_DIFF_CHARS:
-        diff = diff[:MAX_GIT_DIFF_CHARS]
-        diff += "\n\n... [diff truncated — too large for system prompt]"
-    return diff
-
-def read_git_diff(cwd: Path) -> str | None:
-    sections: list[str] = []
-    staged = _read_git_output(cwd, ["diff", "--cached"])
-    if staged is None:
-        return None
-    if staged.strip():
-        sections.append(f"Staged changes:\n{staged.rstrip()}")
-    unstaged = _read_git_output(cwd, ["diff"])
-    if unstaged is None:
-        return None
-    if unstaged.strip():
-        sections.append(f"Unstaged changes:\n{unstaged.rstrip()}")
-    if not sections:
-        return None
-    return _truncate_diff("\n\n".join(sections))
-
-def read_recent_commits(cwd: Path, count: int = 5) -> list[str]:
-    out = _read_git_output(cwd, ["log", f"-{count}", "--oneline", "--no-color"])
-    if not out:
-        return []
-    return [line.strip() for line in out.splitlines() if line.strip()]
-
 def read_current_branch(cwd: Path) -> str | None:
     out = _read_git_output(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])
-    if out is None:
-        return None
-    val = out.strip()
-    return val or None
-
-def read_main_branch(cwd: Path) -> str | None:
-    """Pick the default branch the user would PR against. Tries (in order):
-    origin/HEAD symbolic ref, then a `main` / `master` head. Returns None if
-    neither exists (e.g. fresh repo with only the current branch)."""
-    out = _read_git_output(cwd, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-    if out and out.strip():
-        ref = out.strip()
-        return ref.split("/", 1)[1] if "/" in ref else ref
-    for candidate in ("main", "master"):
-        if _read_git_output(cwd, ["show-ref", "--verify", "--quiet", f"refs/heads/{candidate}"]) is not None:
-            return candidate
-    return None
-
-def read_git_user(cwd: Path) -> str | None:
-    out = _read_git_output(cwd, ["config", "--get", "user.name"])
     if out is None:
         return None
     val = out.strip()
@@ -1216,11 +1170,7 @@ class ProjectContext:
     cwd: Path
     current_date: str
     git_status: str | None = None
-    git_diff: str | None = None
-    recent_commits: list[str] = field(default_factory=list)
     current_branch: str | None = None
-    main_branch: str | None = None
-    git_user: str | None = None
     instruction_files: list[ContextFile] = field(default_factory=list)
     # True when the workspace looks like it contains a frontend (React, Vue,
     # Svelte, Solid, Astro, …). Drives whether the prompt builder includes
@@ -1231,12 +1181,20 @@ class ProjectContext:
     @classmethod
     def discover(cls, cwd: str | Path, current_date: str) -> "ProjectContext":
         cwd = Path(cwd)
-        return cls(
+        ctx = cls(
             cwd=cwd,
             current_date=current_date,
             instruction_files=discover_instruction_files(cwd),
-            is_frontend_project=_workspace_has_frontend_signals(cwd),
         )
+        # `_workspace_has_frontend_signals` is an rglob over the whole tree.
+        # The frontend-UI section is gated on `_is_ojas_workspace OR
+        # is_frontend_project` (see build()), so on an Ojas workspace (the
+        # common case) is_frontend_project is never consulted — skip the walk.
+        # The Ojas check is an O(1) path test; the rglob is O(tree) and ran
+        # every single turn before this guard.
+        if not _is_ojas_workspace(ctx):
+            ctx.is_frontend_project = _workspace_has_frontend_signals(cwd)
+        return ctx
 
     @classmethod
     def discover_with_git(cls, cwd: str | Path, current_date: str) -> "ProjectContext":
@@ -1244,8 +1202,6 @@ class ProjectContext:
         # We only surface `git status` + the current branch in Project context
         # (the agent writes its own files, so a session-start diff / commit log /
         # PR-target branch / git user are stale or irrelevant for a build).
-        # Skipping those reads also avoids four extra git subprocesses per
-        # discovery. The dataclass fields stay (default empty) for back-compat.
         ctx.git_status = read_git_status(ctx.cwd)
         ctx.current_branch = read_current_branch(ctx.cwd)
         return ctx

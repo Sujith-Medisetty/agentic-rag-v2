@@ -172,10 +172,13 @@ def _check_self_destruct(command: str) -> str | None:
          via `ps` and typed it in by hand. This is the second-to-last
          line of defence against a creative LLM.
 
-    The agent can still terminate its OWN children via `kill <pid>` with a
-    specific pid it spawned itself; we only refuse pkill/killall (broad
-    targeting), fuser -k (port-based targeting), and any command that
-    touches a protected pid.
+    The sanctioned way to stop a dev/preview server the session started is
+    the StopProcess tool (StopProcess(port=…) / StopProcess(pid=…)), which
+    kills ONLY processes this session spawned and never a protected pid/port.
+    Raw kill-family verbs in bash stay blocked because static analysis can't
+    prove a string targets a safe pid; these checks are the belt-and-braces
+    layer for compound commands that slip past the validator's first-token
+    block (e.g. `foo && kill <protected-pid>`).
     """
     cmd = command.strip()
     if not cmd:
@@ -185,9 +188,10 @@ def _check_self_destruct(command: str) -> str | None:
     if re.search(r"\bfuser\s+[^|;&]*-k\b", cmd, re.IGNORECASE):
         return (
             "Refused: `fuser -k` is forbidden — it can kill the Ojas "
-            "backend (PID bound to port 8765). If a port is in use, pick "
-            "a DIFFERENT free port for your dev server instead of killing "
-            "what's holding it."
+            "backend (PID bound to port 8765). To free a port YOU bound for "
+            "your own dev server, use StopProcess(port=<port>) (it stops only "
+            "processes this session started). Otherwise pick a DIFFERENT free "
+            "port for your dev server."
         )
 
     # (2) pkill / killall anywhere → block (broad targeting, can hit
@@ -196,17 +200,16 @@ def _check_self_destruct(command: str) -> str | None:
         return (
             "Refused: `pkill` is forbidden — pattern-matching kill can "
             "match the Ojas backend. To stop a dev server you started in "
-            "this session, use `kill <pid>` with the specific pid from "
-            "the bash output; better, start the server with "
-            "`run_in_background=true` so the session-delete cleanup "
-            "handles it automatically."
+            "this session, use StopProcess(port=<port>) or "
+            "StopProcess(pid=<pid>); start servers with "
+            "`bash(run_in_background=true)` so they're tracked and stoppable."
         )
     if re.search(r"\bkillall\b", cmd, re.IGNORECASE):
         return (
             "Refused: `killall` is forbidden — name-matching kill can "
             "match the Ojas backend (`killall uvicorn` would kill us). "
-            "Use `kill <pid>` with a specific pid, or pick a different "
-            "port for your dev server."
+            "To stop a server you started, use StopProcess(port=<port>) or "
+            "StopProcess(pid=<pid>), or pick a different port."
         )
 
     # (4) Bare `kill` (no pid) defaults to "kill the caller's process
@@ -216,8 +219,8 @@ def _check_self_destruct(command: str) -> str | None:
         return (
             "Refused: `kill` with no pid defaults to killing the "
             "caller's process group, which includes the Ojas backend. "
-            "If you need to stop a child you started, use "
-            "`kill <specific-pid>` with the pid from the bash output."
+            "To stop a dev server you started, use StopProcess(port=<port>) "
+            "or StopProcess(pid=<pid>)."
         )
 
     # (3 + 5) Any kill-family verb mentioning a protected port OR a

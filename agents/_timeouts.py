@@ -5,7 +5,8 @@ This is the ONLY timeout left in the agent loop:
   * Streams from the LLM are wrapped in `_stream_with_idle_timeout` so a
     mid-stream stall (TCP freeze, provider deadlock, silent socket drop)
     raises TimeoutError after `AGENT_LLM_STREAM_IDLE_TIMEOUT_S` of no
-    chunks. The LLM retry layer catches that and retries once.
+    chunks. The LLM retry layer catches that and retries (up to
+    AGENT_LLM_RETRY_ATTEMPTS).
 
 Everything else — wall-clock guards around node bodies, iter caps, token
 caps, checkpoint write budgets, httpx total timeouts — was removed in
@@ -44,45 +45,73 @@ def _stream_with_idle_timeout(stream_iter, idle_timeout_s: float):
     main thread pulls with `queue.get(timeout=idle_timeout_s)` and
     raises `TimeoutError` if no chunk arrives within the window.
 
-    Note on the orphan worker: we can't actually cancel the underlying
-    httpx request from the consumer side. When the consumer raises
-    TimeoutError, the worker keeps pulling until the socket dies
-    naturally (the 300s httpx total timeout will eventually fire). The
-    worker is a daemon, so it dies with the agent loop process.
+    Orphan-worker containment: we can't forcibly cancel the underlying
+    httpx request, but when the consumer abandons us (TimeoutError, the
+    generator being closed, or an exception downstream) the `finally`
+    below sets a stop Event. The producer checks it between chunks and on
+    every bounded `put`, so it stops pulling and returns within ~0.5s
+    instead of blocking forever on a full queue holding a socket + thread.
+    Returning from the producer also closes the wrapped iterator, which
+    releases the provider connection. Without this, repeated retries each
+    leaked a stuck producer thread until process exit (there is no httpx
+    total timeout to reap them).
     """
     q: "_queue.Queue[tuple]" = _queue.Queue(maxsize=1024)
+    stop = _threading.Event()
     _start_t = time.monotonic()
     _llm_dbg(f"START idle_timeout_s={idle_timeout_s} stream={type(stream_iter).__name__}")
+
+    def _put(item) -> bool:
+        """Bounded put that bails out if the consumer has abandoned us."""
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.5)
+                return True
+            except _queue.Full:
+                continue
+        return False
 
     def _producer() -> None:
         try:
             for chunk in stream_iter:
-                q.put(("chunk", chunk))
+                if stop.is_set():
+                    break
+                if not _put(("chunk", chunk)):
+                    break
         except BaseException as e:  # noqa: BLE001 — surface to consumer
-            q.put(("error", e))
+            if not stop.is_set():
+                _put(("error", e))
         finally:
-            q.put(("done", None))
+            # Best-effort sentinel; ignored if the consumer is already gone.
+            if not stop.is_set():
+                _put(("done", None))
 
     t = _threading.Thread(target=_producer, daemon=True, name="ojas-llm-stream")
     t.start()
 
-    while True:
-        try:
-            kind, payload = q.get(timeout=idle_timeout_s)
-        except _queue.Empty:
-            _llm_dbg(
-                f"idle {idle_timeout_s}s — no chunk received "
-                f"(producer_alive={t.is_alive()})"
-            )
-            raise TimeoutError(
-                f"LLM stream idle for {idle_timeout_s}s — no chunk received"
-            )
+    try:
+        while True:
+            try:
+                kind, payload = q.get(timeout=idle_timeout_s)
+            except _queue.Empty:
+                _llm_dbg(
+                    f"idle {idle_timeout_s}s — no chunk received "
+                    f"(producer_alive={t.is_alive()})"
+                )
+                raise TimeoutError(
+                    f"LLM stream idle for {idle_timeout_s}s — no chunk received"
+                )
 
-        if kind == "done":
-            return
-        if kind == "error":
-            # Re-raise the producer's exception verbatim — the retry layer
-            # catches transient shapes and lets poison-pill errors bubble.
-            raise payload
+            if kind == "done":
+                return
+            if kind == "error":
+                # Re-raise the producer's exception verbatim — the retry layer
+                # catches transient shapes and lets poison-pill errors bubble.
+                raise payload
 
-        yield payload
+            yield payload
+    finally:
+        # Consumer is done with us (normal return, TimeoutError, generator
+        # close, or a downstream exception): signal the producer to stop so it
+        # can't keep pulling on an abandoned stream.
+        stop.set()

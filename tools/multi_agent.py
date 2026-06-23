@@ -2,9 +2,9 @@
 Multi-agent tools — Agent (+ AgentStatus polling).
 
  * `Agent` spawns a REAL background sub-agent (a thread running a fresh agent
- loop with a subagent-type system prompt + restricted tool set, max 32
- iterations) and returns immediately with status "running". Call it
- multiple times for parallel independent tasks.
+ loop with a subagent-type system prompt + restricted tool set) and returns
+ immediately with status "running". Call it multiple times for parallel
+ independent tasks.
  * `AgentStatus` polls a spawned agent's manifest so the orchestrator can
  wait for completion before starting dependent work.
 
@@ -56,34 +56,46 @@ HARD_AGENT_MAX_TOTAL_SECONDS      = 24 * 3600 # 24h hard ceiling
 
 # Tool allowlists per subagent type (lib.rs allowed_tools_for_subagent).
 # NOTE: `Agent` is intentionally absent from every set — sub-agents cannot spawn
-# further sub-agents. The grep/find work is now done via `bash` (which has
-# default excludes for noise directories), so `grep_search` / `glob_search` /
-# `git_read` are no longer in any allowlist.
+# further sub-agents. There is no dedicated grep/glob tool in the Python
+# toolset, so search/find work is done via `bash` (its default excludes skip
+# noise dirs); every type that needs to LOCATE code therefore needs `bash`.
+# Names here MUST match the registered tool names in tools/wrappers.py
+# (read_file, write_file, edit_file, bash, git, github, WebFetch, WebSearch,
+# TodoWrite, Sleep, AskUserQuestion, SendUserMessage, ToolSearch,
+# EnterPlanMode, ExitPlanMode, AgentStatus). Unknown names are silently
+# dropped by the `name in allowed` filter in _run_agent_job, so a typo or a
+# ported-but-nonexistent tool just disappears — which is exactly how `Explore`
+# ended up unable to search (it listed phantom tools but not `bash`).
 _ALLOWED_TOOLS_BY_TYPE: dict[str, set[str]] = {
+    # Read-only investigator: read files + search via bash + web/docs lookups.
     "Explore": {
-        "read_file", "WebFetch", "WebSearch",
-        "ToolSearch", "Skill", "StructuredOutput",
+        "read_file", "bash", "WebFetch", "WebSearch", "ToolSearch",
     },
+    # Design/planning: same read-only investigation + can draft a plan and
+    # talk to the user. No write/edit (Plan must not mutate the tree).
     "Plan": {
-        "read_file", "WebFetch", "WebSearch",
-        "ToolSearch", "Skill", "TodoWrite", "StructuredOutput", "SendUserMessage",
+        "read_file", "bash", "WebFetch", "WebSearch", "ToolSearch",
+        "TodoWrite", "SendUserMessage",
     },
+    # Runs build/verify commands and reports — needs bash + read.
     "Verification": {
-        "bash", "read_file", "WebFetch", "WebSearch",
-        "ToolSearch", "TodoWrite", "StructuredOutput", "SendUserMessage", "PowerShell",
+        "bash", "read_file", "WebFetch", "WebSearch", "ToolSearch",
+        "TodoWrite", "SendUserMessage", "StopProcess",
     },
+    # Answers questions about the tool/codebase — read + search + docs.
     "claw-guide": {
-        "read_file", "WebFetch", "WebSearch",
-        "ToolSearch", "Skill", "StructuredOutput", "SendUserMessage",
+        "read_file", "bash", "WebFetch", "WebSearch", "ToolSearch",
+        "SendUserMessage",
     },
+    # Narrow config editor — read + edit only.
     "statusline-setup": {
-        "bash", "read_file", "write_file", "edit_file",
-        "ToolSearch",
+        "read_file", "edit_file", "ToolSearch",
     },
+    # Full worker: the complete non-Agent toolset.
     "general-purpose": {
-        "bash", "read_file", "write_file", "edit_file",
-        "WebFetch", "WebSearch", "TodoWrite", "Skill", "ToolSearch", "NotebookEdit",
-        "Sleep", "SendUserMessage", "Config", "StructuredOutput", "REPL", "PowerShell",
+        "bash", "read_file", "write_file", "edit_file", "git", "github",
+        "WebFetch", "WebSearch", "TodoWrite", "ToolSearch", "Sleep",
+        "SendUserMessage", "StopProcess",
     },
 }
 
@@ -487,9 +499,10 @@ def _interrupt_thread(thread: threading.Thread) -> None:
          doing pure-Python work this is near-instant.
       2. If the thread is blocked inside a C-level call (e.g. requests.get,
          subprocess.run, socket.recv), the exception is queued and waits
-         for that call to return. This is why every IO-bound tool now has
-         its own bounded timeout (bash=60s, git=60s, web=20s) — the slowest
-         tool is the worst-case delay before the SystemExit actually fires.
+         for that call to return. This is why every IO-bound tool has its
+         own bounded timeout (see each tool's schema — e.g. bash defaults to
+         120s, max 600s) — the slowest in-flight tool is the worst-case delay
+         before the injected SystemExit actually fires.
       3. If the thread has already finished, the call is a no-op.
     """
     try:

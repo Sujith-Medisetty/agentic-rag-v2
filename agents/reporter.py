@@ -187,14 +187,6 @@ _reporter_var: contextvars.ContextVar[ProgressReporter] = contextvars.ContextVar
 )
 
 
-def set_reporter(reporter: ProgressReporter) -> None:
-    """Set the process-wide default reporter. Any context that hasn't
-    explicitly entered a reporter_scope() will see this one."""
-    global _default_reporter
-    _default_reporter = reporter
-    _reporter_var.set(reporter)
-
-
 def get_reporter() -> ProgressReporter:
     return _reporter_var.get()
 
@@ -202,7 +194,10 @@ def get_reporter() -> ProgressReporter:
 @contextmanager
 def reporter_scope(reporter: ProgressReporter):
     """Use a specific reporter for the duration of this context. Safe for
-    concurrent tasks; restores the previous reporter on exit."""
+    concurrent tasks; restores the previous reporter on exit. This (carried
+    into the worker thread via contextvars.copy_context) is the ONLY way the
+    agent loop binds its reporter — there is deliberately no process-global
+    setter, which would cross-wire concurrent sessions onto one bus."""
     token = _reporter_var.set(reporter)
     try:
         yield
