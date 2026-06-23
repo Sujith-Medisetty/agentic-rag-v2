@@ -31,6 +31,13 @@ class RunnerState(TypedDict, total=False):
     # Loop bookkeeping.
     iterations: int  # number of model calls so far this run (informational)
 
+    # Done-gate bookkeeping (agents/verify_gate.py). The gate blocks a turn
+    # from ending while an Ojas app in the workspace has not passed
+    # `npm run verify` for its current code. Bounded so it can't loop forever.
+    gate_action: str  # "force" | "pass" — set by node_gate, read by gate_router
+    gate_nudges: int  # how many times the gate has forced a re-verify this run
+    gate_started_at: float  # epoch of the first gate nudge (budget anchor)
+
     # Plumbed from session_runner so the agent loop can key cross-turn
     # state (e.g. maybe_compact's session-scoped cache) by session.
     session_id: str

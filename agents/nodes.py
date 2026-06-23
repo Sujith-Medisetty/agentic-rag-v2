@@ -52,6 +52,7 @@ from langchain_core.messages import (
     AIMessageChunk,
     SystemMessage,
     BaseMessage,
+    HumanMessage,
     ToolMessage,
 )
 from langgraph.prebuilt import ToolNode
@@ -762,11 +763,12 @@ def node_tools(state: RunnerState) -> dict:
 
 
 def should_continue(state: RunnerState) -> str:
-    """Continue while the assistant requests tools. Otherwise END.
+    """Continue while the assistant requests tools. Otherwise hand off to
+    the done-gate (which decides END vs. force-a-re-verify).
 
     Simple rule: the LAST message in the history is an AIMessage with
     tool_calls → node_tools. Anything else (no tool_calls, or the last
-    message is a ToolMessage / HumanMessage) → __end__.
+    message is a ToolMessage / HumanMessage) → node_gate.
 
     Note: invalid_tool_calls is intentionally NOT routed back to
     node_tools — the model emitted malformed JSON it can't recover from
@@ -777,4 +779,66 @@ def should_continue(state: RunnerState) -> str:
     last = messages[-1] if messages else None
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         return "node_tools"
-    return "__end__"
+    return "node_gate"
+
+
+def node_gate(state: RunnerState) -> dict:
+    """Done-gate: refuse to end the turn while an Ojas app in the workspace
+    hasn't passed `npm run verify` for its current code.
+
+    Pure filesystem check (agents/verify_gate.py) — it never runs verify
+    itself; it nudges the model to run it and fix the first failure. The
+    nudge is a HumanMessage so the model treats it as a fresh instruction.
+    Bounded by OJAS_VERIFY_GATE_BUDGET_SECS / OJAS_VERIFY_GATE_MAX_NUDGES
+    (and the OJAS_VERIFY_GATE=off kill switch) so it can't loop forever —
+    when the budget is spent it lets the turn end with a loud warning.
+    """
+    from agents import verify_gate
+    from agents.reporter import get_reporter
+
+    if not verify_gate.gate_enabled():
+        return {"gate_action": "pass"}
+
+    workspace = state.get("workspace", ".")
+    try:
+        unverified = verify_gate.find_unverified_apps(workspace)
+    except Exception:
+        # A gate bug must never wedge the loop — fail open.
+        return {"gate_action": "pass"}
+
+    if not unverified:
+        return {"gate_action": "pass"}
+
+    nudges = int(state.get("gate_nudges", 0))
+    started_at = state.get("gate_started_at")
+    give_up = verify_gate.budget_exhausted(started_at, nudges)
+    if give_up:
+        try:
+            get_reporter().tool_done(
+                "verify-gate",
+                f"⚠ {give_up}; ending the turn with verify still RED for: "
+                + ", ".join(str(a.name) for a, _ in unverified),
+                error=True,
+            )
+        except Exception:
+            pass
+        return {"gate_action": "pass"}
+
+    force_text = verify_gate.build_force_message(unverified, workspace)
+    try:
+        get_reporter().tool_done("verify-gate", force_text, error=True)
+    except Exception:
+        pass
+
+    history = list(state.get("messages") or [])
+    return {
+        "messages": history + [HumanMessage(content=force_text)],
+        "gate_action": "force",
+        "gate_nudges": nudges + 1,
+        "gate_started_at": started_at if started_at is not None else time.time(),
+    }
+
+
+def gate_router(state: RunnerState) -> str:
+    """Route the gate's decision: force → back to the model; pass → END."""
+    return "node_agent" if state.get("gate_action") == "force" else "__end__"

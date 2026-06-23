@@ -287,13 +287,31 @@ async function startProxyServer({ frontendUrl, backendUrl } = {}) {
       // Proxy /api/* to backend (fullstack only).
       if (hasBackend && url.pathname.startsWith("/api/")) {
         const target = `${backendOrigin}${url.pathname}${url.search}`;
+        // Buffer the request body for methods that carry one. The old
+        // proxy forwarded GET/HEAD only and silently dropped POST/PATCH/
+        // PUT/DELETE bodies — which made every "create through the UI"
+        // check a false pass (the backend got an empty body). Now we
+        // buffer and forward it so CRUD round-trips actually exercise
+        // the write path.
+        const hasBody = !["GET", "HEAD"].includes((req.method || "GET").toUpperCase());
+        let body;
+        if (hasBody) {
+          const chunks = [];
+          for await (const chunk of req) chunks.push(chunk);
+          body = chunks.length ? Buffer.concat(chunks) : undefined;
+        }
+        // Strip hop-by-hop / length headers — fetch recomputes them for
+        // the buffered body; a stale content-length stalls the upstream.
+        const fwdHeaders = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (["host", "connection", "content-length", "transfer-encoding"].includes(k.toLowerCase()))
+            continue;
+          fwdHeaders[k] = v;
+        }
         const upstream = await fetch(target, {
           method: req.method,
-          headers: req.headers,
-          // fetch() requires ReadableStream; for simple bodies
-          // we let it use GET/HEAD default. Other methods with
-          // bodies would need explicit buffering — none of the
-          // Ojas verify suite uses them.
+          headers: fwdHeaders,
+          body,
         });
         res.statusCode = upstream.status;
         upstream.headers.forEach((v, k) => {
@@ -363,8 +381,208 @@ async function startProxyServer({ frontendUrl, backendUrl } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Verify report
+// Stage helpers — shared by verify-api / verify-browser / verify-smoke
 // ---------------------------------------------------------------------------
+
+// Bounded fetch. Every API request in the suite goes through here so one
+// hung endpoint can't stall the whole stage: short, explicit timeout,
+// parsed body, never throws on a non-2xx (the caller asserts the status).
+async function shortFetch(url, opts = {}, timeoutMs = 8000) {
+  let res;
+  try {
+    res = await fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    return { ok: false, status: 0, error: String(e?.message || e), headers: null, json: null, text: "" };
+  }
+  const text = await res.text().catch(() => "");
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    /* not JSON */
+  }
+  return { ok: res.ok, status: res.status, headers: res.headers, json, text };
+}
+
+// Replace $NAME / $EMAIL / $PASSWORD / $USERNAME tokens (recursively) in a
+// manifest payload template with the run's stable TEST_CREDS.
+function substituteCreds(value, creds = TEST_CREDS) {
+  if (typeof value === "string") {
+    return value
+      .replace(/\$EMAIL/g, creds.email)
+      .replace(/\$PASSWORD/g, creds.password)
+      .replace(/\$USERNAME/g, creds.username)
+      .replace(/\$NAME/g, creds.name);
+  }
+  if (Array.isArray(value)) return value.map((v) => substituteCreds(v, creds));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = substituteCreds(v, creds);
+    return out;
+  }
+  return value;
+}
+
+function getByPath(obj, dotPath) {
+  if (!obj || !dotPath) return undefined;
+  return dotPath.split(".").reduce((acc, k) => (acc == null ? acc : acc[k]), obj);
+}
+
+/**
+ * Run the manifest's auth flow against the backend: signup (best-effort —
+ * a 409/400 "already exists" is fine), then login. Returns the auth state
+ * to attach to subsequent requests:
+ *   { ok, headers, cookie, token, detail }
+ * On failure `ok` is false and `detail` explains why, so the API stage can
+ * report a precise "auth is broken" error rather than a wall of 401s.
+ */
+async function authenticate({ backendBase, auth, creds = TEST_CREDS }) {
+  if (!auth || !auth.enabled) return { ok: true, headers: {}, cookie: null, token: null };
+  const payload = auth.userPayload
+    ? substituteCreds(auth.userPayload, creds)
+    : { name: creds.name, email: creds.email, password: creds.password };
+
+  // Signup (tolerant — the account may already exist from a prior run).
+  if (auth.signupPath) {
+    const r = await shortFetch(`${backendBase}${auth.signupPath}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok && ![400, 409, 422].includes(r.status)) {
+      return {
+        ok: false,
+        detail: `signup POST ${auth.signupPath} returned ${r.status || r.error}. ` +
+          `Expected 2xx (created) or 400/409 (already exists). Body: ${r.text.slice(0, 200)}`,
+      };
+    }
+  }
+
+  // Login.
+  if (!auth.loginPath) {
+    return { ok: false, detail: "auth.enabled but no loginPath — cannot obtain a session." };
+  }
+  const login = await shortFetch(`${backendBase}${auth.loginPath}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!login.ok) {
+    return {
+      ok: false,
+      detail: `login POST ${auth.loginPath} returned ${login.status || login.error}. ` +
+        `Body: ${login.text.slice(0, 200)}`,
+    };
+  }
+
+  if (auth.tokenIn === "cookie") {
+    const cookie = login.headers?.get?.("set-cookie") || null;
+    if (!cookie) return { ok: false, detail: `login succeeded but set no cookie (tokenIn=cookie).` };
+    return { ok: true, headers: { cookie }, cookie, token: null };
+  }
+  const token = getByPath(login.json, auth.tokenField);
+  if (!token) {
+    return {
+      ok: false,
+      detail: `login succeeded but no token at "${auth.tokenField}" in the response. ` +
+        `Keys: ${login.json ? Object.keys(login.json).join(", ") : "(non-JSON body)"}.`,
+    };
+  }
+  return {
+    ok: true,
+    token,
+    headers: { [auth.header]: `${auth.scheme} ${token}`.trim() },
+    cookie: null,
+  };
+}
+
+// ---- Browser helpers (Playwright) -----------------------------------------
+
+const PROMOTED_WARNING_PATTERNS = [
+  /Each child in a list should have a unique "key"/i,
+  /validateDOMNesting/i,
+  /Cannot update a component .* while rendering a different component/i,
+  /Maximum update depth exceeded/i,
+  /not wrapped in act\(/i,
+];
+
+async function launchBrowser() {
+  let chromium;
+  try {
+    ({ chromium } = await import("playwright"));
+  } catch (e) {
+    throw new Error(
+      `playwright is not installed. Run \`npx playwright install chromium\` ` +
+        `from the frontend/ directory, then re-run verify. (${e.message})`,
+    );
+  }
+  try {
+    return await chromium.launch({ headless: true });
+  } catch (e) {
+    throw new Error(
+      `Could not launch headless Chromium. Run \`npx playwright install chromium\` ` +
+        `once, then re-run verify. (${e.message})`,
+    );
+  }
+}
+
+/**
+ * Attach console / pageerror / failed-response listeners to a page and
+ * return a live collector. `consoleErrors` captures genuine errors plus
+ * the five promoted React warnings; `networkErrors` captures 4xx/5xx on
+ * same-origin requests. IGNORED_CONSOLE_PATTERNS filters known noise.
+ */
+function attachCollectors(page) {
+  const consoleErrors = [];
+  const networkErrors = [];
+  const ignore = (t) => IGNORED_CONSOLE_PATTERNS.some((re) => re.test(t));
+  page.on("console", (msg) => {
+    const type = msg.type();
+    const text = msg.text();
+    if (ignore(text)) return;
+    if (type === "error") consoleErrors.push(text);
+    else if (type === "warning" && PROMOTED_WARNING_PATTERNS.some((re) => re.test(text)))
+      consoleErrors.push(`(promoted warning) ${text}`);
+  });
+  page.on("pageerror", (err) => {
+    if (!ignore(err.message)) consoleErrors.push(`uncaught: ${err.message}`);
+  });
+  page.on("response", (res) => {
+    const u = res.url();
+    if (res.status() >= 400 && (u.includes("/api/") || u.startsWith(page.url().split("/").slice(0, 3).join("/")))) {
+      networkErrors.push(`${res.status()} ${res.request().method()} ${u}`);
+    }
+  });
+  return { consoleErrors, networkErrors };
+}
+
+async function gotoSafe(page, url) {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  // Let React mount + first data fetch settle without a blind long sleep:
+  // networkidle with a short cap, falling back if it never idles.
+  await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
+}
+
+// Blank-screen heuristic: a 200 that rendered nothing meaningful.
+async function isBlankScreen(page) {
+  return page.evaluate(() => {
+    const main = document.querySelector("main") || document.body;
+    const text = (main.innerText || "").trim();
+    const semantic = main.querySelectorAll(
+      "h1,h2,h3,h4,p,li,td,th,button,a,input,textarea,select,img,svg,table,form,label,article,section",
+    ).length;
+    return text.length < 30 && semantic < 2;
+  });
+}
+
+async function textVisible(page, needle) {
+  if (!needle) return true;
+  return page.evaluate((t) => {
+    const body = (document.body.innerText || "").toLowerCase();
+    return body.includes(String(t).toLowerCase());
+  }, needle);
+}
+
 // All verify scripts (verify:deps, verify:render, verify:api,
 // verify:integration, verify:browser) contribute structured
 // evidence to a single verify-report.json under
@@ -432,4 +650,15 @@ export {
   bootFullstack,
   bootStatic,
   startProxyServer,
+  // stage helpers
+  shortFetch,
+  substituteCreds,
+  getByPath,
+  authenticate,
+  PROMOTED_WARNING_PATTERNS,
+  launchBrowser,
+  attachCollectors,
+  gotoSafe,
+  isBlankScreen,
+  textVisible,
 };

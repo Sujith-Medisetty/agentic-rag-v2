@@ -353,44 +353,74 @@ def get_ojas_app_rules_section() -> str:
         "time — fold all clean-ups into the same edit; don't fire follow-up "
         "`edit_file` calls to delete unused imports or fix lint.",
         "",
-        "Run `npm run verify` when you believe the app is done (not "
-        "speculatively mid-build). If it fails, fix the cause and re-run; repeat "
-        "until green. A green verify is the done-bar.",
+        "## Verification — `npm run verify` is the staged done-bar",
         "",
-        "After `npm run verify` is green, run `npm run verify:browser`. This is "
-        "the end-to-end browser smoke test (Playwright): it boots the built app "
-        "+ backend, opens every route in headless Chromium, clicks every visible "
-        "button, fills and submits every form, records every console error and "
-        "network failure, checks that any non-empty /api/* response has its data "
-        "visible in the rendered DOM (catches \"API returns data but UI drops "
-        "it\"), and verifies every route actually renders content (a 200 with an "
-        "empty `<main>` is a blank screen — error boundary returned null, list "
-        "with no items and no empty state, routing bug). It also reloads every "
-        "route after the click+form pass and re-checks blank-screen (catches "
-        "routes that load once but break on F5 — state held in memory, missing "
-        "hydration), captures console warnings (React missing-key, "
-        "validateDOMNesting, setState during render, memory leaks, act() "
-        "wrapper — five patterns promoted to failures), walks the OpenAPI spec "
-        "to find dynamic detail routes like `/api/items/{id}` and visits the "
-        "first 3 IDs of each via the UI (so detail pages get covered even when "
-        "the list doesn't expose every one as an anchor), and snapshots list "
-        "counts before/after CRUD button clicks as evidence (a count delta "
-        "indicates Create / Delete fired through the UI). Auth forms (signup / "
-        "login) are detected by their email+password field combo and filled with "
-        "TEST_CREDS generated once per run — the SAME credentials are reused "
-        "across the run, so a signup submit followed by a login submit exercises "
-        "the SAME account. Playwright's context persists cookies and localStorage "
-        "across navigations, so a successful login carries forward to protected "
-        "routes automatically. For fullstack apps `npm run verify` also runs "
-        "`verify:api` between `verify:render` and `verify:browser` — that's the "
-        "OpenAPI-driven CRUD smoke that hits every documented endpoint directly "
-        "(POST→GET→DELETE round-trip, body synthesised from Pydantic schemas) so "
-        "API bugs surface without depending on UI clicks. If anything fails, "
-        "fix the ROOT CAUSE (not the test — the test is right, your app is "
-        "wrong), re-run `npm run verify`, then `npm run verify:browser`. Repeat "
-        "until all are green. Do not declare done with any failing. The first "
-        "run may print a one-time `npx playwright install chromium` hint — do "
-        "that, then re-run.",
+        "`npm run verify` (from `<app>/frontend`) runs ONE ordered pipeline and "
+        "STOPS at the first failing stage with the exact root cause + fix. On a "
+        "full pass it writes `<app>/.ojas/verify-pass.json`. THIS SENTINEL IS THE "
+        "DONE-BAR: the harness will not let you end your turn while any app in the "
+        "workspace lacks a green sentinel newer than its source — if you try, you "
+        "get bounced back to fix verify. So run it when you believe the app is "
+        "done (not speculatively mid-build), fix what it reports, re-run until it "
+        "prints `✅ verify GREEN`. The stages, in order:",
+        "  0. **preflight** — `build` (runs check-deps + verify-radix) + render smoke.",
+        "  1. **auth** (fullstack, if auth) — real signup → login obtains a session.",
+        "  2. **db** (fullstack) — schema is usable; declared fixtures seed AND the "
+        "list endpoints actually load them (catches the #1 'empty screen' bug).",
+        "  3. **api** (fullstack) — every declared endpoint is hit FOR ITS JOB: real "
+        "auth attached, real ids in path params, declared body, asserts the declared "
+        "status + response shape.",
+        "  4. **browser** (all) — one targeted pass per declared screen: it renders "
+        "(no blank `<main>`), ZERO console errors / promoted React warnings / 4xx-5xx, "
+        "the declared data is visible, and the screen's ONE primary action works.",
+        "  5. **smoke** (all) — the declared end-to-end happy path as a single session "
+        "(signup → login → core feature → logout).",
+        "  6. **cleanup** (all) — deletes the dummy test user. Verify always runs on a "
+        "THROWAWAY SQLite DB (node_modules/.ojas-verify/) — the real app DB is never "
+        "touched, so nothing test-shaped leaks into the delivered app.",
+        "Servers + headless Chromium boot ONCE and are shared across stages (fast). "
+        "Bodies for POST/PATCH are proxied correctly. A failure means the APP is "
+        "wrong, not the check — fix the root cause it names and re-run. The first run "
+        "may print a one-time `npx playwright install chromium` hint — do that, then "
+        "re-run.",
+        "",
+        "### Write `<app>/verify.manifest.json` as you build — it's the test contract",
+        "",
+        "The pipeline tests WHAT EACH FEATURE IS FOR, read from this manifest. Write "
+        "it (app root, sibling of `frontend/`/`backend/`) as you add features — every "
+        "field is optional but the more you declare, the more is actually verified. "
+        "If you omit it entirely, verify falls back to a DERIVED minimal smoke pass "
+        "(endpoints from OpenAPI, screens from the route table) and warns that "
+        "coverage is reduced — so always write it for anything non-trivial. Shape:",
+        "```json\n"
+        "{\n"
+        '  "auth": { "enabled": true, "signupPath": "/api/auth/register",\n'
+        '            "loginPath": "/api/auth/login", "tokenField": "access_token",\n'
+        '            "userPayload": { "email": "$EMAIL", "password": "$PASSWORD" },\n'
+        '            "loginRoute": "/login", "signupRoute": "/signup" },\n'
+        '  "resources": [ { "name": "tasks", "listPath": "/api/tasks", "minRows": 1,\n'
+        '                   "seed": [ { "title": "Buy milk", "done": false } ] } ],\n'
+        '  "endpoints": [ { "feature": "create task", "method": "POST", "path": "/api/tasks",\n'
+        '                   "auth": true, "body": { "title": "Verify task" },\n'
+        '                   "expectStatus": 201, "expectShape": ["id","title"] } ],\n'
+        '  "screens": [ { "feature": "task list", "route": "/", "requiresAuth": true,\n'
+        '                 "expectVisible": ["Buy milk"],\n'
+        '                 "primaryAction": { "kind": "fill-submit", "fields": {"title":"E2E task"},\n'
+        '                                    "submitText": "Add", "expectVisibleAfter": ["E2E task"] } } ],\n'
+        '  "happyPath": [ {"step":"signup"}, {"step":"login"}, {"step":"navigate","route":"/"},\n'
+        '                 {"step":"fillSubmit","fields":{"title":"Walk dog"},"submitText":"Add",\n'
+        '                  "expectVisibleAfter":["Walk dog"]}, {"step":"logout"} ],\n'
+        '  "cleanup": { "deleteTestUser": true, "deleteUserPath": "/api/auth/me" }\n'
+        "}\n"
+        "```\n"
+        "Notes: `$EMAIL`/`$PASSWORD`/`$NAME`/`$USERNAME` are substituted with the "
+        "run's test creds (so signup+login use the SAME account). `primaryAction.kind` "
+        "is `fill-submit` | `click` | `none`; fields match by label/placeholder/name. "
+        "`expectVisible`/`expectVisibleAfter` are plain substrings that must appear on "
+        "the page. Mark protected screens `requiresAuth: true` — the runner logs in "
+        "through the UI once and the session carries across screens. Declare a "
+        "`resources[].seed` for every list the UI shows, or its screen verifies as a "
+        "blank/empty page.",
         "",
         "CRITICAL — REPLACE the starter `App.tsx` AND its `<Dashboard />`. The "
         "fullstack template's `App.tsx` returns `<Dashboard />`, and that "
@@ -567,6 +597,13 @@ def get_ojas_app_rules_section() -> str:
         "auto-rebuilds stale dist on deploy (last-line-of-defence), but you must "
         "catch it yourself FIRST. Before calling `TaskUpdate completed` on ANY "
         "frontend edit task, ALL must hold:\n",
+        "  0. `npm run verify` printed `✅ verify GREEN` for the CURRENT code — i.e. "
+        "`<app>/.ojas/verify-pass.json` exists and is newer than every source file. "
+        "This is the real done-bar and the harness ENFORCES it: if you try to end "
+        "your turn with any app's sentinel missing or stale, you are bounced back to "
+        "run verify and fix the first failing stage. The checks below are subsumed by "
+        "verify (it runs build + render + the staged backend/browser/smoke checks); "
+        "they remain as fast standalone probes.\n",
         "  1. `npm --prefix <abs/frontend> run build` exited 0.\n",
         "  2. `python3 /opt/ojas/agents/scripts/check-build-freshness.py <abs/frontend>` exited 0. This walks `frontend/src/` and compares the newest mtime to `frontend/dist/index.html` — if any `.tsx`/`.ts`/`.css`/`.html`/etc. is newer than the bundle, it exits 1 with the exact culprit file and the fix command. Treat a non-zero exit as \"the edit is NOT done.\"\n",
         "  3. `python3 /opt/ojas/agents/scripts/check-feature-completeness.py <abs/frontend>` exited 0. This is the UPSTREAM gate — it catches the agent claiming done when the SCREENS THEMSELVES are unfinished (stubs, missing pages, broken routes, dead imports). It parses `src/App.tsx` and `src/pages/*.tsx` to verify every page is imported, routed, has a default export, and has substantive body content (no `return <div>TODO</div>` placeholders). Exit 1 means the build is half-done — fix every reported issue before declaring done.\n",
@@ -617,24 +654,25 @@ def get_ojas_app_rules_section() -> str:
         "build` doesn't mean it boots. `npm run verify:render` (esbuild + "
         "`react-dom/server` `renderToString` in a single ESM graph, no browser, "
         "no `vite-node` dep) catches the two-React hook error, missing imports, "
-        "throw-during-render bugs, and bad module resolution. The build "
-        "pipeline chains `verify:deps` → `build` → `verify:render`; "
-        "`npm run verify` is the only command that proves the app works.",
+        "throw-during-render bugs, and bad module resolution. It's the "
+        "preflight stage of `npm run verify` (which then runs auth → db → api → "
+        "browser → smoke → cleanup); `npm run verify` is the only command that "
+        "proves the app works end-to-end.",
         "",
-        "Both templates ship four guards under `frontend/scripts/`: "
-        "`check-deps.mjs` (two-React duplicate-hoist), `verify-render.mjs` "
-        "(render smoke test), `verify-radix.mjs` (Radix Trigger/Content "
-        "parent-child invariant — `<SheetTrigger>` outside its `<Sheet>` throws "
-        "`DialogTrigger must be used within Dialog` and ships a blank screen), "
-        "and `verify-browser.mjs` (Playwright end-to-end test: every route "
-        "loads, every button responds, every form submits, no console errors, "
-        "no network 4xx/5xx, every route renders actual content — a 200 with an "
-        "empty `<main>` fails the gate). "
-        "All four are wired into `prebuild`/`verify`. If you hand-rolled the "
-        "project or scaffolded WITHOUT the Ojas template, copy all four "
-        "scripts AND the `prebuild`/`verify` lines from another Ojas project — "
-        "skipping any of them lets a broken handler, dead import, two-React "
-        "bundle, or Radix-orphan trigger ship as a deployable broken app.",
+        "Both templates ship the staged verifier under `frontend/scripts/`, "
+        "orchestrated by `verify.mjs`: `check-deps.mjs` (two-React duplicate-hoist) "
+        "and `verify-radix.mjs` (Radix Trigger/Content invariant — `<SheetTrigger>` "
+        "outside its `<Sheet>` throws `DialogTrigger must be used within Dialog` and "
+        "ships a blank screen) run in `prebuild`; `verify-render.mjs` is the render "
+        "smoke; then `verify-db.mjs` / `verify-api.mjs` (manifest-driven backend "
+        "checks), `verify-browser.mjs` (one targeted pass per declared screen — "
+        "renders, no console errors, no 4xx/5xx, declared data visible, primary "
+        "action works) and `verify-smoke.mjs` (end-to-end happy path + cleanup). "
+        "All read `verify.manifest.json`. If you hand-rolled the project or "
+        "scaffolded WITHOUT the Ojas template, copy the whole `scripts/` directory "
+        "AND the `prebuild`/`verify` lines from another Ojas project — skipping them "
+        "lets a broken handler, dead import, two-React bundle, blank screen, or "
+        "Radix-orphan trigger ship as a deployable broken app.",
         "",
         "### 5.7 Backend bind address",
         "",
