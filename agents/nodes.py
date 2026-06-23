@@ -699,6 +699,80 @@ def _build_system_prompt(state: RunnerState) -> tuple[str, str]:
 # The three nodes
 # ---------------------------------------------------------------------------
 
+def _render_todos(todos: list) -> str:
+    icons = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+    return "\n".join(
+        f"  {icons.get(t.get('status'), '[ ]')} {t.get('content', '')}" for t in todos
+    )
+
+
+# Tunables — how stale the plan panel may get before the loop nudges.
+_TODO_STALE_AFTER = int(os.getenv("AGENT_TODO_REMINDER_AFTER", "5"))
+_TODO_MIN_TOOLS_FOR_EMPTY = int(os.getenv("AGENT_TODO_MIN_TOOLS", "3"))
+
+
+def _todo_reminder_text(todos: list, n: int, total: int) -> str | None:
+    """Pure decision core for the todo nudge (no message-type deps, so it's
+    unit-testable). `n` = tool calls since the last TodoWrite; `total` = tool
+    calls this run. Assumes the caller already confirmed we're mid-task."""
+    if not todos:
+        if total >= _TODO_MIN_TOOLS_FOR_EMPTY:
+            return (
+                "<system-reminder>\nYour todo list is empty and you've already taken "
+                "several actions this turn. If this task has 3+ distinct steps, call "
+                "TodoWrite NOW with the full plan — every item `pending`, the first one "
+                "`in_progress` — so the user can see progress. If the task is genuinely "
+                "trivial, ignore this.\n</system-reminder>"
+            )
+        return None
+
+    has_in_progress = any(t.get("status") == "in_progress" for t in todos)
+    pending = [t for t in todos if t.get("status") == "pending"]
+
+    if not has_in_progress and pending:
+        return (
+            "<system-reminder>\nYour todo list has no `in_progress` item but work is "
+            "ongoing. Current list:\n" + _render_todos(todos) + "\nMark the item you're "
+            "working on as `in_progress` (exactly one at a time) with TodoWrite.\n"
+            "</system-reminder>"
+        )
+
+    if n >= _TODO_STALE_AFTER:
+        return (
+            "<system-reminder>\nYou've run " + str(n) + " tool calls since the last "
+            "TodoWrite — the plan panel the user is watching may be stale. Current list:\n"
+            + _render_todos(todos)
+            + "\nKeep it accurate: flip the `in_progress` item to `completed` the moment "
+            "it's done and set the next one `in_progress`. One TodoWrite per transition.\n"
+            "</system-reminder>"
+        )
+    return None
+
+
+def _build_todo_reminder(state: RunnerState, history: list[BaseMessage]) -> str | None:
+    """Claude-Code-style stateful todo nudge.
+
+    Returns a `<system-reminder>` string to append to the model's input for
+    THIS call only (never persisted into history, so the prefix cache is
+    untouched) when the plan panel has gone stale, else None. Only fires
+    mid-task — when the last message is a ToolMessage — so we never stack two
+    user-role turns at the very start.
+    """
+    if os.getenv("AGENT_TODO_REMINDER", "on").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    last = history[-1] if history else None
+    if not isinstance(last, ToolMessage):
+        return None
+
+    from tools.utils import read_todos
+
+    return _todo_reminder_text(
+        read_todos(),
+        int(state.get("tools_since_todo", 0)),
+        int(state.get("tools_total", 0)),
+    )
+
+
 def node_agent(state: RunnerState) -> dict:
     """One model call = one node invocation.
 
@@ -716,6 +790,13 @@ def node_agent(state: RunnerState) -> dict:
     if dynamic_suffix:
         messages.append(SystemMessage(content=dynamic_suffix))
     messages.extend(history)
+
+    # Append a stateful todo <system-reminder> for THIS call only when the
+    # plan panel has gone stale. Appended after history (suffix-only), so the
+    # cached prefix is unaffected, and never written back into state.
+    todo_reminder = _build_todo_reminder(state, history)
+    if todo_reminder:
+        messages.append(HumanMessage(content=todo_reminder))
 
     llm = _get_llm()
     bind_kwargs: dict = {}
@@ -756,9 +837,22 @@ def node_tools(state: RunnerState) -> dict:
 
     new_tool_messages = list(result.get("messages", []))
     existing = list(state.get("messages") or [])
+
+    # Todo-reminder bookkeeping: count the tools that just ran and whether
+    # TodoWrite was among them. A TodoWrite resets the staleness counter;
+    # anything else advances it. node_agent reads these to decide whether to
+    # inject the stateful todo <system-reminder>.
+    ran_count = len(new_tool_messages)
+    ran_todo = any(getattr(m, "name", "") == "TodoWrite" for m in new_tool_messages)
+    prev_since = int(state.get("tools_since_todo", 0))
+    tools_since_todo = 0 if ran_todo else prev_since + ran_count
+    tools_total = int(state.get("tools_total", 0)) + ran_count
+
     return {
         **result,
         "messages": existing + new_tool_messages,
+        "tools_since_todo": tools_since_todo,
+        "tools_total": tools_total,
     }
 
 

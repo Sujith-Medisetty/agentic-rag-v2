@@ -60,6 +60,24 @@ class TodoWriteOutput:
     verification_nudge_needed: bool | None = None
 
 
+def read_todos() -> list[dict]:
+    """Read the current todo list from the store (empty list if none).
+
+    Used by the agent loop to build the stateful todo `<system-reminder>`.
+    The store is deleted when every item is completed, so an empty list
+    means either "no plan yet" or "plan finished" — both fine for the
+    reminder logic, which keys off whether items exist + how stale they are.
+    """
+    store = _todo_store_path()
+    if not store.exists():
+        return []
+    try:
+        data = json.loads(store.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
 def todo_write(todos: list[dict]) -> TodoWriteOutput:
     """Write/update the todo list.
 

@@ -31,6 +31,11 @@ class RunnerState(TypedDict, total=False):
     # Loop bookkeeping.
     iterations: int  # number of model calls so far this run (informational)
 
+    # Todo-reminder bookkeeping. The loop injects a stateful
+    # `<system-reminder>` when the plan panel goes stale (Claude-Code style).
+    tools_since_todo: int  # tool calls executed since the last TodoWrite
+    tools_total: int  # total tool calls this run (used to detect non-trivial tasks)
+
     # Done-gate bookkeeping (agents/verify_gate.py). The gate blocks a turn
     # from ending while an Ojas app in the workspace has not passed
     # `npm run verify` for its current code. Bounded so it can't loop forever.
