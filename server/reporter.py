@@ -56,6 +56,16 @@ class SessionBus:
     # will re-subscribe from the DB.
     MAX_QUEUE = 1000
 
+    # Event kinds that are safe to drop FIRST under backpressure: high-volume,
+    # coalescable deltas where losing one live frame is cosmetic (the next one
+    # supersedes it, and the full history is in the DB anyway). Lifecycle
+    # events (tool_start/tool_done/file_changed/agent_*/commit_*/turn_summary…)
+    # are NOT in this set, so a slow client can never make a tool silently jump
+    # from "running" to "done" — the tool_start is preserved over a token delta.
+    _COALESCABLE = frozenset({
+        "assistant_text", "thinking_text", "token_update", "context_update",
+    })
+
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -159,23 +169,62 @@ class SessionBus:
                 pass
         if self._loop is not None and self._queue is not None:
             try:
-                # Backpressure: if the queue is full, evict the OLDEST
-                # event to make room for the new one. The dropped
-                # event was already persisted to SQLite (above) so
-                # a reconnect with `?since=<ts>` will replay the gap.
-                # Net effect: a stuck client drops the OLDEST buffered
-                # event while the persisted DB history stays intact.
-                if self._queue.full():
-                    try:
-                        dropped = self._queue.get_nowait()
-                        self.dropped_count += 1
-                        del dropped
-                    except Exception:
-                        pass
-                self._loop.call_soon_threadsafe(self._queue.put_nowait, event)
+                # Hand the event to the loop thread to enqueue. ALL queue
+                # mutation happens there (in _enqueue) — asyncio.Queue is NOT
+                # thread-safe, so the producer thread must never touch it
+                # directly. The old code called .full()/.get_nowait() right
+                # here, on the agent worker thread, racing the fanout
+                # coroutine's `await queue.get()` on the loop thread; that
+                # corrupted the queue's internal bookkeeping and is what made
+                # live events intermittently vanish (a tool_start emitted
+                # mid-stream would disappear while the quieter tool_done
+                # survived → a tool that jumps straight to "completed").
+                self._loop.call_soon_threadsafe(self._enqueue, event)
             except RuntimeError:
                 # Loop is closed (server shutting down); drop the event.
                 pass
+
+    def _enqueue(self, event: dict) -> None:
+        """Append `event` to the fan-out queue. Runs ONLY on the event-loop
+        thread (scheduled via call_soon_threadsafe), so it is the single place
+        the asyncio.Queue is mutated — satisfying asyncio's single-thread
+        contract. On backpressure it evicts one buffered event to make room;
+        the evicted event is still in the DB, so a reconnect replays the gap."""
+        q = self._queue
+        if q is None:
+            return
+        if q.full():
+            self._evict_one(q)
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            # _evict_one couldn't free a slot (should not happen) — count the
+            # new event as dropped rather than letting put_nowait raise into
+            # the loop's callback handler (which would just log + swallow it).
+            self.dropped_count += 1
+
+    def _evict_one(self, q: asyncio.Queue) -> None:
+        """Free exactly one slot in a full queue. Prefer dropping the oldest
+        COALESCABLE delta (token/text/context) over a lifecycle event so a
+        slow client never loses a tool_start/tool_done/file_changed; only if
+        the buffer holds nothing droppable do we fall back to the true oldest.
+        Safe to scan/mutate q's deque here because we're on the loop thread
+        and a full queue has no pending getter to wake."""
+        pending = getattr(q, "_queue", None)
+        if pending is not None:
+            for i, ev in enumerate(pending):
+                if isinstance(ev, dict) and ev.get("kind") in self._COALESCABLE:
+                    del pending[i]
+                    self.dropped_count += 1
+                    return
+        # Nothing coalescable buffered (or no introspectable deque): drop the
+        # oldest event outright.
+        try:
+            q.get_nowait()
+            self.dropped_count += 1
+        except Exception:
+            pass
+
 
     # ---- consumer side (WebSocket handler) ------------------------------
     def subscribe(self, websocket) -> None:

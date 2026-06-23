@@ -1,16 +1,25 @@
 """
-Agent loop — the streaming LLM call, the tool execution, the routing decision.
+Agent loop — the streaming LLM call, the tool execution, the routing decisions.
 
-Three LangGraph nodes and one decision function:
+Three LangGraph nodes and two routing functions:
 
   node_agent      — stream ONE LLM call, append the AIMessage to history
   node_tools      — execute the tool calls the LLM just requested
-  should_continue — if the last AIMessage has tool_calls → node_tools, else END
+  node_gate       — done-gate: refuse to END while an Ojas app hasn't passed
+                    `npm run verify` for its current code (agents/verify_gate.py)
+  should_continue — last AIMessage has tool_calls → node_tools, else → node_gate
+  gate_router     — gate forced a re-verify → node_agent, else → END
 
-That's the whole loop. No wall-clock guard around node bodies. No iter / token /
-time / stall budget. No todo-sync nudge gate. No per-tool synthetic error
+The core is still a tight tool-calling cycle. No wall-clock guard around node
+bodies. No iter / token / time / stall budget. No per-tool synthetic error
 fallback. No `_truncate_*` / `_strip_old_thinking` / `_mask_old_observations`
 helpers. No cache diagnostics.
+
+Two cheap state-driven nudges layer on top of the cycle:
+  * the done-gate (node_gate) — bounded, kill-switchable filesystem check;
+  * a Claude-Code-style stateful todo `<system-reminder>` (`_build_todo_reminder`)
+    appended to the model input for one call when the plan panel goes stale.
+Both are ephemeral / suffix-only, so the cached prefix stays intact.
 
 What's preserved (because it's load-bearing):
   * streaming model call with a per-chunk idle watchdog — the SINGLE
@@ -32,14 +41,12 @@ What's preserved (because it's load-bearing):
     per-turn `before/after` diff (concurrent sessions were inflating each
     other's totals before this was made per-session).
 
-Faithful port of runtime/src/conversation.rs::run_turn (the Rust agent).
-The TodoWrite tool exists in Ojas but isn't synced at end-of-turn — the
-agent decides when it's done. Same as Rust.
+Faithful port of runtime/src/conversation.rs::run_turn (the Rust agent),
+extended with the Ojas-specific done-gate + todo reminder described above.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import platform
 import sys
@@ -49,7 +56,6 @@ from datetime import date
 
 from langchain_core.messages import (
     AIMessage,
-    AIMessageChunk,
     SystemMessage,
     BaseMessage,
     HumanMessage,
@@ -62,7 +68,6 @@ from agents.prompt import SystemPromptBuilder, ProjectContext, current_model_nam
 from memory.checkpointer import (
     maybe_compact,
     _auto_compact_threshold,
-    _truncate_tool_result,
     record_llm_input_tokens,
 )
 from agents._timeouts import _stream_with_idle_timeout
