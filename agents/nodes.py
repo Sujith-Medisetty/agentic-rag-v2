@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import sys
 import threading
 import time
@@ -215,9 +216,25 @@ def _get_llm(
 # DeepSeek, Qwen-thinking, etc.) that emit chain-of-thought as plain text.
 # ---------------------------------------------------------------------------
 
+# Matches an opening OR closing think tag, tolerant of case and inner
+# whitespace: <think>, </think>, </Think>, </think >, < / think >. The
+# session_runner's final-text stripper already uses re.IGNORECASE — the live
+# splitter MUST match the same variants or the literal tag leaks into the
+# thinking pane (the exact-case `.find("</think>")` it used before missed
+# `</Think>`/`</think >`, so the marker showed up verbatim every turn).
+_THINK_TAG_RE = re.compile(r"<\s*/?\s*think\s*>", re.IGNORECASE)
+
+
 class _ThinkingTagSplitter:
-    _OPEN = "<think>"
-    _CLOSE = "</think>"
+    """Split a streamed text channel into ('thinking'|'assistant', piece)
+    segments around inline <think>…</think> markers.
+
+    Robust to: tags split across chunk boundaries, case variants (</Think>),
+    inner whitespace (</think >), and stray/unbalanced tags. A recognized tag
+    is ALWAYS consumed, never emitted — an opener sets thinking mode, a closer
+    clears it — so the literal marker can never leak into either pane, even if
+    a closer arrives with no matching opener (or vice-versa).
+    """
 
     def __init__(self) -> None:
         self.in_thinking = False
@@ -227,16 +244,19 @@ class _ThinkingTagSplitter:
         out: list[tuple[str, str]] = []
         self._buf += text
         while self._buf:
-            tag = self._CLOSE if self.in_thinking else self._OPEN
-            idx = self._buf.find(tag)
-            if idx >= 0:
-                head = self._buf[:idx]
+            m = _THINK_TAG_RE.search(self._buf)
+            if m:
+                head = self._buf[: m.start()]
                 if head:
                     out.append(("thinking" if self.in_thinking else "assistant", head))
-                self._buf = self._buf[idx + len(tag):]
-                self.in_thinking = not self.in_thinking
+                # A "/" anywhere in the matched tag → closing tag.
+                self.in_thinking = "/" not in m.group(0)
+                self._buf = self._buf[m.end():]
                 continue
-            hold = self._partial_tail(self._buf, tag)
+            # No complete tag. Hold back a trailing run that could still grow
+            # into one (an unterminated '<…') so a tag split across chunks is
+            # recognized on the next feed; emit the rest now.
+            hold = self._partial_tail(self._buf)
             safe = self._buf[: len(self._buf) - hold] if hold else self._buf
             if safe:
                 out.append(
@@ -254,11 +274,24 @@ class _ThinkingTagSplitter:
         return out
 
     @staticmethod
-    def _partial_tail(s: str, tag: str) -> int:
-        max_n = min(len(s), len(tag) - 1)
-        for n in range(max_n, 0, -1):
-            if tag.startswith(s[-n:]):
-                return n
+    def _partial_tail(s: str) -> int:
+        """Length of the trailing substring that could be the START of a think
+        tag split across chunk boundaries — an unterminated '<…' (no '>' yet)
+        short enough, and shaped like, a partial tag. Returns 0 otherwise, so
+        ordinary text containing a lone '<' (e.g. `a < b`) is not held back."""
+        lt = s.rfind("<")
+        if lt < 0:
+            return 0
+        tail = s[lt:]
+        if ">" in tail or len(tail) > 10:
+            return 0  # terminated, or too long to be a partial tag
+        collapsed = re.sub(r"\s+", "", tail.lower())
+        if (
+            collapsed in ("<", "</")
+            or "<think".startswith(collapsed)
+            or "</think".startswith(collapsed)
+        ):
+            return len(tail)
         return 0
 
 
@@ -738,7 +771,9 @@ def _todo_reminder_text(todos: list, n: int, total: int) -> str | None:
         return (
             "<system-reminder>\nYour todo list has no `in_progress` item but work is "
             "ongoing. Current list:\n" + _render_todos(todos) + "\nMark the item you're "
-            "working on as `in_progress` (exactly one at a time) with TodoWrite.\n"
+            "working on as `in_progress` (exactly one at a time) with TodoWrite — "
+            "bundle that TodoWrite in the SAME turn as your next work tool, don't spend "
+            "a turn on it alone.\n"
             "</system-reminder>"
         )
 
@@ -748,7 +783,9 @@ def _todo_reminder_text(todos: list, n: int, total: int) -> str | None:
             "TodoWrite — the plan panel the user is watching may be stale. Current list:\n"
             + _render_todos(todos)
             + "\nKeep it accurate: flip the `in_progress` item to `completed` the moment "
-            "it's done and set the next one `in_progress`. One TodoWrite per transition.\n"
+            "it's done and set the next one `in_progress`. Bundle that TodoWrite into the "
+            "SAME turn as the work tool it relates to (it's independent and harmless to "
+            "batch) — never emit it as a turn of its own.\n"
             "</system-reminder>"
         )
     return None

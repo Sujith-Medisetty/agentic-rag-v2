@@ -460,8 +460,10 @@ def _final_assistant_text(messages: list) -> str:
 # We already route streamed-chunk thinking to its own UI channel via the
 # splitter in agents/nodes.py, but the canonical AIMessage.content still
 # contains the raw tags — strip them here so the final flush + the
-# persisted-message DB row are tag-free.
-_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# persisted-message DB row are tag-free. Tolerant of case + inner whitespace
+# (</Think>, </think >, < / think >) to match the live splitter's regex; an
+# exact `<think>.*?</think>` left those variants in the saved message.
+_THINK_TAG_RE = re.compile(r"<\s*think\s*>.*?<\s*/\s*think\s*>", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_thinking_tags(text: str) -> str:
@@ -695,17 +697,22 @@ async def _call_llm_for_title(prompt: str) -> str | None:
         if not raw:
             print(f"[auto-rename] LLM returned empty content blocks", file=sys.stderr, flush=True)
             return None
-        # Strip <think>...</think> blocks. Use a non-greedy match
-        # AND require the closing tag to actually appear. If the
-        # model emits an unclosed think block (truncation, model
-        # bug), fall back to the raw content rather than eating
-        # the whole response.
-        if "<think>" in raw and "</think>" in raw:
-            cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL)
-        elif "<think>" in raw:
+        # Strip <think>...</think> blocks. Tolerant of case + inner
+        # whitespace (matches the live splitter), non-greedy, AND requires
+        # the closing tag to actually appear. If the model emits an unclosed
+        # think block (truncation, model bug), fall back to the content after
+        # the opener rather than eating the whole response.
+        _open = _re.compile(r"<\s*think\s*>", _re.IGNORECASE)
+        _close = _re.compile(r"<\s*/\s*think\s*>", _re.IGNORECASE)
+        if _open.search(raw) and _close.search(raw):
+            cleaned = _re.sub(
+                r"<\s*think\s*>.*?<\s*/\s*think\s*>", "", raw,
+                flags=_re.DOTALL | _re.IGNORECASE,
+            )
+        elif _open.search(raw):
             # Unclosed think block — everything after <think> is the
             # model's answer (or empty). Strip just the opening tag.
-            cleaned = raw.split("<think>", 1)[1]
+            cleaned = _open.split(raw, 1)[1]
         else:
             cleaned = raw
         # JSON wrapping: some models follow a "format as JSON" hint
