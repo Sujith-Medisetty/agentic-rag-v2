@@ -865,6 +865,43 @@ def _build_todo_reminder(state: RunnerState, history: list[BaseMessage]) -> str 
     )
 
 
+def _visible_assistant_text(ai: BaseMessage) -> str:
+    """The user-facing text of an assistant message, with the model's private
+    reasoning stripped out.
+
+    Two content shapes occur:
+      • list of blocks (Anthropic native) — only {"type": "text"} blocks are
+        user-facing; "thinking"/"redacted_thinking" are not.
+      • plain string (OpenAI-compatible + inline <think> tags) — run it back
+        through the same splitter the live stream uses and keep only the
+        "assistant" channel, so "visible" matches exactly what the user saw.
+
+    May return "" (callers test `.strip()`). A response whose visible text is
+    empty AND which has no tool_calls is "thinking-only": the model reasoned
+    but neither answered nor acted — that is NOT a finished turn.
+    """
+    content = getattr(ai, "content", "") or ""
+    if isinstance(content, list):
+        parts = [
+            (b.get("text", "") or "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "".join(parts)
+    if isinstance(content, str):
+        splitter = _ThinkingTagSplitter()
+        segs = splitter.feed(content) + splitter.flush()
+        return "".join(piece for channel, piece in segs if channel == "assistant")
+    return ""
+
+
+def _max_empty_continuations() -> int:
+    """Bound on consecutive thinking-only re-prompts before the loop gives up
+    and ends the turn — a backstop against a model that NEVER emits text or a
+    tool call. Tunable / kill-switchable via env."""
+    return max(0, int(os.getenv("AGENT_MAX_EMPTY_CONTINUATIONS", "3")))
+
+
 def node_agent(state: RunnerState) -> dict:
     """One model call = one node invocation.
 
@@ -890,6 +927,20 @@ def node_agent(state: RunnerState) -> dict:
     if todo_reminder:
         messages.append(HumanMessage(content=todo_reminder))
 
+    # Continuation nudge: when the previous call returned reasoning ONLY (no
+    # answer, no tool call), should_continue routed us back here to force an
+    # action. Append a one-shot suffix asking the model to act — this both
+    # makes the intent explicit AND keeps roles alternating (history now ends
+    # on an assistant turn, which some providers reject as a re-call). Suffix-
+    # only, never persisted, so the cached prefix is untouched.
+    if int(state.get("empty_responses", 0)) > 0:
+        messages.append(HumanMessage(content=(
+            "<system-reminder>Your previous response contained only internal "
+            "reasoning — no answer to the user and no tool call. Continue now: "
+            "either call the appropriate tool(s) to make progress, or give your "
+            "final answer.</system-reminder>"
+        )))
+
     llm = _get_llm()
     bind_kwargs: dict = {}
     if _provider != "anthropic":
@@ -901,9 +952,19 @@ def node_agent(state: RunnerState) -> dict:
 
     _publish_context(ai, session_id)
 
+    # Thinking-only ⇒ no tool_calls AND no visible (non-reasoning) text. Track
+    # a consecutive run of these so should_continue can re-prompt yet still be
+    # bounded; any real text or tool call resets it to 0.
+    thinking_only = (
+        not getattr(ai, "tool_calls", None)
+        and not _visible_assistant_text(ai).strip()
+    )
     return {
         "messages": list(history) + [ai],
         "iterations": int(state.get("iterations", 0)) + 1,
+        "empty_responses": (
+            int(state.get("empty_responses", 0)) + 1 if thinking_only else 0
+        ),
     }
 
 
@@ -949,12 +1010,20 @@ def node_tools(state: RunnerState) -> dict:
 
 
 def should_continue(state: RunnerState) -> str:
-    """Continue while the assistant requests tools. Otherwise hand off to
-    the done-gate (which decides END vs. force-a-re-verify).
+    """Decide the next hop after a model call.
 
-    Simple rule: the LAST message in the history is an AIMessage with
-    tool_calls → node_tools. Anything else (no tool_calls, or the last
-    message is a ToolMessage / HumanMessage) → node_gate.
+      1. last AIMessage has tool_calls            → node_tools   (run them, loop)
+      2. last AIMessage is thinking-only          → node_agent   (force an action)
+      3. anything else (real final text, etc.)    → node_gate    (→ END or re-verify)
+
+    Case 2 is the fix for the "loop exits on a reasoning-only response" bug:
+    a turn where the model emitted ONLY a <think> block (no user-facing text,
+    no tool call) is NOT finished — historically it fell through to the gate
+    and ended the turn. We now loop back so the model is re-prompted to either
+    answer or call a tool (the reasoning block stays in history, so it
+    continues from where it left off). Bounded by `empty_responses` (see
+    AGENT_MAX_EMPTY_CONTINUATIONS) so a model that never acts can't spin
+    forever — once the budget is spent we fall through to the gate and end.
 
     Note: invalid_tool_calls is intentionally NOT routed back to
     node_tools — the model emitted malformed JSON it can't recover from
@@ -965,6 +1034,12 @@ def should_continue(state: RunnerState) -> str:
     last = messages[-1] if messages else None
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
         return "node_tools"
+    if (
+        isinstance(last, AIMessage)
+        and not _visible_assistant_text(last).strip()
+        and int(state.get("empty_responses", 0)) <= _max_empty_continuations()
+    ):
+        return "node_agent"
     return "node_gate"
 
 

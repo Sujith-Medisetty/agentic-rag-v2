@@ -3,6 +3,9 @@ LangGraph runner — a single iterative tool-calling loop.
 
   START → node_agent → (should_continue?)
   ├── node_tools → node_agent          (assistant requested tools)
+  ├── node_agent                        (reasoning-only response — re-prompt
+  │                                      to force an answer or a tool call;
+  │                                      bounded by AGENT_MAX_EMPTY_CONTINUATIONS)
   └── node_gate → (gate_router?)        (assistant signalled done)
         ├── node_agent  (an Ojas app hasn't passed `npm run verify` yet —
         │                forces a re-verify + fix)
@@ -34,7 +37,11 @@ def build_runner_graph(use_compaction: bool = True):
     builder.add_conditional_edges(
         "node_agent",
         should_continue,
-        {"node_tools": "node_tools", "node_gate": "node_gate"},
+        {
+            "node_tools": "node_tools",
+            "node_agent": "node_agent",  # thinking-only → re-prompt to force an action
+            "node_gate": "node_gate",
+        },
     )
     builder.add_edge("node_tools", "node_agent")
     builder.add_conditional_edges(

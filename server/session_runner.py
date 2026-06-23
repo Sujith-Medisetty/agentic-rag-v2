@@ -202,18 +202,20 @@ async def run_turn(
             # Per-TURN bookkeeping — MUST be reset every turn. The checkpointer
             # persists the whole RunnerState per thread_id (session) and only
             # the keys we pass here overwrite it; any key we omit silently
-            # carries its previous value into the new turn. These five are
-            # "this run" counters/anchors (see agents/state.py), so without an
+            # carries its previous value into the new turn. These are "this
+            # run" counters/anchors (see agents/state.py), so without an
             # explicit reset the verify-gate budget (gate_nudges/gate_started_at)
             # would accumulate across the whole session and eventually make the
-            # gate give up mid-session, and the todo-reminder counters would
-            # reflect session-lifetime tool use instead of this turn's.
+            # gate give up mid-session, the todo-reminder counters would reflect
+            # session-lifetime tool use instead of this turn's, and
+            # empty_responses would let stale thinking-only counts end a turn early.
             "tools_since_todo": 0,
             "tools_total":      0,
             "gate_action":      "",
             "gate_nudges":      0,
             "gate_started_at":  0.0,
             "todo_finalize_nudges": 0,
+            "empty_responses":  0,
         }
         for _ in runner_graph.stream(
             initial_state, config=config, stream_mode="updates",

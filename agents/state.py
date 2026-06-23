@@ -30,6 +30,13 @@ class RunnerState(TypedDict, total=False):
     # Loop bookkeeping.
     iterations: int  # number of model calls so far this run (informational)
 
+    # Consecutive thinking-only model responses (reasoning, but no user-facing
+    # text and no tool call). should_continue re-prompts while this is within
+    # AGENT_MAX_EMPTY_CONTINUATIONS so a turn isn't ended by a bare <think>
+    # block; any real text or tool call resets it to 0. Per-turn — session_runner
+    # zeroes it in initial_state (see the reset note below).
+    empty_responses: int
+
     # Per-turn bookkeeping — session_runner zeroes ALL of the fields below in
     # the per-turn initial_state. The checkpointer persists RunnerState per
     # session (thread_id) and only the keys passed each turn overwrite it, so
