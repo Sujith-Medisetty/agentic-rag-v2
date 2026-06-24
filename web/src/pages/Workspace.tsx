@@ -19,7 +19,7 @@ import InstallButton from "@/components/InstallButton";
 import DeleteProgressModal from "@/components/DeleteProgressModal";
 import {
   MenuIcon, ChevronLeftIcon, TrashIcon, PlusIcon, LogoutIcon,
-  ShieldIcon, CogIcon, PencilIcon,
+  ShieldIcon, CogIcon, PencilIcon, KeyIcon,
 } from "@/components/icons";
 
 export default function Workspace() {
@@ -424,6 +424,15 @@ export default function Workspace() {
             >
               <ShieldIcon className="h-3.5 w-3.5" />
               <span>Admin</span>
+            </Link>
+          )}
+          {me?.role === "root" && (
+            <Link
+              to="/providers"
+              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-md border border-accent/30 bg-accent/10 px-3 py-1.5 text-sm font-medium text-accent transition-colors hover:border-accent/50 hover:bg-accent/15"
+            >
+              <KeyIcon className="h-3.5 w-3.5" />
+              <span>Providers</span>
             </Link>
           )}
           <button

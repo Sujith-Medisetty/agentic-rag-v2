@@ -192,6 +192,22 @@ CREATE INDEX IF NOT EXISTS idx_deployed_apps_session
     ON deployed_apps(source_session_id);
 -- idx_deployed_apps_state is created in init_db() AFTER the column
 -- migration runs (the column may not exist on legacy DBs).
+
+-- Per-model token pricing overrides set from the admin Providers page.
+-- `source` is informational: 'override' = admin-set via UI, anything else
+-- means a placeholder was inserted programmatically (not currently used).
+-- Prices are per-million tokens (USD), same units as MODEL_PRICING in
+-- memory/token_counter.py — the lookup helper consults DB first, then
+-- the in-code defaults. An admin override beats both.
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model         TEXT    PRIMARY KEY,
+    input         REAL    NOT NULL,
+    output        REAL    NOT NULL,
+    cache_write   REAL    NOT NULL DEFAULT 0,
+    cache_read    REAL    NOT NULL DEFAULT 0,
+    source        TEXT    NOT NULL DEFAULT 'override',
+    updated_at    INTEGER NOT NULL
+);
 """
 
 
@@ -836,6 +852,70 @@ def set_app_setting(key: str, value: str) -> None:
             "VALUES (?, ?, ?)",
             (key, value, _now()),
         )
+
+
+def delete_app_setting(key: str) -> None:
+    """Remove a single global setting. No-op if it doesn't exist."""
+    with _connect() as cx:
+        cx.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+
+
+# ============================================================================
+# Model pricing overrides — set via the admin Providers page. The token
+# counter consults this table BEFORE the hardcoded MODEL_PRICING dict, so
+# an admin's override beats the in-code defaults without a backend restart.
+# ============================================================================
+
+def get_model_price(model: str) -> dict | None:
+    """Return {'input','output','cache_write','cache_read','source','updated_at'}
+    for an admin-set override, or None if no override exists."""
+    with _connect() as cx:
+        r = cx.execute(
+            "SELECT model, input, output, cache_write, cache_read, source, updated_at "
+            "FROM model_pricing WHERE model = ?",
+            (model,),
+        ).fetchone()
+    if r is None:
+        return None
+    return dict(r)
+
+
+def set_model_price(
+    model: str,
+    input: float,
+    output: float,
+    cache_write: float = 0.0,
+    cache_read: float = 0.0,
+    source: str = "override",
+) -> None:
+    """Upsert a per-model pricing row. Prices are USD per million tokens —
+    same units as MODEL_PRICING in memory/token_counter.py."""
+    with _connect() as cx:
+        cx.execute(
+            "INSERT OR REPLACE INTO model_pricing"
+            "(model, input, output, cache_write, cache_read, source, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (model, float(input), float(output), float(cache_write),
+             float(cache_read), source, _now()),
+        )
+
+
+def delete_model_price(model: str) -> bool:
+    """Remove an admin override. Returns True if a row was deleted."""
+    with _connect() as cx:
+        cur = cx.execute("DELETE FROM model_pricing WHERE model = ?", (model,))
+        return cur.rowcount > 0
+
+
+def list_all_model_prices() -> list[dict]:
+    """List every admin-set override. (The hardcoded defaults are NOT
+    included here — callers should layer them on top of this result.)"""
+    with _connect() as cx:
+        rows = cx.execute(
+            "SELECT model, input, output, cache_write, cache_read, source, updated_at "
+            "FROM model_pricing ORDER BY model ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ============================================================================

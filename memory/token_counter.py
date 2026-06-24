@@ -79,6 +79,30 @@ MODEL_PRICING: dict[str, dict] = {
         "cache_write": 0.00,
         "cache_read": 0.00,
     },
+    # ---- OpenAI GPT-5 (current generation) ----
+    "gpt-5":         {"input": 5.00,  "output": 20.00, "cache_write": 0.00, "cache_read": 1.25},
+    "gpt-5-mini":    {"input": 1.00,  "output": 4.00,  "cache_write": 0.00, "cache_read": 0.25},
+    # ---- Google Gemini (via OpenAI-compat endpoint) ----
+    "gemini-2.5-pro":     {"input": 1.25, "output": 5.00,  "cache_write": 0.00, "cache_read": 0.31},
+    "gemini-2.5-flash":   {"input": 0.30, "output": 1.20,  "cache_write": 0.00, "cache_read": 0.08},
+    "gemini-2.0-pro":     {"input": 1.25, "output": 5.00,  "cache_write": 0.00, "cache_read": 0.31},
+    # ---- DeepSeek ----
+    "deepseek-chat":      {"input": 0.27, "output": 1.10,  "cache_write": 0.00, "cache_read": 0.07},
+    "deepseek-reasoner":  {"input": 0.55, "output": 2.19,  "cache_write": 0.00, "cache_read": 0.14},
+    # ---- Groq (mostly free at small scale; assume free for safety) ----
+    "llama-3.3-70b-versatile":  {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0},
+    "llama-3.1-8b-instant":     {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0},
+    "mixtral-8x7b-32768":       {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0},
+    # ---- xAI Grok ----
+    "grok-3":         {"input": 3.00,  "output": 15.00, "cache_write": 0.00, "cache_read": 0.75},
+    "grok-3-mini":    {"input": 0.30,  "output": 0.50,  "cache_write": 0.00, "cache_read": 0.08},
+    "grok-2":         {"input": 2.00,  "output": 10.00, "cache_write": 0.00, "cache_read": 0.50},
+    # ---- Mistral ----
+    "mistral-large-latest":   {"input": 2.00, "output": 6.00,  "cache_write": 0.00, "cache_read": 0.50},
+    "mistral-small-latest":   {"input": 0.20, "output": 0.60,  "cache_write": 0.00, "cache_read": 0.05},
+    "codestral-latest":       {"input": 0.30, "output": 0.90,  "cache_write": 0.00, "cache_read": 0.08},
+    # ---- Together (per-model; pick a representative) ----
+    "meta-llama/Llama-3.3-70B-Instruct-Turbo":  {"input": 0.88, "output": 0.88, "cache_write": 0.00, "cache_read": 0.00},
     # Ollama / local models — free
     "llama3":         {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0},
     "codellama":      {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0},
@@ -98,10 +122,16 @@ _PROVIDER_FAMILY_PRICING: list[tuple[str, dict]] = [
     ("claude-sonnet-",   {"input": 3.00,  "output": 15.00, "cache_write": 0.75, "cache_read": 0.30}),
     ("claude-haiku-",    {"input": 0.80,  "output": 4.00,  "cache_write": 0.20, "cache_read": 0.08}),
     # OpenAI families
+    ("gpt-5-",           {"input": 1.00,  "output": 4.00,  "cache_write": 0.00, "cache_read": 0.25}),
+    ("gpt-5",            {"input": 5.00,  "output": 20.00, "cache_write": 0.00, "cache_read": 1.25}),
     ("gpt-4o-",          {"input": 5.00,  "output": 15.00, "cache_write": 0.00, "cache_read": 2.50}),
     ("gpt-4-turbo",      {"input": 10.00, "output": 30.00, "cache_write": 0.00, "cache_read": 0.00}),
     ("gpt-4",            {"input": 10.00, "output": 30.00, "cache_write": 0.00, "cache_read": 0.00}),
-    # Local models — assume free
+    # Google Gemini family
+    ("gemini-",          {"input": 0.30,  "output": 1.20,  "cache_write": 0.00, "cache_read": 0.08}),
+    # xAI Grok family
+    ("grok-",            {"input": 0.30,  "output": 0.50,  "cache_write": 0.00, "cache_read": 0.08}),
+    # Local / OpenAI-compat free-tier families — assume $0
     ("llama",            {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
     ("codellama",        {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
     ("mistral",          {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}),
@@ -111,36 +141,120 @@ _PROVIDER_FAMILY_PRICING: list[tuple[str, dict]] = [
 
 
 def _lookup_pricing(model: str) -> dict:
-    """Find pricing for `model` — exact match, then provider-family prefix,
-    then a logged-warning zero fallback. The previous behaviour silently
-    used Sonnet-class prices for any unknown model, which dramatically
-    undercounted Opus (~$3/15 vs real $15/75) and similarly mispriced any
-    unfamiliar name. Unknown models now show $0.00 with a one-line warning
-    so the operator notices and adds the entry to MODEL_PRICING."""
+    """Find pricing for `model` — DB override → exact in-code match →
+    provider-family prefix → logged-warning zero fallback.
+
+    Lookup order:
+      1. `model_pricing` table (admin-set via the Providers UI). An override
+         here beats everything else. Results are cached in-process so the
+         DB is hit at most once per model name per backend lifetime.
+      2. `MODEL_PRICING` exact match (canonical in-code defaults).
+      3. `_PROVIDER_FAMILY_PRICING` prefix (most specific first) — covers
+         new minor versions of known providers that aren't in the exact
+         dict yet.
+      4. Unknown — log a one-time warning and return zeros. The previous
+         behaviour silently used Sonnet-class prices for any unknown
+         model, which dramatically undercounted Opus (~$3/15 vs real
+         $15/75). Showing $0.00 + a warning is more honest and nudges the
+         admin to add a price."""
     if not model:
         return {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
-    # 1. Exact match
+
+    # 1. DB override (cached in-process)
+    db_price = _db_override_lookup(model)
+    if db_price is not None:
+        return db_price
+
+    # 2. Exact in-code match
     p = MODEL_PRICING.get(model)
     if p is not None:
         return p
-    # 2. Provider-family prefix (most specific first)
+    # 3. Provider-family prefix (most specific first)
     low = model.lower()
     for prefix, pricing in _PROVIDER_FAMILY_PRICING:
         if low.startswith(prefix):
             return pricing
-    # 3. Unknown — log once, then return zeros so the cost doesn't lie.
+    # 4. Unknown — log once, then return zeros so the cost doesn't lie.
     import logging, sys
     logging.getLogger(__name__).warning(
         "token_counter: unknown model %r — add an entry to MODEL_PRICING "
-        "(or _PROVIDER_FAMILY_PRICING for a family fallback). Showing $0.00.",
+        "(or _PROVIDER_FAMILY_PRICING for a family fallback), or set a price "
+        "via the Providers admin page. Showing $0.00.",
         model,
     )
     print(
         f"[token_counter] WARNING: unknown model {model!r} — cost shown as $0.00. "
-        f"Add an entry to MODEL_PRICING in memory/token_counter.py.",
+        f"Add an entry to MODEL_PRICING in memory/token_counter.py, or set a price "
+        f"via the Providers admin page.",
         file=sys.stderr, flush=True,
     )
     return {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0}
+
+
+# Cache of DB-sourced pricing lookups. Key = model name. Value = the
+# pricing dict (when found) or the sentinel `False` (when the table has
+# no row for that model — distinguishes "looked up and found nothing"
+# from "never looked up"). Avoids hitting SQLite on every record() call.
+_db_price_cache: dict[str, dict | bool] = {}
+
+
+def _db_override_lookup(model: str) -> dict | None:
+    """Return an admin-set price for `model`, or None if no override
+    exists. Cached in-process so the DB is hit at most once per name.
+    Imported lazily — `server.db` would create a cycle on cold start if
+    pulled in at module top."""
+    cached = _db_price_cache.get(model)
+    if cached is False:
+        return None
+    if cached:
+        return cached
+    try:
+        from server import db as _db
+        row = _db.get_model_price(model)
+    except Exception:
+        # If the DB is unreachable, fall through to the in-code defaults
+        # — never let pricing lookup break the agent loop.
+        return None
+    if row is None:
+        _db_price_cache[model] = False
+        return None
+    pricing = {
+        "input":       float(row["input"]),
+        "output":      float(row["output"]),
+        "cache_write": float(row.get("cache_write") or 0),
+        "cache_read":  float(row.get("cache_read") or 0),
+    }
+    _db_price_cache[model] = pricing
+    return pricing
+
+
+def invalidate_price_cache() -> None:
+    """Clear the in-process DB-override cache. Called when the admin
+    updates pricing via the Providers page so the next LLM call's cost
+    uses the new value without a backend restart."""
+    _db_price_cache.clear()
+
+
+def lookup_pricing_silent(model: str) -> dict | None:
+    """Like `_lookup_pricing`, but never logs warnings. Used by the
+    admin UI to enumerate the catalog without spamming the log for every
+    model that doesn't have a built-in price.
+
+    DB override > exact MODEL_PRICING > family prefix > None.
+    Returns None if no entry exists."""
+    if not model:
+        return None
+    db_price = _db_override_lookup(model)
+    if db_price is not None:
+        return db_price
+    p = MODEL_PRICING.get(model)
+    if p is not None:
+        return p
+    low = model.lower()
+    for prefix, pricing in _PROVIDER_FAMILY_PRICING:
+        if low.startswith(prefix):
+            return pricing
+    return None
 
 
 @dataclass

@@ -54,6 +54,100 @@ class AppSettingsUpdateRequest(BaseModel):
     """PATCH body — every field optional, only the ones present are updated."""
     tokens_show_new_only: bool | None = None
 
+# ---- LLM providers (root-only) -------------------------------------------
+
+class ProviderInfo(BaseModel):
+    """One provider card in the admin Providers page."""
+    id: str
+    name: str
+    kind: str                     # "anthropic" | "openai"
+    default_model: str
+    default_models: list[str]
+    default_base_url: str | None
+    needs_base_url: bool
+    has_key: bool                 # DB OR env
+    is_active: bool
+
+
+class ActiveProviderResponse(BaseModel):
+    """Currently-active provider + model. Used in the swap card + the
+    response after a successful PATCH."""
+    provider: str
+    model: str
+
+
+class ActiveProviderUpdate(BaseModel):
+    """PATCH /api/admin/providers/active body."""
+    provider: str = Field(min_length=1, max_length=64)
+    model: str = Field(min_length=1, max_length=256)
+
+
+class ProviderKeyUpdate(BaseModel):
+    """PUT /api/admin/providers/{provider_id}/key body.
+
+    `base_url` is optional — omit (or pass empty string) to clear the
+    provider-specific base URL and fall back to the env var / built-in
+    default for that provider."""
+    api_key: str = Field(min_length=1, max_length=512)
+    base_url: str | None = Field(default=None, max_length=512)
+
+
+class ProvidersListResponse(BaseModel):
+    """GET /api/admin/providers response."""
+    active: ActiveProviderResponse
+    providers: list[ProviderInfo]
+
+
+class TestResult(BaseModel):
+    """POST /api/admin/providers/test response.
+
+    `echo` is the first ~64 chars of the model's reply on success.
+    `error` carries the exception message on failure."""
+    ok: bool
+    echo: str | None = None
+    error: str | None = None
+
+
+# ---- Token pricing overrides (root-only) ---------------------------------
+
+class ModelPriceOut(BaseModel):
+    """One model's pricing row, as returned by GET /api/admin/pricing.
+
+    `source` is "override" when an admin set it via the UI, or "builtin"
+    when the value comes from `MODEL_PRICING` / `_PROVIDER_FAMILY_PRICING`
+    in code. Prices are USD per million tokens."""
+    model: str
+    input: float
+    output: float
+    cache_write: float
+    cache_read: float
+    source: str  # "override" | "builtin"
+    provider_id: str | None = None   # set when source=builtin and the model is in KNOWN_PROVIDERS catalog
+
+
+class ModelPriceUpdate(BaseModel):
+    """PUT /api/admin/pricing/{model} body. All four prices are required."""
+    input: float = Field(ge=0)
+    output: float = Field(ge=0)
+    cache_write: float = Field(default=0, ge=0)
+    cache_read: float = Field(default=0, ge=0)
+
+
+class PricingListResponse(BaseModel):
+    """GET /api/admin/pricing response.
+
+    `models` is the full pricing catalog: every model in the canonical
+    KNOWN_PROVIDERS list (with `source='builtin'`) plus every DB override
+    (with `source='override'`). DB overrides for the same model name win
+    over the in-code default — the server de-duplicates by model name."""
+    models: list[ModelPriceOut]
+
+
+class MessageOut(BaseModel):
+    """Lightweight `{message: str}` response used by simple endpoints."""
+    message: str
+
+
 # ---- Projects -------------------------------------------------------------
 
 class ProjectCreateRequest(BaseModel):

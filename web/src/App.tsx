@@ -6,6 +6,7 @@ import ChatPage from "@/pages/ChatPage";
 import ProjectList from "@/pages/ProjectList";
 import SessionList from "@/pages/SessionList";
 import Admin from "@/pages/Admin";
+import Providers from "@/pages/Providers";
 import Settings from "@/pages/Settings";
 import { SessionProvider } from "@/lib/sessionContext";
 import { AppSettingsProvider } from "@/lib/appSettings";
@@ -43,6 +44,10 @@ export default function App() {
                 check + redirects non-root users to /, so an accidental link
                 tap doesn't leak the page. */}
             <Route path="/admin" element={<Layout><Admin /></Layout>} />
+
+            {/* Root-only LLM providers admin: swap active provider/model +
+                manage per-provider API keys. Hot-swaps at runtime. */}
+            <Route path="/providers" element={<Layout><Providers /></Layout>} />
 
             {/* Settings: pause/resume toggles for all the user's deployed
                 apps, grouped by source session. Root sees every app;

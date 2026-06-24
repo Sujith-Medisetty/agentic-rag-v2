@@ -96,15 +96,18 @@ from server.reporter import WebReporter, get_bus
 from pydantic import BaseModel
 from server.schemas import (
     AppSettingsResponse, AppSettingsUpdateRequest,
+    ActiveProviderResponse, ActiveProviderUpdate,
     AuthStatusResponse, DeployRequest, DeployedAppResponse,
     DeployJobStartResponse, DeployJobStatusResponse,
     DeployStateResponse, DeployedAppsBySession,
     DeleteJobStartResponse, DeleteJobStatusResponse,
     EventResponse, GitInfoResponse, LoginRequest,
-    LoginResponse, MessagePostRequest, MessageResponse, OjasServiceResponse,
+    LoginResponse, MessageOut, MessagePostRequest, MessageResponse, OjasServiceResponse,
     ProcessResponse, ProjectCreateRequest, ProjectResponse, ProjectSettingsRequest,
+    ProviderInfo, ProviderKeyUpdate, ProvidersListResponse,
+    PricingListResponse, ModelPriceOut, ModelPriceUpdate,
     PushResponse, SessionCreateRequest, SessionRenameRequest, SessionResponse,
-    SignupRequest, UserResponse, AdminResetPasswordRequest,
+    SignupRequest, TestResult, UserResponse, AdminResetPasswordRequest,
 )
 from server.session_runner import run_turn
 
@@ -675,6 +678,21 @@ async def _configure_runtime_singletons() -> None:
         thinking_budget=getattr(cfg, "thinking_budget", 10000),
         provider=cfg.provider,
     )
+
+    # If the admin previously saved an active provider/model via the
+    # Providers UI, it lives in the `app_settings` KV. Override the env-
+    # derived boot config so the admin's choice survives a backend restart.
+    # `app_settings` is only checked ONCE per boot — runtime changes still
+    # go through configure_model() in the PATCH endpoint.
+    if db.get_app_setting("active_provider"):
+        from agents.provider_config import load_active_provider_config as _lapc
+        pc = _lapc()
+        configure_model(
+            model=pc.model,
+            thinking=cfg.thinking,
+            thinking_budget=getattr(cfg, "thinking_budget", 10000),
+            provider=pc.provider,
+        )
 
     # MCP tools -- empty `mcp_servers` config returns [] immediately, so this
     # is a no-op for fresh installs. Once the user adds entries to .agent.json
@@ -5882,6 +5900,257 @@ def admin_settings_update(
             "tokens_show_new_only", "1" if req.tokens_show_new_only else "0",
         )
     return _current_app_settings()
+
+
+# ============================================================================
+# LLM providers — root-only. Hot-swap the active provider/model/API keys from
+# the admin Providers page; takes effect on the next LLM call (no restart).
+#
+# Storage: `app_settings` KV. Keys:
+#   active_provider             — string (e.g. "anthropic", "openai", "google")
+#   active_model                — string (e.g. "claude-opus-4-8")
+#   <provider>_api_key          — string (per-provider API key)
+#   <provider>_base_url         — string (per-provider override of base URL)
+#
+# Read precedence in agents.provider_config.load_active_provider_config():
+#   DB → env → built-in default.
+# ============================================================================
+
+def _all_provider_ids() -> set[str]:
+    from agents.provider_config import all_provider_ids as _ids
+    return _ids()
+
+
+@app.get("/api/admin/providers", response_model=ProvidersListResponse)
+def admin_providers_list(_root: dict = Depends(require_root)):
+    """List every supported provider with its state (active? has key?) and
+    the currently-active provider/model. Root only."""
+    from agents.provider_config import load_active_provider_config, list_providers
+    active = load_active_provider_config()
+    providers = list_providers(active)
+    return ProvidersListResponse(
+        active=ActiveProviderResponse(provider=active.provider, model=active.model),
+        providers=[ProviderInfo(**p) for p in providers],
+    )
+
+
+@app.patch("/api/admin/providers/active", response_model=ActiveProviderResponse)
+def admin_providers_set_active(
+    req: ActiveProviderUpdate,
+    _root: dict = Depends(require_root),
+):
+    """Swap the active provider/model. Writes to `app_settings`, then calls
+    `configure_model()` so the in-process module globals are updated and the
+    next `_get_llm()` picks up the new config immediately."""
+    provider = req.provider.lower().strip()
+    if provider not in _all_provider_ids():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown provider {provider!r}")
+    db.set_app_setting("active_provider", provider)
+    db.set_app_setting("active_model", req.model)
+    # Mutate module globals so the next _get_llm() picks this up without
+    # a server restart. We always turn thinking OFF on swap — the picker
+    # exposes only canonical text models, and thinking is only honored by
+    # Anthropic anyway (see _get_llm).
+    from agents.nodes import configure_model as _configure_model
+    _configure_model(
+        model=req.model, thinking=False, thinking_budget=10000, provider=provider,
+    )
+    return ActiveProviderResponse(provider=provider, model=req.model)
+
+
+@app.put("/api/admin/providers/{provider_id}/key")
+def admin_providers_set_key(
+    provider_id: str,
+    req: ProviderKeyUpdate,
+    _root: dict = Depends(require_root),
+):
+    """Save (or clear) the API key + optional base URL for a provider.
+
+    `base_url=""` or `null` deletes the per-provider base_url setting,
+    falling back to the env var / built-in default for that provider."""
+    pid = provider_id.lower().strip()
+    if pid not in _all_provider_ids():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown provider {pid!r}")
+    db.set_app_setting(f"{pid}_api_key", req.api_key)
+    if req.base_url is None or req.base_url.strip() == "":
+        db.delete_app_setting(f"{pid}_base_url")
+    else:
+        db.set_app_setting(f"{pid}_base_url", req.base_url.strip())
+    return {"ok": True}
+
+
+@app.delete("/api/admin/providers/{provider_id}/key")
+def admin_providers_delete_key(
+    provider_id: str,
+    _root: dict = Depends(require_root),
+):
+    """Clear the API key + base_url override for a provider. Falls back to
+    env var / built-in defaults after this."""
+    pid = provider_id.lower().strip()
+    if pid not in _all_provider_ids():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown provider {pid!r}")
+    db.delete_app_setting(f"{pid}_api_key")
+    db.delete_app_setting(f"{pid}_base_url")
+    return {"ok": True}
+
+
+@app.post("/api/admin/providers/test", response_model=TestResult)
+async def admin_providers_test(
+    req: ActiveProviderUpdate,
+    _root: dict = Depends(require_root),
+):
+    """Probe the configured provider/model with a 1-token "ping" message.
+    Returns the model's reply (truncated) on success, or the exception
+    message on failure. Hard 10s timeout so a misconfigured endpoint
+    doesn't hang the admin UI."""
+    try:
+        # Build the LLM through the same path the agent uses, but skip
+        # streaming so we don't depend on chunk delivery for the test.
+        from agents.nodes import _get_llm
+        llm = _get_llm(
+            provider=req.provider, model=req.model, streaming=False,
+        )
+        from langchain_core.messages import HumanMessage
+        result = await asyncio.wait_for(
+            llm.ainvoke([HumanMessage(content="ping")]), timeout=10,
+        )
+        # AIMessage.content may be str or list-of-blocks; coerce.
+        content = result.content if isinstance(result.content, str) else str(result.content)
+        return TestResult(ok=True, echo=content[:64])
+    except Exception as e:
+        return TestResult(ok=False, error=f"{type(e).__name__}: {e}")
+
+
+# ============================================================================
+# Token pricing overrides — root-only. Lets the admin set accurate per-model
+# prices via the UI instead of relying on the in-code defaults. The token
+# counter consults the `model_pricing` table before MODEL_PRICING, so a
+# set-override beats both with no restart.
+# ============================================================================
+
+def _enumerate_pricing_catalog() -> list[dict]:
+    """Build the full pricing catalog: every model in the canonical
+    KNOWN_PROVIDERS catalog (source='builtin') plus every DB override
+    (source='override'). DB overrides win on duplicate model names."""
+    from agents.provider_config import KNOWN_PROVIDERS, get_provider_def
+    from memory.token_counter import (
+        MODEL_PRICING, _PROVIDER_FAMILY_PRICING, lookup_pricing_silent,
+    )
+
+    rows: dict[str, dict] = {}
+
+    # 1. DB overrides win — load first so they pin any duplicate model name.
+    for row in db.list_all_model_prices():
+        rows[row["model"]] = {
+            "model": row["model"],
+            "input": float(row["input"]),
+            "output": float(row["output"]),
+            "cache_write": float(row.get("cache_write") or 0),
+            "cache_read": float(row.get("cache_read") or 0),
+            "source": "override",
+            "provider_id": None,
+        }
+
+    # 2. Canonical models from KNOWN_PROVIDERS — only add if not already
+    #    overridden and we have a pricing row (exact or family match).
+    for p in KNOWN_PROVIDERS:
+        for m in p.default_models:
+            if m in rows:
+                # Already overridden — keep the override but record which
+                # provider catalog it lives under for the UI grouping.
+                rows[m]["provider_id"] = p.id
+                continue
+            pricing = lookup_pricing_silent(m)
+            if pricing is None:
+                continue
+            rows[m] = {
+                "model": m,
+                "input": float(pricing.get("input", 0)),
+                "output": float(pricing.get("output", 0)),
+                "cache_write": float(pricing.get("cache_write", 0)),
+                "cache_read": float(pricing.get("cache_read", 0)),
+                "source": "builtin",
+                "provider_id": p.id,
+            }
+
+    # 3. Models in MODEL_PRICING that aren't in the KNOWN_PROVIDERS
+    #    catalog (e.g. legacy `gpt-4-turbo`, `llama3`). Surface them too
+    #    so the admin sees + can edit every price the system might use.
+    for m, pricing in MODEL_PRICING.items():
+        if m in rows:
+            continue
+        # Skip family-prefix rows that look like models — they're already
+        # matched by prefix and don't need their own row.
+        if any(m.lower().startswith(prefix) for prefix, _ in _PROVIDER_FAMILY_PRICING):
+            continue
+        rows[m] = {
+            "model": m,
+            "input": float(pricing.get("input", 0)),
+            "output": float(pricing.get("output", 0)),
+            "cache_write": float(pricing.get("cache_write", 0)),
+            "cache_read": float(pricing.get("cache_read", 0)),
+            "source": "builtin",
+            "provider_id": None,
+        }
+
+    return sorted(rows.values(), key=lambda r: (r["provider_id"] or "~", r["model"]))
+
+
+@app.get("/api/admin/pricing", response_model=PricingListResponse)
+def admin_pricing_list(_root: dict = Depends(require_root)):
+    """List every model pricing row — canonical defaults + admin overrides.
+    Root only."""
+    return PricingListResponse(
+        models=[ModelPriceOut(**r) for r in _enumerate_pricing_catalog()],
+    )
+
+
+@app.put("/api/admin/pricing/{model:path}", response_model=ModelPriceOut)
+def admin_pricing_set(
+    model: str,
+    req: ModelPriceUpdate,
+    _root: dict = Depends(require_root),
+):
+    """Upsert a per-model price override. The model name can be any
+    string — even a brand-new model not in the catalog — so the admin
+    can add pricing for arbitrary providers / private deployments."""
+    db.set_model_price(
+        model=model,
+        input=req.input,
+        output=req.output,
+        cache_write=req.cache_write,
+        cache_read=req.cache_read,
+        source="override",
+    )
+    # Drop the in-process cache so the next cost() uses the new price.
+    from memory.token_counter import invalidate_price_cache
+    invalidate_price_cache()
+    # Re-enumerate so the response reflects any catalog grouping.
+    for r in _enumerate_pricing_catalog():
+        if r["model"] == model:
+            return ModelPriceOut(**r)
+    # Fallback (shouldn't happen) — synthesize the response.
+    return ModelPriceOut(
+        model=model,
+        input=req.input, output=req.output,
+        cache_write=req.cache_write, cache_read=req.cache_read,
+        source="override", provider_id=None,
+    )
+
+
+@app.delete("/api/admin/pricing/{model:path}", response_model=MessageOut)
+def admin_pricing_delete(
+    model: str,
+    _root: dict = Depends(require_root),
+):
+    """Clear the admin-set override for `model`. Falls back to the in-code
+    default afterwards (or $0.00 + warning if no default exists)."""
+    if not db.delete_model_price(model):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no override for {model!r}")
+    from memory.token_counter import invalidate_price_cache
+    invalidate_price_cache()
+    return MessageOut(message=f"Cleared override for {model}")
+
 
 def _listening_ports_system_wide() -> list[tuple[int, str, int | None]]:
     """Enumerate every TCP port currently in LISTEN on this host, with

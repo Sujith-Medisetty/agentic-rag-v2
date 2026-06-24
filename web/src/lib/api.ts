@@ -207,6 +207,114 @@ export const settingsApi = {
   get: () => request<AppSettings>("/api/settings"),
 };
 
+// ---- LLM providers (root-only) -------------------------------------------
+//
+// Hot-swap the active provider/model + manage per-provider API keys. All
+// writes go through PATCH/PUT/DELETE on /api/admin/providers/*; the server
+// calls configure_model() under the hood so the change takes effect on the
+// next LLM call without restarting.
+
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  kind: "anthropic" | "openai";
+  default_model: string;
+  default_models: string[];
+  default_base_url: string | null;
+  needs_base_url: boolean;
+  has_key: boolean;       // DB OR env
+  is_active: boolean;
+}
+
+export interface ActiveProvider {
+  provider: string;
+  model: string;
+}
+
+export interface ProvidersListResponse {
+  active: ActiveProvider;
+  providers: ProviderInfo[];
+}
+
+export interface TestResult {
+  ok: boolean;
+  echo?: string | null;
+  error?: string | null;
+}
+
+export const providersApi = {
+  list: () => request<ProvidersListResponse>("/api/admin/providers"),
+  setActive: (provider: string, model: string) =>
+    request<ActiveProvider>("/api/admin/providers/active", {
+      method: "PATCH",
+      body: JSON.stringify({ provider, model }),
+    }),
+  setKey: (
+    providerId: string,
+    api_key: string,
+    base_url?: string | null,
+  ) =>
+    request<{ ok: true }>(
+      `/api/admin/providers/${encodeURIComponent(providerId)}/key`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ api_key, base_url: base_url ?? null }),
+      },
+    ),
+  deleteKey: (providerId: string) =>
+    request<{ ok: true }>(
+      `/api/admin/providers/${encodeURIComponent(providerId)}/key`,
+      { method: "DELETE" },
+    ),
+  test: (provider: string, model: string) =>
+    request<TestResult>("/api/admin/providers/test", {
+      method: "POST",
+      body: JSON.stringify({ provider, model }),
+    }),
+};
+
+// ---- Token pricing overrides (root-only) ----------------------------------
+//
+// Set per-model USD-per-million-token prices via the UI instead of relying
+// on the in-code defaults. DB overrides beat the in-code defaults; the
+// next LLM call after a save uses the new price (server-side cache is
+// invalidated on PUT/DELETE).
+
+export interface ModelPrice {
+  model: string;
+  input: number;
+  output: number;
+  cache_write: number;
+  cache_read: number;
+  source: "builtin" | "override";
+  provider_id: string | null;
+}
+
+export interface PricingListResponse {
+  models: ModelPrice[];
+}
+
+export interface ModelPriceUpdate {
+  input: number;
+  output: number;
+  cache_write?: number;
+  cache_read?: number;
+}
+
+export const pricingApi = {
+  list: () => request<PricingListResponse>("/api/admin/pricing"),
+  set: (model: string, body: ModelPriceUpdate) =>
+    request<ModelPrice>(
+      `/api/admin/pricing/${encodeURIComponent(model)}`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  delete: (model: string) =>
+    request<{ message: string }>(
+      `/api/admin/pricing/${encodeURIComponent(model)}`,
+      { method: "DELETE" },
+    ),
+};
+
 export const pathsApi = {
   common: () =>
     request<{ locations: { label: string; path: string }[] }>(

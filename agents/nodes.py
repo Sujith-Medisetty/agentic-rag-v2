@@ -180,9 +180,16 @@ def _get_llm(
     """Build the LangChain chat client for the configured provider.
 
     All kwargs are optional — defaults come from the module-level config
-    set by `configure_model()`. Sub-agents (`tools/multi_agent.py`) pass
-    overrides so they can use a different model without mutating module
-    state.
+    set by `configure_model()`, which itself is seeded from
+    `load_active_provider_config()` (DB-backed, env-fallback). Sub-agents
+    (`tools/multi_agent.py`) pass `provider=` / `model=` overrides so they
+    can target a different model without mutating module state.
+
+    Hot-swap: `_get_llm()` is re-called every turn and reads `_provider` /
+    `_model` from module globals. `configure_model()` mutates those globals
+    and clears the per-session TokenCounter cache, so a UI-driven change
+    in the Providers admin page takes effect on the next call without a
+    restart.
 
     Note: no httpx-level timeout is set on the chat client. The single
     timeout is the per-chunk idle watchdog (AGENT_LLM_STREAM_IDLE_TIMEOUT_S)
@@ -190,53 +197,56 @@ def _get_llm(
     provider that never sends a byte is caught within `idle_timeout_s`
     seconds. Adding a second httpx timeout on top would be redundant.
     """
-    eff_provider = (provider or _provider).lower()
-    eff_model = model or _model
-    eff_thinking = _thinking if thinking is None else thinking
+    from agents.provider_config import (
+        load_active_provider_config,
+        get_provider_def,
+        KNOWN_PROVIDERS,
+    )
 
-    if eff_provider == "anthropic":
-        kwargs = {"model": eff_model, "streaming": streaming}
+    cfg = load_active_provider_config()
+
+    eff_provider = (provider or cfg.provider).lower()
+    eff_model = model or cfg.model
+    eff_thinking = _thinking if thinking is None else thinking
+    defn = get_provider_def(eff_provider) or KNOWN_PROVIDERS[0]
+
+    if defn.kind == "anthropic":
+        kwargs = {
+            "model": eff_model,
+            "streaming": streaming,
+        }
+        if cfg.api_key:
+            kwargs["api_key"] = cfg.api_key
         if eff_thinking:
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": _thinking_budget}
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(**kwargs)
 
+    # Everything else (OpenAI + every OpenAI-compat provider — Google,
+    # MiniMax, DeepSeek, Groq, xAI, Mistral, Together) routes through
+    # ChatOpenAI with the resolved base_url + api_key.
     from langchain_openai import ChatOpenAI
 
-    if eff_provider == "minimax":
-        api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("MINIMAX_API_KEY is not set.")
-        base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
-        return ChatOpenAI(
-            model=eff_model, api_key=api_key, base_url=base_url,
-            streaming=streaming,
-            # OpenAI-compatible streaming hides usage by default — without
-            # this, `usage_metadata` is empty on every AIMessage and the
-            # per-call token_update event never fires. `stream_usage=True`
-            # opts in to `stream_options={"include_usage": true}` upstream.
-            stream_usage=True,
+    if not cfg.api_key:
+        env_hint = f" ({defn.env_api_key})" if defn.env_api_key else ""
+        raise RuntimeError(
+            f"API key for provider '{eff_provider}' is not set. "
+            f"Save one via the Providers admin page or set the env var{env_hint}."
         )
 
-    if eff_provider in ("openai-compatible", "openai"):
-        api_key = os.getenv("AGENT_API_KEY") or os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("AGENT_BASE_URL") or os.getenv("OPENAI_BASE_URL")
-        if not api_key:
-            raise RuntimeError(
-                "AGENT_API_KEY (or OPENAI_API_KEY) is not set for openai-compatible provider."
-            )
-        kwargs = {
-            "model": eff_model, "api_key": api_key,
-            "streaming": streaming,
-            "stream_usage": True,
-        }
-        if base_url:
-            kwargs["base_url"] = base_url
-        return ChatOpenAI(**kwargs)
-
-    raise RuntimeError(
-        f"unknown provider '{eff_provider}'. Supported: anthropic, minimax, openai-compatible."
-    )
+    kwargs = {
+        "model": eff_model,
+        "api_key": cfg.api_key,
+        "streaming": streaming,
+        # OpenAI-compatible streaming hides usage by default — without
+        # this, `usage_metadata` is empty on every AIMessage and the
+        # per-call token_update event never fires. `stream_usage=True`
+        # opts in to `stream_options={"include_usage": true}` upstream.
+        "stream_usage": True,
+    }
+    if cfg.base_url:
+        kwargs["base_url"] = cfg.base_url
+    return ChatOpenAI(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -463,17 +473,23 @@ def _stream_with_retry(
                     f"LLM call failed after {max_attempts} attempt(s): "
                     f"{type(e).__name__}: {e}"
                 ) from e
+            # Distinguish the actual failure shape so the banner tells the
+            # user something true. "TimeoutError" is OUR idle watchdog
+            # (agents/_timeouts.py — no chunk for AGENT_LLM_STREAM_IDLE_TIMEOUT_S).
+            # "APITimeoutError" is httpx wrapping a read/connect timeout on
+            # the open SSE socket. Both can happen mid-stream; neither
+            # actually means "the model thought too long".
             _reason = {
-                "TimeoutError": "timeout",
-                "APITimeoutError": "timeout",
-                "ConnectionError": "connection error",
-                "APIConnectionError": "connection error",
-                "RateLimitError": "rate limit",
-            }.get(type(e).__name__, "provider error")
+                "TimeoutError":     "stream went silent",
+                "APITimeoutError":  "HTTP read timeout",
+                "ConnectionError":  "connection error",
+                "APIConnectionError": "connection dropped mid-stream",
+                "RateLimitError":   "rate limit",
+            }.get(type(e).__name__, f"provider error ({type(e).__name__})")
             try:
                 reporter.assistant_text(
-                    f"\n\n[LLM provider {_reason} — "
-                    f"retry attempt {attempt + 1} of {max_attempts - 1}, "
+                    f"\n\n[stream interrupted — {_reason}; "
+                    f"retry {attempt + 1} of {max_attempts - 1}, "
                     f"waiting {backoff_s:.1f}s]\n\n",
                     done=False,
                 )
