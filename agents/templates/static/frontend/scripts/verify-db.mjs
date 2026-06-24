@@ -21,6 +21,8 @@
  */
 import { shortFetch, substituteCreds } from "./verify-helpers.mjs";
 import { StageError } from "./verify-report-util.mjs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Pull the row array out of a list response in any of the common shapes.
 function rowsOf(json) {
@@ -30,10 +32,56 @@ function rowsOf(json) {
   return null;
 }
 
+/**
+ * Defense-in-depth for the "bare `yield` lifespan" bug: scan the backend's
+ * main.py and warn if the `lifespan` context manager doesn't reference any
+ * seed function. (Static apps don't have a backend, so this is a no-op for
+ * them — the candidates list will simply not resolve to a file.)
+ */
+function warnIfLifespanNeverSeeds(ctx) {
+  const candidates = [
+    join(ctx.backendRoot || ".", "main.py"),
+    join(ctx.projectRoot || ".", "backend", "main.py"),
+    join(ctx.repoRoot || ".", "backend", "main.py"),
+  ];
+  let text = null;
+  let foundAt = null;
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      try {
+        text = readFileSync(p, "utf8");
+        foundAt = p;
+        break;
+      } catch {
+        // fall through
+      }
+    }
+  }
+  if (text === null) return; // no backend/main.py — static app.
+
+  const m = text.match(/@asynccontextmanager[\s\S]*?async def lifespan\([^)]*\)\s*(?:->[^:]+)?:\s*([\s\S]*?)\n\s*yield/);
+  if (!m) return;
+  const body = m[1];
+  const stripped = body
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("#"))
+    .join("\n");
+  if (!/\bseed\b/i.test(stripped)) {
+    ctx.log(
+      "⚠ backend/main.py lifespan does NOT call any seed function " +
+        `(file: ${foundAt}). The demo DB will ship EMPTY on first deploy — ` +
+        "every UI screen will render blank. Fix: add `import seed as _seed; " +
+        "_seed.seed()` inside lifespan, wrapped in try/except.",
+    );
+  }
+}
+
 export async function runDbStage(ctx) {
   const { backendBase, manifest, auth } = ctx;
   const authHeaders = auth?.headers ?? {};
   const resources = manifest.resources;
+
+  warnIfLifespanNeverSeeds(ctx);
 
   if (resources.length === 0) {
     ctx.log("no resources declared — schema/data check limited to a boot probe (already green).");

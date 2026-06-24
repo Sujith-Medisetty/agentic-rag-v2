@@ -456,6 +456,39 @@ def get_ojas_app_rules_section() -> str:
         "Always set `cleanup.deleteTestUser` + `deleteUserPath` so the dummy account "
         "and any test rows verify created don't linger in the real DB.",
         "",
+        "### HARD rule — `lifespan` must auto-seed the demo DB",
+        "",
+        "Your `backend/main.py` `lifespan` function MUST call `seed.seed()` (or your "
+        "module's local seed function) before `yield`, wrapped in `try/except` so a "
+        "seed failure never crashes the service. Bare `yield` is a BUG — the demo "
+        "DB will ship empty on first deploy and every UI screen will render blank. "
+        "Use this exact pattern:",
+        "",
+        "```python",
+        "from contextlib import asynccontextmanager",
+        "from fastapi import FastAPI",
+        "",
+        "@asynccontextmanager",
+        "async def lifespan(_app: FastAPI):",
+        "    try:",
+        "        import logging",
+        "        import seed as _seed",
+        "        _seed.seed()",
+        "    except Exception:",
+        "        logging.getLogger(__name__).exception(\"seed failed during lifespan startup\")",
+        "    yield",
+        "",
+        "app = FastAPI(title=\"...\", lifespan=lifespan)",
+        "```",
+        "",
+        "Make sure `seed.seed()` itself is idempotent — the simplest pattern is to "
+        "check for an existing **store** (not user; users sign up before any demo "
+        "data exists, so a user-count check would skip seed wrongly). If the store "
+        "table is non-empty, bail out with a one-line print; otherwise insert your "
+        "demo rows. The verify suite's `db` stage will catch you if you forget — "
+        "see `verify-db.mjs`'s lifespan-check warning — but do not rely on that; "
+        "wire the seed call correctly the first time.",
+        "",
         "CRITICAL — REPLACE the starter `App.tsx` AND its `<Dashboard />`. The "
         "fullstack template's `App.tsx` returns `<Dashboard />`, and that "
         "Dashboard fetches `/api/items` — a route your real backend won't "

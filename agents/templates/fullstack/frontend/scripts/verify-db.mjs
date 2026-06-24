@@ -21,6 +21,8 @@
  */
 import { shortFetch, substituteCreds } from "./verify-helpers.mjs";
 import { StageError } from "./verify-report-util.mjs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Pull the row array out of a list response in any of the common shapes.
 function rowsOf(json) {
@@ -30,10 +32,71 @@ function rowsOf(json) {
   return null;
 }
 
+/**
+ * Defense-in-depth for the "bare `yield` lifespan" bug: scan the backend's
+ * main.py and warn if the `lifespan` context manager doesn't reference any
+ * seed function. The verify suite's other stages don't run on the live DB's
+ * startup path — they hit a temp DB — so without this check an agent that
+ * forgot to wire `seed.seed()` into lifespan ships a backend whose DB is
+ * empty on every fresh deploy, even though verify itself passes.
+ *
+ * Heuristic: extract the `lifespan(...)` body (or the whole async def) and
+ * look for "seed" as a substring. If absent, log a loud warning. We don't
+ * fail here (the seed may legitimately be skipped for some apps) but the
+ * warning is impossible to miss in the verify log.
+ */
+function warnIfLifespanNeverSeeds(ctx) {
+  // repoRoot sits at frontend/scripts/verify-db.mjs → ../../../
+  const mainPath = join(ctx.backendRoot || ctx.repoRoot || ".", "main.py");
+  // Try a few conventional locations.
+  const candidates = [
+    mainPath,
+    join(ctx.backendRoot || ".", "main.py"),
+    join(ctx.projectRoot || ".", "backend", "main.py"),
+  ];
+  let text = null;
+  let foundAt = null;
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      try {
+        text = readFileSync(p, "utf8");
+        foundAt = p;
+        break;
+      } catch {
+        // fall through
+      }
+    }
+  }
+  if (text === null) return; // static app, no backend/main.py — nothing to check.
+
+  // Match the lifespan async-context-manager body. The block runs from the
+  // `@asynccontextmanager` line up to the next `yield` (a bare-yield lifespan
+  // is what we want to catch). Strip comments and look for "seed".
+  const m = text.match(/@asynccontextmanager[\s\S]*?async def lifespan\([^)]*\)\s*(?:->[^:]+)?:\s*([\s\S]*?)\n\s*yield/);
+  if (!m) return; // couldn't parse — skip silently rather than false-positive.
+  const body = m[1];
+  const stripped = body
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("#"))
+    .join("\n");
+  if (!/\bseed\b/i.test(stripped)) {
+    ctx.log(
+      "⚠ backend/main.py lifespan does NOT call any seed function " +
+        `(file: ${foundAt}). The demo DB will ship EMPTY on first deploy — ` +
+        "every UI screen will render blank. Fix: add `import seed as _seed; " +
+        "_seed.seed()` inside lifespan, wrapped in try/except. See prompt.py " +
+        "for the full pattern.",
+    );
+  }
+}
+
 export async function runDbStage(ctx) {
   const { backendBase, manifest, auth } = ctx;
   const authHeaders = auth?.headers ?? {};
   const resources = manifest.resources;
+
+  // Cheap upfront scan: warn if backend/main.py lifespan never calls seed.
+  warnIfLifespanNeverSeeds(ctx);
 
   if (resources.length === 0) {
     ctx.log("no resources declared — schema/data check limited to a boot probe (already green).");

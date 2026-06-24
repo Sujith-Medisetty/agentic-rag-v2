@@ -111,8 +111,23 @@ class ItemOut(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Anything to do on startup goes here. (For Alembic, run
-    `alembic upgrade head` here instead of `create_all` above.)"""
+    """Anything to do on startup goes here.
+
+    Auto-seed the demo DB on every backend boot so the running app actually
+    has content on first deploy. The seed module's `seed()` MUST be idempotent
+    (skip if a key table already has rows) so this is safe on every restart.
+    The try/except wrapper keeps a seed failure from crashing the service —
+    better to start with an empty DB than to not start at all.
+
+    For Alembic, replace the `seed.seed()` call below with `alembic upgrade
+    head` instead of `create_all` above.
+    """
+    try:
+        import logging
+        import seed as _seed
+        _seed.seed()
+    except Exception:
+        logging.getLogger(__name__).exception("seed failed during lifespan startup")
     yield
 
 
