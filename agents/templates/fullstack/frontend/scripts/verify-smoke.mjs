@@ -1,150 +1,72 @@
 /**
- * Stage: Smoke (end-to-end happy path) + Cleanup.  (all apps)
+ * Stage: Cleanup.  (all apps)
  *
- * The browser stage proves each screen works in isolation; this stage
- * proves the FULL journey works as ONE continuous session — the thing a
- * real user does: sign up → log in → use the core feature → see the
- * result → log out. It runs the manifest's `happyPath` steps in order in
- * a single persistent context, so state (auth, created data) carries
- * across steps exactly like a real session.
+ * Verify now runs against the app's REAL database (so the running app ends
+ * up properly seeded). The flip side is that the api stage creates transient
+ * TEST rows ("test order", "test task", the dummy account) directly in that
+ * real DB — and those must not be left behind. This stage removes them,
+ * leaving only the legitimate seed data the app needs.
  *
- * Cleanup then removes the dummy test user so nothing test-shaped is left
- * behind. (Verify always runs against a THROWAWAY DB under
- * node_modules/.ojas-verify/ — the real app DB is never touched — but if
- * the app exposes account deletion we exercise it here too, which both
- * cleans up and proves the delete-account feature works.)
+ *   1. Delete every row the api stage created (tracked in ctx._createdRows)
+ *      via each resource's DELETE endpoint. Rows already removed by a DELETE
+ *      test are gone; this mops up the rest.
+ *   2. Delete the dummy test user (if auth + a delete-account endpoint).
  *
- * Exposes runSmokeStage(ctx) and runCleanupStage(ctx).
+ * Anything it can't remove (a resource with no delete route) is reported
+ * LOUDLY so the leftover test data in the real DB is never silent.
+ *
+ * Exposes runCleanupStage(ctx).
  */
-import { gotoSafe, textVisible, attachCollectors, shortFetch } from "./verify-helpers.mjs";
-import { findField, clickByText, uiLogin } from "./verify-browser.mjs";
+import { shortFetch } from "./verify-helpers.mjs";
 import { StageError } from "./verify-report-util.mjs";
 
-function authRoute(ctx, re, fallback) {
-  return ctx.manifest.screens.find((s) => re.test(s.route))?.route ?? fallback;
-}
-
-async function uiSignup(ctx, page) {
-  const auth = ctx.manifest.auth;
-  const route = auth.signupRoute || authRoute(ctx, /sign-?up|register/i, "/signup");
-  await gotoSafe(page, `${ctx.frontendBase}${route}`);
-  const name = await findField(page, "name");
-  if (name) await name.fill(ctx.creds.name).catch(() => {});
-  const email = await findField(page, "email");
-  const pass = await findField(page, "password");
-  if (!email || !pass) {
-    throw new StageError(
-      "smoke",
-      `happy path "signup": no email+password fields found at "${route}". ` +
-        `Set auth.signupRoute in the manifest or use standard input types.`,
-    );
-  }
-  await email.fill(ctx.creds.email);
-  await pass.fill(ctx.creds.password);
-  await clickByText(page, auth.signupSubmitText || "(sign ?up|register|create account|continue|submit)");
-  await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
-}
-
-export async function runSmokeStage(ctx) {
-  const steps = ctx.manifest.happyPath;
-  if (!steps.length) {
-    ctx.log("no happyPath declared — per-screen browser checks already cover each screen.");
-    return { steps: 0 };
-  }
-  const context = await ctx.browser.newContext({ baseURL: ctx.frontendBase });
-  context.setDefaultTimeout(8000);
-  const page = await context.newPage();
-  const { consoleErrors } = attachCollectors(page);
-
-  try {
-    for (let i = 0; i < steps.length; i++) {
-      const s = steps[i];
-      const where = `happy-path step ${i + 1} (${s.step})`;
-      switch (s.step) {
-        case "signup":
-          await uiSignup(ctx, page);
-          break;
-        case "login":
-          await uiLogin(ctx, page);
-          break;
-        case "logout":
-          await clickByText(page, s.target || "(log ?out|sign ?out)").catch(() => {
-            throw new StageError("smoke", `${where}: no logout control found.`);
-          });
-          await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
-          break;
-        case "navigate":
-          await gotoSafe(page, `${ctx.frontendBase}${s.route || "/"}`);
-          break;
-        case "click":
-          if (s.route) await gotoSafe(page, `${ctx.frontendBase}${s.route}`);
-          await clickByText(page, s.target);
-          await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
-          break;
-        case "fillSubmit": {
-          if (s.route) await gotoSafe(page, `${ctx.frontendBase}${s.route}`);
-          for (const [k, v] of Object.entries(s.fields || {})) {
-            const f = await findField(page, k);
-            if (!f) throw new StageError("smoke", `${where}: no field matching "${k}".`);
-            await f.fill(String(v));
-          }
-          await clickByText(page, s.submitText || "(submit|save|add|create|send)");
-          await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
-          break;
-        }
-        case "expectVisible":
-          if (!(await textVisible(page, s.text))) {
-            throw new StageError(
-              "smoke",
-              `${where}: expected "${s.text}" to be visible but it wasn't. The journey broke here.`,
-            );
-          }
-          break;
-        case "expectGone":
-          if (await textVisible(page, s.text)) {
-            throw new StageError("smoke", `${where}: expected "${s.text}" to be gone but it's still shown.`);
-          }
-          break;
-        default:
-          ctx.log(`unknown happy-path step "${s.step}" — ignored.`);
-      }
-      // expectVisibleAfter is allowed on any interactive step.
-      for (const text of s.expectVisibleAfter || []) {
-        if (!(await textVisible(page, text))) {
-          throw new StageError("smoke", `${where}: expected "${text}" after this step; not found.`);
-        }
-      }
-    }
-    if (consoleErrors.length) {
-      throw new StageError(
-        "smoke",
-        `the happy path logged ${consoleErrors.length} console error(s):\n    ` +
-          consoleErrors.slice(0, 5).join("\n    "),
-      );
-    }
-  } finally {
-    await page.close();
-    await context.close();
-  }
-  return { steps: steps.length };
+function listPathFor(ctx, resource) {
+  return ctx.manifest.resources.find((r) => r.name === resource)?.listPath ?? `/api/${resource}`;
 }
 
 export async function runCleanupStage(ctx) {
+  const authHeaders = ctx.auth?.headers ?? {};
+  const created = ctx._createdRows || {};
+
+  // 1) Remove the test rows the api stage created in the real DB.
+  let deleted = 0;
+  const leftover = [];
+  for (const [resource, ids] of Object.entries(created)) {
+    const listPath = listPathFor(ctx, resource);
+    for (const id of ids) {
+      const del = await shortFetch(`${ctx.backendBase}${listPath}/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers: authHeaders,
+      });
+      if (del.ok || del.status === 404) deleted++;
+      else leftover.push(`${listPath}/${id} (DELETE → ${del.status || del.error})`);
+    }
+  }
+  if (deleted) ctx.log(`removed ${deleted} test row(s) created during this run.`);
+  if (leftover.length) {
+    ctx.log(
+      `⚠ could NOT remove ${leftover.length} test row(s) from the real DB — the resource has ` +
+        `no working DELETE endpoint. Clean up manually or add a delete route:\n    ` +
+        leftover.slice(0, 10).join("\n    "),
+    );
+  }
+
+  // 2) Remove the dummy test user.
   const c = ctx.manifest.cleanup;
   if (!ctx.manifest.auth.enabled || !c.deleteTestUser) {
-    ctx.log("nothing to delete — verify ran against a throwaway DB; the real app DB is untouched.");
+    ctx.log("no test user to delete.");
     return;
   }
   if (!c.deleteUserPath) {
     ctx.log(
-      "deleteTestUser set but no deleteUserPath — the dummy user lives only in the throwaway " +
-        "verify DB (discarded after this run), so nothing leaks into the real app.",
+      "deleteTestUser set but no deleteUserPath — the dummy account stays in the real DB. " +
+        "Add cleanup.deleteUserPath (e.g. DELETE /api/auth/me) so verify can remove it.",
     );
     return;
   }
   const del = await shortFetch(`${ctx.backendBase}${c.deleteUserPath}`, {
     method: "DELETE",
-    headers: ctx.auth?.headers ?? {},
+    headers: authHeaders,
   });
   if (!del.ok && del.status !== 404) {
     throw new StageError(

@@ -383,19 +383,31 @@ def get_ojas_app_rules_section() -> str:
         "prints `✅ verify GREEN`. The stages, in order:",
         "  0. **preflight** — `build` (runs check-deps + verify-radix) + render smoke.",
         "  1. **auth** (fullstack, if auth) — real signup → login obtains a session.",
-        "  2. **db** (fullstack) — schema is usable; declared fixtures seed AND the "
-        "list endpoints actually load them (catches the #1 'empty screen' bug).",
-        "  3. **api** (fullstack) — every declared endpoint is hit FOR ITS JOB: real "
-        "auth attached, real ids in path params, declared body, asserts the declared "
-        "status + response shape.",
-        "  4. **browser** (all) — one targeted pass per declared screen: it renders "
-        "(no blank `<main>`), ZERO console errors / promoted React warnings / 4xx-5xx, "
-        "the declared data is visible, and the screen's ONE primary action works.",
-        "  5. **smoke** (all) — the declared end-to-end happy path as a single session "
-        "(signup → login → core feature → logout).",
-        "  6. **cleanup** (all) — deletes the dummy test user. Verify always runs on a "
-        "THROWAWAY SQLite DB (node_modules/.ojas-verify/) — the real app DB is never "
-        "touched, so nothing test-shaped leaks into the delivered app.",
+        "  2. **db** (fullstack) — seeds the app's REAL DB with the declared fixtures "
+        "(idempotently — only when a list is empty, so re-runs don't duplicate) and "
+        "asserts the list endpoints load them. This is what fixes the #1 'app shows no "
+        "data' bug: declare a `resources[].seed` for every list and the running app is "
+        "actually populated.",
+        "  3. **api** (fullstack) — EVERY endpoint in the backend's `/openapi.json` is "
+        "hit, not just the ones you list: the manifest ENRICHES the spec (declared "
+        "endpoints get per-feature body/status/shape assertions; the rest are tested "
+        "generically for any 2xx). Protected endpoints get the real session token. "
+        "Destructive routes ({id} PUT/PATCH/DELETE) run against a row verify CREATED, "
+        "never your seed data.",
+        "  4. **wiring** (fullstack) — STATIC check (no browser): every `/api/...` the "
+        "frontend calls must resolve to a real backend route. Catches a submit/handler "
+        "wired to a path the backend doesn't expose (it would 404 at runtime).",
+        "  5. **browser** (all) — a per-route headless pass over EVERY route "
+        "(your declared `screens`, or the router's routes if you declare none): each "
+        "renders (no blank `<main>`), logs ZERO console errors / promoted React "
+        "warnings, hits no 4xx/5xx, shows its declared `expectVisible` data, AND "
+        "actually calls `/api` — a data screen that fires no backend request (mock/"
+        "hardcoded data, or a broken fetch) FAILS here. The screen's one `primaryAction` "
+        "runs too, and a write that doesn't ping the API fails. (The old chained "
+        "end-to-end 'happy path' session was removed; this is per-route only.)",
+        "  6. **cleanup** (all) — verify runs against the REAL DB, so it deletes the "
+        "transient test rows it created (tracked per resource) plus the dummy user, "
+        "leaving only your legitimate seed data behind.",
         "Servers + headless Chromium boot ONCE and are shared across stages (fast). "
         "Bodies for POST/PATCH are proxied correctly. A failure means the APP is "
         "wrong, not the check — fix the root cause it names and re-run. The first run "
@@ -407,9 +419,12 @@ def get_ojas_app_rules_section() -> str:
         "The pipeline tests WHAT EACH FEATURE IS FOR, read from this manifest. Write "
         "it (app root, sibling of `frontend/`/`backend/`) as you add features — every "
         "field is optional but the more you declare, the more is actually verified. "
-        "If you omit it entirely, verify falls back to a DERIVED minimal smoke pass "
-        "(endpoints from OpenAPI, screens from the route table) and warns that "
-        "coverage is reduced — so always write it for anything non-trivial. Shape:",
+        "Even with NO manifest, the api stage tests every endpoint in `/openapi.json` "
+        "generically; declaring `endpoints` adds per-feature body/status/shape "
+        "assertions, and declaring `resources[].seed` is what gives the running app "
+        "its starting data. Declaring `screens` makes the browser stage assert each "
+        "route renders, stays console-clean, and actually calls the backend "
+        "(happyPath is gone — the chained session test was removed). The fields:",
         "```json\n"
         "{\n"
         '  "auth": { "enabled": true, "signupPath": "/api/auth/register",\n'
@@ -422,23 +437,24 @@ def get_ojas_app_rules_section() -> str:
         '                   "auth": true, "body": { "title": "Verify task" },\n'
         '                   "expectStatus": 201, "expectShape": ["id","title"] } ],\n'
         '  "screens": [ { "feature": "task list", "route": "/", "requiresAuth": true,\n'
-        '                 "expectVisible": ["Buy milk"],\n'
+        '                 "expectVisible": ["Buy milk"], "expectsApi": true,\n'
         '                 "primaryAction": { "kind": "fill-submit", "fields": {"title":"E2E task"},\n'
         '                                    "submitText": "Add", "expectVisibleAfter": ["E2E task"] } } ],\n'
-        '  "happyPath": [ {"step":"signup"}, {"step":"login"}, {"step":"navigate","route":"/"},\n'
-        '                 {"step":"fillSubmit","fields":{"title":"Walk dog"},"submitText":"Add",\n'
-        '                  "expectVisibleAfter":["Walk dog"]}, {"step":"logout"} ],\n'
         '  "cleanup": { "deleteTestUser": true, "deleteUserPath": "/api/auth/me" }\n'
         "}\n"
         "```\n"
         "Notes: `$EMAIL`/`$PASSWORD`/`$NAME`/`$USERNAME` are substituted with the "
-        "run's test creds (so signup+login use the SAME account). `primaryAction.kind` "
-        "is `fill-submit` | `click` | `none`; fields match by label/placeholder/name. "
-        "`expectVisible`/`expectVisibleAfter` are plain substrings that must appear on "
-        "the page. Mark protected screens `requiresAuth: true` — the runner logs in "
-        "through the UI once and the session carries across screens. Declare a "
-        "`resources[].seed` for every list the UI shows, or its screen verifies as a "
-        "blank/empty page.",
+        "run's test creds (so signup+login use the SAME account). `loginRoute`/"
+        "`signupRoute` tell the browser auth check where the forms live. For each "
+        "screen, `expectVisible` is substrings that must appear; `expectsApi:true` (or "
+        "any `expectVisible`) makes the browser FAIL the route if it loads without "
+        "calling `/api` (catches mock/hardcoded data); `primaryAction.kind` is "
+        "`fill-submit`|`click`|`none` (fields match by label/placeholder/name), and a "
+        "write with `expectVisibleAfter` must fire an API request. Declare a "
+        "`resources[].seed` for EVERY list the UI shows — without it the real DB ships "
+        "empty and the screen renders blank (the db stage fails you for exactly this). "
+        "Always set `cleanup.deleteTestUser` + `deleteUserPath` so the dummy account "
+        "and any test rows verify created don't linger in the real DB.",
         "",
         "CRITICAL — REPLACE the starter `App.tsx` AND its `<Dashboard />`. The "
         "fullstack template's `App.tsx` returns `<Dashboard />`, and that "
@@ -620,7 +636,7 @@ def get_ojas_app_rules_section() -> str:
         "This is the real done-bar and the harness ENFORCES it: if you try to end "
         "your turn with any app's sentinel missing or stale, you are bounced back to "
         "run verify and fix the first failing stage. The checks below are subsumed by "
-        "verify (it runs build + render + the staged backend/browser/smoke checks); "
+        "verify (it runs build + render + the staged backend/wiring/auth checks); "
         "they remain as fast standalone probes.\n",
         "  1. `npm --prefix <abs/frontend> run build` exited 0.\n",
         "  2. `python3 /opt/ojas/agents/scripts/check-build-freshness.py <abs/frontend>` exited 0. This walks `frontend/src/` and compares the newest mtime to `frontend/dist/index.html` — if any `.tsx`/`.ts`/`.css`/`.html`/etc. is newer than the bundle, it exits 1 with the exact culprit file and the fix command. Treat a non-zero exit as \"the edit is NOT done.\"\n",
@@ -674,7 +690,7 @@ def get_ojas_app_rules_section() -> str:
         "no `vite-node` dep) catches the two-React hook error, missing imports, "
         "throw-during-render bugs, and bad module resolution. It's the "
         "preflight stage of `npm run verify` (which then runs auth → db → api → "
-        "browser → smoke → cleanup); `npm run verify` is the only command that "
+        "wiring → browser → cleanup); `npm run verify` is the only command that "
         "proves the app works end-to-end.",
         "",
         "Both templates ship the staged verifier under `frontend/scripts/`, "
@@ -682,10 +698,11 @@ def get_ojas_app_rules_section() -> str:
         "and `verify-radix.mjs` (Radix Trigger/Content invariant — `<SheetTrigger>` "
         "outside its `<Sheet>` throws `DialogTrigger must be used within Dialog` and "
         "ships a blank screen) run in `prebuild`; `verify-render.mjs` is the render "
-        "smoke; then `verify-db.mjs` / `verify-api.mjs` (manifest-driven backend "
-        "checks), `verify-browser.mjs` (one targeted pass per declared screen — "
-        "renders, no console errors, no 4xx/5xx, declared data visible, primary "
-        "action works) and `verify-smoke.mjs` (end-to-end happy path + cleanup). "
+        "smoke; then `verify-db.mjs` (seeds the real DB + asserts data loads) / "
+        "`verify-api.mjs` (hits EVERY `/openapi.json` endpoint), `verify-wiring.mjs` "
+        "(static: every frontend `/api` call resolves to a real route) and "
+        "`verify-browser.mjs` (per-route: renders, console-clean, actually calls the "
+        "backend) plus `verify-smoke.mjs` (cleanup of test rows + dummy user). "
         "All read `verify.manifest.json`. If you hand-rolled the project or "
         "scaffolded WITHOUT the Ojas template, copy the whole `scripts/` directory "
         "AND the `prebuild`/`verify` lines from another Ojas project — skipping them "

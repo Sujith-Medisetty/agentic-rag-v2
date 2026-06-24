@@ -112,6 +112,7 @@ function coerceManifest(raw) {
             expectStatus: e.expectStatus ?? null, // null => "any 2xx"
             expectShape: Array.isArray(e.expectShape) ? e.expectShape : [],
             pathParamsFrom: e.pathParamsFrom ?? null, // resource name to pull a real id from
+            generic: Boolean(e.generic), // derived-from-spec, no per-feature assertions
           }))
       : [],
     screens: Array.isArray(m.screens)
@@ -122,6 +123,7 @@ function coerceManifest(raw) {
             route: s.route,
             requiresAuth: Boolean(s.requiresAuth),
             expectVisible: Array.isArray(s.expectVisible) ? s.expectVisible : [],
+            expectsApi: Boolean(s.expectsApi), // force the "must call /api on load" check
             primaryAction: coercePrimaryAction(s.primaryAction),
           }))
       : [],
@@ -229,6 +231,7 @@ function deriveEndpointsFromSpec(spec) {
         expectShape: [],
         // GET-with-{id} endpoints pull a real id from the matching list resource.
         pathParamsFrom: /\/api\/([a-z0-9_-]+)\//i.exec(path)?.[1] ?? null,
+        generic: true, // synthesised from the spec, not hand-declared
       });
     }
   }
@@ -320,10 +323,80 @@ function deriveManifest({ openapi = null } = {}) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Merge (explicit ∪ spec) — the API surface is the SOURCE OF TRUTH
+// ---------------------------------------------------------------------------
+//
+// The agent's verify.manifest.json used to REPLACE the spec: only the
+// endpoints it hand-listed were tested, so anything it forgot shipped
+// untested. That is the wrong default — the backend's /openapi.json is the
+// real list of "designed APIs", and EVERY one of them must be exercised.
+//
+// mergeManifests makes the manifest ENRICH the spec instead of replacing it:
+//   - start from the full derived set (one entry per real endpoint),
+//   - where the manifest declares the same (method, path), use the manifest's
+//     richer expectations (feature name, body, expectStatus, expectShape),
+//   - keep any extra endpoints the manifest declares that aren't in the spec
+//     (harmless — they'll just be tested too),
+//   - union resources by name, and turn auth on if EITHER side wants it.
+// The result: 100% of the designed endpoints are tested, with per-feature
+// assertions wherever the agent bothered to write them.
+const normPath = (p) => (p.length > 1 ? p.replace(/\/+$/, "") : p);
+const epKey = (e) => `${e.method} ${normPath(e.path)}`;
+
+function mergeManifests(explicit, derived) {
+  const byKey = new Map();
+  // Spec endpoints first (the full designed surface, generic expectations).
+  for (const e of derived.endpoints) byKey.set(epKey(e), e);
+  const derivedKeys = new Set(byKey.keys());
+  // Manifest endpoints layered on top (richer, per-feature expectations).
+  let enriched = 0;
+  for (const e of explicit.endpoints) {
+    const k = epKey(e);
+    if (derivedKeys.has(k)) enriched++;
+    byKey.set(k, e);
+  }
+  const endpoints = [...byKey.values()];
+
+  // Resources: union by name, manifest wins (it may carry seed/minRows).
+  const resByName = new Map();
+  for (const r of derived.resources) resByName.set(r.name, r);
+  for (const r of explicit.resources) resByName.set(r.name, r);
+
+  const autoTested = derived.endpoints.length - enriched; // spec endpoints with no manifest entry
+  const warnings = [...explicit.warnings];
+  if (autoTested > 0) {
+    warnings.push(
+      `${autoTested} endpoint(s) exist in the backend's OpenAPI spec but are NOT ` +
+        `declared in verify.manifest.json — they are being tested GENERICALLY (any 2xx, ` +
+        `no per-feature body/shape assertions). Declare them in "endpoints" to test what ` +
+        `each one is actually for.`,
+    );
+  }
+
+  return coerceManifest({
+    name: explicit.name,
+    derived: false,
+    warnings,
+    // Auth on if either side enabled it; prefer the explicit config (it has
+    // the real paths/payload) and fall back to the spec-derived one.
+    auth: explicit.auth.enabled ? explicit.auth : derived.auth,
+    resources: [...resByName.values()],
+    endpoints,
+    // Walk every route: the agent's declared screens, or the router's routes
+    // (derived from the source) when none were declared — so a fresh app
+    // still gets every page visited in the browser.
+    screens: explicit.screens.length ? explicit.screens : derived.screens,
+    happyPath: explicit.happyPath,
+    cleanup: explicit.cleanup,
+  });
+}
+
 export {
   MANIFEST_PATH,
   loadManifest,
   deriveManifest,
+  mergeManifests,
   coerceManifest,
   synthBody,
 };

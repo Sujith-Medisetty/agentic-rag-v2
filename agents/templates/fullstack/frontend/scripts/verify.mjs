@@ -12,16 +12,16 @@
  *
  *   0. preflight   build (runs check-deps + verify-radix via prebuild) + render smoke
  *   1. auth        signup → login obtains a real session            (fullstack, if auth)
- *   2. db          schema usable, declared data seeds + loads        (fullstack)
- *   3. api         every declared endpoint does its job              (fullstack)
- *   4. browser     each screen renders, no console errors, data
- *                  visible, primary action works                     (all)
- *   5. smoke       end-to-end happy path as one session              (all)
- *   6. cleanup     delete the dummy test user                        (all)
+ *   2. db          seed the app's real DB (idempotent), data loads   (fullstack)
+ *   3. api         EVERY endpoint in /openapi.json is exercised      (fullstack)
+ *   4. wiring      static: every frontend /api call hits a real route(fullstack)
+ *   5. browser     per-route: renders, no console errors, calls the API   (all)
+ *   6. cleanup     delete the test rows + dummy user from the real DB (all)
  *
- * The whole run uses a THROWAWAY SQLite DB under node_modules/.ojas-verify/
- * — the real app DB is never touched. Servers + browser boot ONCE and are
- * shared across stages (the old suite booted a backend per script).
+ * Verify runs against the app's REAL SQLite DB so the running app ends up
+ * properly seeded — the cleanup stage removes the transient test rows it
+ * created, leaving the legitimate seed data behind. Servers + browser boot
+ * ONCE and are shared across stages.
  */
 import { spawn } from "node:child_process";
 import { existsSync, rmSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
@@ -40,16 +40,16 @@ import {
   authenticate,
   shortFetch,
 } from "./verify-helpers.mjs";
-import { loadManifest, deriveManifest } from "./manifest.mjs";
+import { loadManifest, deriveManifest, mergeManifests } from "./manifest.mjs";
 import { Reporter, StageError } from "./verify-report-util.mjs";
 import { runDbStage } from "./verify-db.mjs";
 import { runApiStage } from "./verify-api.mjs";
+import { runWiringStage } from "./verify-wiring.mjs";
 import { runBrowserStage } from "./verify-browser.mjs";
-import { runSmokeStage, runCleanupStage } from "./verify-smoke.mjs";
+import { runCleanupStage } from "./verify-smoke.mjs";
 
 const SENTINEL_DIR = join(repoRoot, ".ojas");
 const SENTINEL_PATH = join(SENTINEL_DIR, "verify-pass.json");
-const VERIFY_DB = join(projectRoot, "node_modules", ".ojas-verify", "verify.db");
 const isFullstack = existsSync(join(repoRoot, "backend", "main.py"));
 
 function runChild(cmd, args, opts = {}) {
@@ -84,12 +84,10 @@ async function main() {
   await runChild("node", ["scripts/verify-render.mjs"], { cwd: projectRoot, stage: "preflight" });
   reporter.pass("preflight", "build + render");
 
-  // Fresh throwaway DB so seed counts + the dummy user are deterministic.
-  try {
-    rmSync(VERIFY_DB, { force: true });
-  } catch {}
-
-  const procs = isFullstack ? await bootFullstack() : await bootStatic();
+  // Boot against the app's REAL DB (dbPath:null leaves DATABASE_URL unset, so
+  // the backend opens its own database). The run seeds it and removes its own
+  // test rows in cleanup.
+  const procs = isFullstack ? await bootFullstack({ dbPath: null }) : await bootStatic();
 
   // Shared context for every stage — booted servers, creds, the (lazy)
   // browser. Declared out here so the cleanup finally can always reap it.
@@ -120,20 +118,27 @@ async function main() {
 }
 
 async function runStages(ctx, summary, reporter) {
-  // Manifest: explicit if present, else derived (bounded + loud warning).
-  let manifest = loadManifest();
-  if (!manifest) {
-    let openapi = null;
-    if (isFullstack) {
-      const spec = await shortFetch(`${BACKEND_URL}/openapi.json`);
-      openapi = spec.json;
-    }
-    manifest = deriveManifest({ openapi });
-    reporter.log("⚠ " + manifest.warnings.join("\n    ⚠ "));
-  } else {
-    reporter.log(`manifest: ${manifest.endpoints.length} endpoint(s), ${manifest.screens.length} screen(s).`);
+  // Manifest = the agent's verify.manifest.json ENRICHING the backend's full
+  // OpenAPI surface, so EVERY designed endpoint is tested (declared ones with
+  // per-feature assertions, the rest generically). Falls back to a pure
+  // derived manifest when the agent wrote none.
+  const explicit = loadManifest();
+  let openapi = null;
+  let specPaths = [];
+  if (isFullstack) {
+    const spec = await shortFetch(`${BACKEND_URL}/openapi.json`);
+    openapi = spec.json;
+    specPaths = openapi?.paths ? Object.keys(openapi.paths) : [];
   }
+  const derived = openapi ? deriveManifest({ openapi }) : null;
+  let manifest;
+  if (explicit && derived) manifest = mergeManifests(explicit, derived);
+  else manifest = explicit || derived || deriveManifest({});
+
+  if (manifest.warnings.length) reporter.log("⚠ " + manifest.warnings.join("\n    ⚠ "));
+  reporter.log(`manifest: ${manifest.endpoints.length} endpoint(s), ${manifest.resources.length} resource(s).`);
   ctx.manifest = manifest;
+  ctx.specPaths = specPaths;
 
   // ---- 1. auth ----
   if (isFullstack && manifest.auth.enabled) {
@@ -149,34 +154,37 @@ async function runStages(ctx, summary, reporter) {
     reporter.pass("auth", "signup + login established a session");
   }
 
-  // ---- 2. db ----
+  // ---- 2. db (seed the real DB, idempotent) ----
   if (isFullstack) {
     reporter.start("db");
     await runDbStage(ctx);
     reporter.pass("db", `${manifest.resources.length} resource(s)`);
   }
 
-  // ---- 3. api ----
+  // ---- 3. api (every endpoint) ----
   if (isFullstack) {
     reporter.start("api");
     const r = await runApiStage(ctx);
     summary.api = r;
-    reporter.pass("api", `${r.tested} endpoint(s) tested, ${r.skipped} skipped`);
+    reporter.pass("api", `${r.tested}/${r.total} endpoint(s) tested, ${r.skipped} skipped`);
   }
 
-  // ---- 4. browser + 5. smoke (need a browser) ----
-  const needBrowser = manifest.screens.length > 0 || manifest.happyPath.length > 0;
-  if (needBrowser) ctx.browser = await launchBrowser();
+  // ---- 4. wiring (static frontend → API) ----
+  if (isFullstack) {
+    reporter.start("wiring");
+    const w = await runWiringStage(ctx);
+    summary.wiring = w;
+    reporter.pass("wiring", `${w.calls} frontend call(s) wired`);
+  }
 
-  reporter.start("browser");
-  const b = await runBrowserStage(ctx);
-  summary.browser = b;
-  reporter.pass("browser", `${b.checked} screen(s)`);
-
-  reporter.start("smoke");
-  const sm = await runSmokeStage(ctx);
-  summary.smoke = sm;
-  reporter.pass("smoke", `${sm.steps} step(s)`);
+  // ---- 5. browser (per-route render + console + API-fired checks) ----
+  if (manifest.screens.length > 0 || manifest.auth.enabled) {
+    ctx.browser = await launchBrowser();
+    reporter.start("browser");
+    const b = await runBrowserStage(ctx);
+    summary.browser = b;
+    reporter.pass("browser", `${b.checked} screen(s)`);
+  }
 
   // ---- 6. cleanup ----
   reporter.start("cleanup");

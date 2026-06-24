@@ -126,27 +126,33 @@ async function withCleanup(procs, fn) {
  * @param {number} [opts.backendPort] - uvicorn port (default BACKEND_PORT)
  * @param {string} [opts.frontendUrl] - frontend origin (default FRONTEND_URL)
  * @param {string} [opts.backendUrl] - backend origin (default BACKEND_URL)
- * @param {string} [opts.dbPath] - sqlite DATABASE_URL path (default
- *   <projectRoot>/node_modules/.ojas-verify/verify.db)
+ * @param {string|null} [opts.dbPath] - sqlite DATABASE_URL path. Pass a path
+ *   to force a throwaway DB; pass `null` to leave DATABASE_URL UNSET so the
+ *   backend uses the app's own real DB (the default for verify now — the run
+ *   seeds it and cleans up its test rows). Omit for the legacy throwaway path.
  */
 async function bootFullstack(opts = {}) {
   const pythonBin = opts.pythonBin ?? PYTHON_BIN;
   const backendPort = opts.backendPort ?? BACKEND_PORT;
   const frontendUrl = opts.frontendUrl ?? FRONTEND_URL;
   const backendUrl = opts.backendUrl ?? BACKEND_URL;
+  // undefined → legacy throwaway path; null → use the app's real DB; string → that path.
   const dbPath =
-    opts.dbPath ?? join(projectRoot, "node_modules", ".ojas-verify", "verify.db");
+    opts.dbPath === undefined
+      ? join(projectRoot, "node_modules", ".ojas-verify", "verify.db")
+      : opts.dbPath;
 
   const procs = [];
 
-  // Backend: uvicorn on the local port, with a transient DB so we
-  // don't touch anything on disk the user cares about.
+  // Backend: uvicorn on the local port. DATABASE_URL is set only when a
+  // throwaway dbPath is given; otherwise we leave it unset so the app opens
+  // its own real database.
   const backendEnv = {
     ...process.env,
-    DATABASE_URL: `sqlite:///${dbPath}`,
     PORT: String(backendPort),
     OJAS_VERIFY_MODE: "1",
   };
+  if (dbPath) backendEnv.DATABASE_URL = `sqlite:///${dbPath}`;
   const backendCwd = join(repoRoot, "backend");
   const uvicorn = spawnLogged(
     pythonBin,
@@ -527,14 +533,17 @@ async function launchBrowser() {
 }
 
 /**
- * Attach console / pageerror / failed-response listeners to a page and
- * return a live collector. `consoleErrors` captures genuine errors plus
- * the five promoted React warnings; `networkErrors` captures 4xx/5xx on
- * same-origin requests. IGNORED_CONSOLE_PATTERNS filters known noise.
+ * Attach console / pageerror / response / request listeners to a page and
+ * return a live collector. `consoleErrors` captures genuine errors plus the
+ * five promoted React warnings; `networkErrors` captures 4xx/5xx on
+ * same-origin requests; `apiCalls` captures EVERY request to a /api/ path
+ * (so a stage can prove the UI actually talks to the backend, not just that
+ * it rendered). IGNORED_CONSOLE_PATTERNS filters known noise.
  */
 function attachCollectors(page) {
   const consoleErrors = [];
   const networkErrors = [];
+  const apiCalls = [];
   const ignore = (t) => IGNORED_CONSOLE_PATTERNS.some((re) => re.test(t));
   page.on("console", (msg) => {
     const type = msg.type();
@@ -547,13 +556,23 @@ function attachCollectors(page) {
   page.on("pageerror", (err) => {
     if (!ignore(err.message)) consoleErrors.push(`uncaught: ${err.message}`);
   });
+  page.on("request", (req) => {
+    const u = req.url();
+    if (u.includes("/api/")) {
+      try {
+        apiCalls.push(`${req.method()} ${new URL(u).pathname}`);
+      } catch {
+        apiCalls.push(`${req.method()} ${u}`);
+      }
+    }
+  });
   page.on("response", (res) => {
     const u = res.url();
     if (res.status() >= 400 && (u.includes("/api/") || u.startsWith(page.url().split("/").slice(0, 3).join("/")))) {
       networkErrors.push(`${res.status()} ${res.request().method()} ${u}`);
     }
   });
-  return { consoleErrors, networkErrors };
+  return { consoleErrors, networkErrors, apiCalls };
 }
 
 async function gotoSafe(page, url) {

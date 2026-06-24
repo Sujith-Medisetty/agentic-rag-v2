@@ -144,7 +144,7 @@ def build_force_message(unverified: list[tuple[Path, str]], workspace: str | os.
     lines = [
         "⛔ NOT DONE — the staged verifier has not gone green for the current code.",
         "An Ojas app ships only after `npm run verify` prints `✅ verify GREEN` "
-        "(stages: preflight → auth → db → api → browser → smoke → cleanup, stopping "
+        "(stages: preflight → auth → db → api → wiring → browser → cleanup, stopping "
         "at the first failure with the exact fix).",
         "",
     ]

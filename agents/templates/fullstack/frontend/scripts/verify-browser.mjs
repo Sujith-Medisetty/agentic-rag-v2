@@ -1,22 +1,24 @@
 /**
  * Stage: Browser.  (all apps)
  *
- * ONE targeted pass per declared screen — no BFS over 200 routes, no
- * click-every-button, no reload-everything. For each screen in the
- * manifest it:
- *   1. navigates (logging in first through the UI if the screen needs auth),
- *   2. asserts the page actually rendered (not a blank <main>),
- *   3. asserts ZERO console errors / promoted React warnings / 4xx-5xx,
- *   4. asserts the declared `expectVisible` text is on the page (the data
- *      the screen is supposed to show is actually shown),
- *   5. runs the screen's ONE primary action (fill+submit a form, or click
- *      a control) and asserts the declared `expectVisibleAfter` outcome.
+ * A per-route headless UNIT pass — NOT a chained end-to-end session (that
+ * "integration" pass was removed). For EVERY route (the manifest's screens,
+ * or the router's routes when none are declared) it opens the page on its
+ * own and asserts:
+ *   1. it isn't a BLANK screen (200 but nothing rendered),
+ *   2. ZERO console errors / promoted React warnings,
+ *   3. ZERO 4xx/5xx on same-origin or /api requests,
+ *   4. the declared `expectVisible` text is actually on the page,
+ *   5. it actually TALKS TO THE BACKEND — a data screen that fires no /api
+ *      request is using mock/hardcoded data or has a broken fetch (the
+ *      "renders fine but the network tab is empty" bug),
+ *   6. its ONE primary action works AND (for a write) hits the API.
  *
- * Deterministic and bounded: a screen either renders its feature or it
- * fails with a precise reason. Shares the orchestrator's single browser
- * + one persistent context (so a UI login carries across screens).
+ * If auth is enabled it logs in through the UI once up front, so protected
+ * routes load in the shared context. This is where "static screens are fine
+ * but backend integration is broken" gets caught.
  *
- * Exposes runBrowserStage(ctx).
+ * Exposes runBrowserStage(ctx); plus findField/clickByText/uiLogin.
  */
 import { attachCollectors, gotoSafe, isBlankScreen, textVisible } from "./verify-helpers.mjs";
 import { StageError } from "./verify-report-util.mjs";
@@ -47,6 +49,10 @@ export async function clickByText(page, text) {
   throw new StageError("browser", `could not find anything to click matching "${text}".`);
 }
 
+function guessAuthRoute(ctx, re) {
+  return ctx.manifest.screens.find((s) => re.test(s.route))?.route ?? null;
+}
+
 // Best-effort UI login: navigate to the login route, fill email+password,
 // submit. Establishes the session in the shared context (cookie or the
 // app's own localStorage token) so protected screens load afterward.
@@ -70,8 +76,25 @@ export async function uiLogin(ctx, page) {
   await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
 }
 
-function guessAuthRoute(ctx, re) {
-  return ctx.manifest.screens.find((s) => re.test(s.route))?.route ?? null;
+// Best-effort UI signup: fill the signup form and submit. Tolerant — the
+// account may already exist (the auth stage created it via the API), so a
+// failure here is not fatal; the login step is the real assertion.
+async function uiSignup(ctx, page) {
+  const auth = ctx.manifest.auth;
+  const route = auth.signupRoute || guessAuthRoute(ctx, /sign-?up|register/i);
+  if (!route) return;
+  await gotoSafe(page, `${ctx.frontendBase}${route}`);
+  const name = await findField(page, "name");
+  if (name) await name.fill(ctx.creds.name).catch(() => {});
+  const email = await findField(page, "email");
+  const pass = await findField(page, "password");
+  if (!email || !pass) return;
+  await email.fill(ctx.creds.email);
+  await pass.fill(ctx.creds.password);
+  await clickByText(page, auth.signupSubmitText || "(sign ?up|register|create account|continue|submit)").catch(
+    () => {},
+  );
+  await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
 }
 
 async function runPrimaryAction(ctx, page, screen) {
@@ -109,28 +132,40 @@ async function runPrimaryAction(ctx, page, screen) {
 
 export async function runBrowserStage(ctx) {
   const screens = ctx.manifest.screens;
-  if (screens.length === 0) {
-    ctx.log("no screens declared — skipping browser stage.");
+  if (!ctx.browser || screens.length === 0) {
+    ctx.log("no screens to walk — skipping browser stage.");
     return { checked: 0 };
   }
+  const isFullstack = ctx.mode === "fullstack";
   const context = await ctx.browser.newContext({ baseURL: ctx.frontendBase });
   context.setDefaultTimeout(8000);
 
-  // Log in once up front if any screen needs auth.
-  const needsAuth = ctx.manifest.auth.enabled && screens.some((s) => s.requiresAuth);
-  if (needsAuth) {
-    const page = await context.newPage();
-    attachCollectors(page);
+  // ONE persistent page + context for the whole walk. This matters for the
+  // session: cookies & localStorage live on the context, but sessionStorage
+  // is per-TAB — it would be lost if we opened a fresh page per route. Logging
+  // in on this page and then NAVIGATING it (same tab) to each route preserves
+  // cookie, localStorage AND sessionStorage tokens. Collectors attach once;
+  // we snapshot their lengths per route so each route is judged on its own
+  // new console errors / failed requests / api calls.
+  const page = await context.newPage();
+  const c = attachCollectors(page);
+
+  // Log in through the UI once up front (so protected routes render). The
+  // auth stage already proved the API accepts these creds; this proves the
+  // UI login wires that session into the app shell — and the session now
+  // rides along on this same tab for every route below.
+  if (ctx.manifest.auth.enabled) {
+    await uiSignup(ctx, page);
     await uiLogin(ctx, page);
-    await page.close();
   }
 
   let checked = 0;
-  for (const screen of screens) {
-    const page = await context.newPage();
-    const { consoleErrors, networkErrors } = attachCollectors(page);
-    try {
+  try {
+    for (const screen of screens) {
+      const base = { console: c.consoleErrors.length, net: c.networkErrors.length, api: c.apiCalls.length };
       await gotoSafe(page, `${ctx.frontendBase}${screen.route}`);
+      // Let late data fetches settle before judging "no API call".
+      await page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => {});
 
       if (await isBlankScreen(page)) {
         throw new StageError(
@@ -150,28 +185,66 @@ export async function runBrowserStage(ctx) {
           );
         }
       }
-      await runPrimaryAction(ctx, page, screen);
 
-      if (consoleErrors.length) {
+      // Did the screen actually talk to the backend on load? (count this
+      // route's NEW api calls, not the login's.)
+      const apiOnLoad = c.apiCalls.length - base.api;
+      if (isFullstack && apiOnLoad === 0) {
+        if (screen.expectVisible.length > 0 || screen.expectsApi) {
+          throw new StageError(
+            "browser",
+            `screen "${screen.feature}" (${screen.route}) rendered but made ZERO calls to /api — ` +
+              `it's showing mock/hardcoded data or its fetch never fires. This is the "looks ` +
+              `fine but the network tab is empty" bug: wire the component to the real endpoint ` +
+              `(useEffect fetch / react-query / loader) instead of static data.`,
+          );
+        }
+        ctx.log(`⚠ screen "${screen.feature}" (${screen.route}) made no /api calls on load (ok if static).`);
+      } else if (isFullstack) {
+        ctx.log(`screen "${screen.feature}" (${screen.route}): ${apiOnLoad} /api call(s) on load.`);
+      }
+
+      // Primary action — and, for a write, prove it pinged the backend.
+      const beforeAction = c.apiCalls.length;
+      await runPrimaryAction(ctx, page, screen);
+      const a = screen.primaryAction;
+      if (
+        isFullstack &&
+        a.kind !== "none" &&
+        a.expectVisibleAfter.length > 0 &&
+        c.apiCalls.length === beforeAction
+      ) {
         throw new StageError(
           "browser",
-          `screen "${screen.feature}" (${screen.route}) logged ${consoleErrors.length} console ` +
-            `error(s):\n    ${consoleErrors.slice(0, 5).join("\n    ")}`,
+          `screen "${screen.feature}" (${screen.route}): the "${a.kind}" action ran but fired NO ` +
+            `/api request, even though it's expected to change backend data ` +
+            `(expectVisibleAfter is set). The handler isn't calling the API — the change lives ` +
+            `only in client state and is lost on reload.`,
         );
       }
-      if (networkErrors.length) {
+
+      const newConsole = c.consoleErrors.slice(base.console);
+      if (newConsole.length) {
         throw new StageError(
           "browser",
-          `screen "${screen.feature}" (${screen.route}) hit ${networkErrors.length} failing ` +
-            `request(s):\n    ${networkErrors.slice(0, 5).join("\n    ")}`,
+          `screen "${screen.feature}" (${screen.route}) logged ${newConsole.length} console ` +
+            `error(s):\n    ${newConsole.slice(0, 5).join("\n    ")}`,
+        );
+      }
+      const newNet = c.networkErrors.slice(base.net);
+      if (newNet.length) {
+        throw new StageError(
+          "browser",
+          `screen "${screen.feature}" (${screen.route}) hit ${newNet.length} failing ` +
+            `request(s):\n    ${newNet.slice(0, 5).join("\n    ")}`,
         );
       }
       checked++;
       ctx.log(`screen "${screen.feature}" (${screen.route}) ✓`);
-    } finally {
-      await page.close();
     }
+  } finally {
+    await page.close();
+    await context.close();
   }
-  await context.close();
   return { checked };
 }
